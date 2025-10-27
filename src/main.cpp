@@ -4,6 +4,7 @@
 #include <iostream>
 #include <gtk/gtk.h>
 #include <string>
+#include <ctime>
 #include <map>
 #include <vector>
 #include <filesystem>
@@ -30,6 +31,8 @@ typedef struct _CardRow {
     gchar *translated_colors;
     int total_mana_cost;
     gchar *image_url;
+    gchar *added_date; // ISO format: YYYY-MM-DDTHH:MM:SS
+    gchar *price_usd; // Prezzo in USD come stringa
 } CardRow;
 
 typedef struct _CardRowClass {
@@ -59,6 +62,8 @@ static void card_row_finalize(GObject *object) {
     g_free(self->rarity);
     g_free(self->translated_colors);
     g_free(self->image_url);
+    g_free(self->added_date);
+    g_free(self->price_usd);
     G_OBJECT_CLASS(card_row_parent_class)->finalize(object);
 }
 
@@ -116,6 +121,8 @@ static void card_row_init(CardRow *self) {
     self->translated_colors = NULL;
     self->total_mana_cost = 0;
     self->image_url = NULL;
+    self->added_date = NULL;
+    self->price_usd = NULL;
 }
 
 static std::string translate_colors(const std::string& colors_str) {
@@ -150,11 +157,18 @@ static std::string translate_colors(const std::string& colors_str) {
     return display_colors;
 }
 
+static std::string current_language = "it";
+
 static std::string translate_rarity(const std::string& rarity) {
-    if (rarity == "common") return "Comune";
-    if (rarity == "uncommon") return "Non Comune";
-    if (rarity == "rare") return "Rara";
-    if (rarity == "mythic") return "Mitica";
+    if (current_language == "en") return rarity;
+    static std::map<std::string, std::string> translations = {
+        {"common", "Comune"},
+        {"uncommon", "Non Comune"},
+        {"rare", "Rara"},
+        {"mythic", "Mitica"}
+    };
+    auto it = translations.find(rarity);
+    if (it != translations.end()) return it->second;
     return rarity; // fallback
 }
 
@@ -181,7 +195,32 @@ static int calculate_total_mana_cost(const std::string& mana_cost) {
     return total_cost;
 }
 
-CardRow* card_row_new(int id, const char* name, const char* type, const char* colors, const char* set_code, const char* mana_cost, const char* rarity, int quantity, const char* image_url) {
+static std::string format_italian_datetime(const std::string& iso) {
+    if (iso.empty()) return "";
+    struct tm tm{};
+    // Parse ISO YYYY-MM-DDTHH:MM:SS
+    if (strptime(iso.c_str(), "%Y-%m-%dT%H:%M:%S", &tm) == nullptr) {
+        return iso;
+    }
+    // Normalize to time_t to get weekday
+    time_t tt = mktime(&tm);
+    if (tt == (time_t)-1) return iso;
+    struct tm local_tm{};
+#if defined(_MSC_VER)
+    localtime_s(&local_tm, &tt);
+#else
+    localtime_r(&tt, &local_tm);
+#endif
+    const char* weekdays[] = {"dom","lun","mar","mer","gio","ven","sab"};
+    const char* months[] = {"gennaio","febbraio","marzo","aprile","maggio","giugno","luglio","agosto","settembre","ottobre","novembre","dicembre"};
+    char buf[128];
+    snprintf(buf, sizeof(buf), "%s %02d %s %d %02d:%02d:%02d",
+             weekdays[local_tm.tm_wday], local_tm.tm_mday, months[local_tm.tm_mon], 1900 + local_tm.tm_year,
+             local_tm.tm_hour, local_tm.tm_min, local_tm.tm_sec);
+    return std::string(buf);
+}
+
+CardRow* card_row_new(int id, const char* name, const char* type, const char* colors, const char* set_code, const char* mana_cost, const char* rarity, int quantity, const char* image_url, const char* added_date, const char* price_usd) {
     CardRow* row = (CardRow*)g_object_new(card_row_get_type(), NULL);
     row->id = id;
     row->name = g_strdup(name);
@@ -196,16 +235,128 @@ CardRow* card_row_new(int id, const char* name, const char* type, const char* co
     row->translated_colors = g_strdup(trans.c_str());
     row->total_mana_cost = calculate_total_mana_cost(mana_cost ? mana_cost : "");
     row->image_url = g_strdup(image_url);
+    row->added_date = g_strdup(added_date ? added_date : "");
+    row->price_usd = g_strdup(price_usd ? price_usd : "");
     return row;
 }
+
+static std::map<std::string, std::map<std::string, std::string>> translations = {
+    {"Nome", {{"it", "Nome"}, {"en", "Name"}}},
+    {"Tipo", {{"it", "Tipo"}, {"en", "Type"}}},
+    {"Colori", {{"it", "Colori"}, {"en", "Colors"}}},
+    {"Costo Mana", {{"it", "Costo Mana"}, {"en", "Mana Cost"}}},
+    {"Rarità", {{"it", "Rarità"}, {"en", "Rarity"}}},
+    {"Data di aggiunta", {{"it", "Data di aggiunta"}, {"en", "Added Date"}}},
+    {"Quantità", {{"it", "Quantità"}, {"en", "Quantity"}}},
+    {"Nuova Carta", {{"it", "Nuova Carta"}, {"en", "New Card"}}},
+    {"Cerca per nome...", {{"it", "Cerca per nome..."}, {"en", "Search by name..."}}},
+    {"File", {{"it", "File"}, {"en", "File"}}},
+    {"Visualizza", {{"it", "Visualizza"}, {"en", "View"}}},
+    {"Lingua", {{"it", "Lingua"}, {"en", "Language"}}},
+    {"Nuovo Database", {{"it", "Nuovo Database"}, {"en", "New Database"}}},
+    {"Apri Database", {{"it", "Apri Database"}, {"en", "Open Database"}}},
+    {"Ordina Crescente", {{"it", "Ordina Crescente"}, {"en", "Sort Ascending"}}},
+    {"Ordina Decrescente", {{"it", "Ordina Decrescente"}, {"en", "Sort Descending"}}},
+    {"Elimina", {{"it", "Elimina"}, {"en", "Delete"}}},
+    {"Totale carte", {{"it", "Totale carte"}, {"en", "Total cards"}}},
+    {"Valore totale", {{"it", "Valore totale"}, {"en", "Total Value"}}}
+};
+
+std::string translate(const std::string& key) {
+    auto it = translations.find(key);
+    if (it != translations.end()) {
+        auto lang_it = it->second.find(current_language);
+        if (lang_it != it->second.end()) return lang_it->second;
+    }
+    return key;
+}
+
+static std::string translate_colors(const char* colors) {
+    if (!colors) return "";
+    std::string c = colors;
+    std::map<std::string, std::string> color_trans;
+    if (current_language == "it") {
+        color_trans = {
+            {"W", "Bianco"},
+            {"U", "Blu"},
+            {"B", "Nero"},
+            {"R", "Rosso"},
+            {"G", "Verde"}
+        };
+    } else if (current_language == "en") {
+        color_trans = {
+            {"W", "White"},
+            {"U", "Blue"},
+            {"B", "Black"},
+            {"R", "Red"},
+            {"G", "Green"}
+        };
+    } else {
+        // Default to original
+        std::string result;
+        for (char ch : c) {
+            result += ch;
+            result += " ";
+        }
+        if (!result.empty()) result.pop_back();
+        return result;
+    }
+    std::string result;
+    for (char ch : c) {
+        std::string s(1, ch);
+        auto it = color_trans.find(s);
+        if (it != color_trans.end()) result += it->second + " ";
+        else result += s + " ";
+    }
+    if (!result.empty()) result.pop_back();
+    return result;
+}
+
 struct AppState {
     std::string db_path;
     Database* db;
     GtkWidget* db_name_label;
+    GtkWidget* total_cards_label;
     GListStore* card_store;
     GtkColumnView* column_view;
     GtkSelectionModel* selection;
+    GtkWidget* search_entry;
+    GtkColumnViewColumn *name_col, *type_col, *colors_col, *mana_col, *rarity_col, *date_col, *qty_col;
+    GtkWidget* add_card_button;
+    GtkWidget* file_button;
+    GtkWidget* view_button;
 };
+
+static void update_ui_texts(GtkWindow *window, AppState* state) {
+    gtk_column_view_column_set_title(state->name_col, translate("Nome").c_str());
+    gtk_column_view_column_set_title(state->type_col, translate("Tipo").c_str());
+    gtk_column_view_column_set_title(state->colors_col, translate("Colori").c_str());
+    gtk_column_view_column_set_title(state->mana_col, translate("Costo Mana").c_str());
+    gtk_column_view_column_set_title(state->rarity_col, translate("Rarità").c_str());
+    gtk_column_view_column_set_title(state->date_col, translate("Data di aggiunta").c_str());
+    gtk_column_view_column_set_title(state->qty_col, translate("Quantità").c_str());
+    gtk_button_set_label(GTK_BUTTON(state->add_card_button), translate("Nuova Carta").c_str());
+    gtk_menu_button_set_label(GTK_MENU_BUTTON(state->file_button), translate("File").c_str());
+    gtk_menu_button_set_label(GTK_MENU_BUTTON(state->view_button), translate("Visualizza").c_str());
+    gtk_entry_set_placeholder_text(GTK_ENTRY(state->search_entry), translate("Cerca per nome...").c_str());
+    // Update total label
+    char buf[128];
+    int total_qty = 0;
+    double total_value = 0.0;
+    if (state->db) {
+        state->db->query("SELECT quantity, price_usd FROM cards", [&](const std::map<std::string, std::string>& row) {
+            total_qty += std::stoi(row.at("quantity"));
+            if (!row.at("price_usd").empty()) {
+                try {
+                    double price = std::stod(row.at("price_usd"));
+                    total_value += price * std::stoi(row.at("quantity"));
+                } catch (...) {}
+            }
+        });
+    }
+    snprintf(buf, sizeof(buf), "%s: %d | %s: $%.2f", translate("Totale carte").c_str(), total_qty, translate("Valore totale").c_str(), total_value);
+    gtk_label_set_text(GTK_LABEL(state->total_cards_label), buf);
+}
 
 // Funzione per ordinare la lista carte
 static void sort_card_list(AppState* state, const char* column, bool asc) {
@@ -230,6 +381,17 @@ static void sort_card_list(AppState* state, const char* column, bool asc) {
             res = g_strcmp0(a->rarity, b->rarity);
         } else if (strcmp(column, "quantity") == 0) {
             res = a->quantity - b->quantity;
+        } else if (strcmp(column, "added_date") == 0) {
+            const char* da = a->added_date ? a->added_date : "";
+            const char* db = b->added_date ? b->added_date : "";
+            res = strcmp(da, db);
+        } else if (strcmp(column, "price_usd") == 0) {
+            // Confronta come float per ordinamento numerico
+            float pa = a->price_usd && strlen(a->price_usd) > 0 ? std::atof(a->price_usd) : 0.0f;
+            float pb = b->price_usd && strlen(b->price_usd) > 0 ? std::atof(b->price_usd) : 0.0f;
+            if (pa < pb) res = -1;
+            else if (pa > pb) res = 1;
+            else res = 0;
         }
         return asc ? res < 0 : res > 0;
     };
@@ -250,10 +412,19 @@ struct AddCardContext {
 };
 
 // Funzione per caricare le carte dal database
-static std::vector<std::map<std::string, std::string>> load_cards_from_db(Database* db) {
+static std::vector<std::map<std::string, std::string>> load_cards_from_db(Database* db, const std::string& filter = "") {
     std::vector<std::map<std::string, std::string>> cards;
     if (!db) return cards;
-    db->query("SELECT id, name, type, colors, set_code, mana_cost, rarity, quantity, image_url FROM cards", [&](const std::map<std::string, std::string>& row) {
+    db->query("SELECT id, english_name, localized_name, name, type, localized_type, colors, set_code, mana_cost, rarity, quantity, image_url, added_date, price_usd FROM cards", [&](const std::map<std::string, std::string>& row) {
+        if (!filter.empty()) {
+            std::string name_lower = row.at("name");
+            std::transform(name_lower.begin(), name_lower.end(), name_lower.begin(), ::tolower);
+            std::string filter_lower = filter;
+            std::transform(filter_lower.begin(), filter_lower.end(), filter_lower.begin(), ::tolower);
+            if (name_lower.find(filter_lower) == std::string::npos) {
+                return; // Salta questa carta
+            }
+        }
         cards.push_back(row);
     });
     return cards;
@@ -262,24 +433,43 @@ static std::vector<std::map<std::string, std::string>> load_cards_from_db(Databa
 // Funzione globale per aggiornare la lista carte (GListStore)
 void refresh_card_list(AppState* state) {
     if (!state || !state->card_store) return;
+    std::string filter = "";
+    if (state->search_entry) {
+        const char* text = gtk_editable_get_text(GTK_EDITABLE(state->search_entry));
+        filter = text ? text : "";
+    }
     g_list_store_remove_all(state->card_store);
     if (!state->db) return;
-    auto cards = load_cards_from_db(state->db);
+    auto cards = load_cards_from_db(state->db, filter);
     std::cout << "Loading " << cards.size() << " cards from db" << std::endl;
+    int total_quantity = 0;
+    double total_value = 0.0;
     for (const auto& row : cards) {
-        std::cout << "Card: " << row.at("name") << ", " << row.at("set_code") << ", " << row.at("quantity") << std::endl;
+        std::string english = row.count("english_name") && !row.at("english_name").empty() ? row.at("english_name") : row.at("name");
+        std::string localized = row.count("localized_name") && !row.at("localized_name").empty() ? row.at("localized_name") : row.at("name");
+        std::string display_name = (current_language == "en") ? english : localized;
+        std::string english_type = row.at("type");
+        std::string localized_type = row.count("localized_type") && !row.at("localized_type").empty() ? row.at("localized_type") : row.at("type");
+        std::string display_type = (current_language == "en") ? english_type : localized_type;
+        std::cout << "Card: " << display_name << ", " << row.at("set_code") << ", " << row.at("quantity") << std::endl;
         CardRow* crow = card_row_new(std::stoi(row.at("id")),
-                                     row.at("name").c_str(),
-                                     row.at("type").c_str(),
+                                     display_name.c_str(),
+                                     display_type.c_str(),
                                      row.at("colors").c_str(),
                                      row.at("set_code").c_str(),
                                      row.at("mana_cost").c_str(),
                                      row.at("rarity").c_str(),
                                      std::stoi(row.at("quantity")),
-                                     row.at("image_url").c_str());
+                                     row.at("image_url").c_str(),
+                                     row.count("added_date") ? row.at("added_date").c_str() : "",
+                                     row.count("price_usd") ? row.at("price_usd").c_str() : "");
         g_list_store_append(state->card_store, crow);
         g_object_unref(crow);
     }
+    // Update total cards label
+    char buf[128];
+    snprintf(buf, sizeof(buf), "Totale carte: %d | Valore totale: $%.2f", total_quantity, total_value);
+    gtk_label_set_text(GTK_LABEL(state->total_cards_label), buf);
     // Update the columnview model
     // GtkSelectionModel *selection = GTK_SELECTION_MODEL(gtk_single_selection_new(G_LIST_MODEL(state->card_store)));
     // gtk_column_view_set_model(state->column_view, selection);
@@ -310,17 +500,20 @@ static void on_add_card_ok_clicked(GtkButton *button, gpointer user_data) {
     } else if (cards.size() == 1 && cards[0].is_exact_match) {
         // Carta singola trovata esattamente
         auto& card = cards[0];
+        
+        std::cout << "Single card: " << card.name << ", price_usd: '" << card.price_usd << "'" << std::endl;
         std::string msg = "Nome: " + card.name + "\n";
         msg += "Tipo: " + card.type + "\n";
         msg += "Colori: " + card.colors + "\n";
         msg += "Set: " + card.set_name + "\n";
         msg += "Costo Mana: " + card.mana_cost + "\n";
         msg += "Rarità: " + card.rarity + "\n";
+        msg += "Prezzo USD: " + (card.price_usd.empty() ? "N/A" : card.price_usd) + "\n";
         msg += "Testo: " + card.oracle_text;
         
         if (state && state->db) {
-            bool success = state->db->insert_card(card.name, card.type, card.colors, card.set_name, card.mana_cost, card.rarity, quantity, card.image_url);
-            std::cout << "Inserted card: " << card.name << " in set " << card.set_name << " qty " << quantity << " success: " << success << std::endl;
+            bool success = state->db->insert_card(card.english_name, card.localized_name, card.type, card.localized_type, card.colors, card.set_name, card.mana_cost, card.rarity, quantity, card.image_url, card.price_usd);
+            std::cout << "Inserted card: " << card.english_name << " in set " << card.set_name << " qty " << quantity << " success: " << success << std::endl;
             if (success) {
                 refresh_card_list(state);
                 g_main_context_iteration(NULL, FALSE);
@@ -427,8 +620,8 @@ static void on_add_card_ok_clicked(GtkButton *button, gpointer user_data) {
                 msg += "Testo: " + card.oracle_text;
                 
                 if (ctx->state && ctx->state->db) {
-                    bool success = ctx->state->db->insert_card(card.name, card.type, card.colors, card.set_name, card.mana_cost, card.rarity, ctx->quantity, card.image_url);
-                    std::cout << "Inserted card: " << card.name << " in set " << card.set_name << " qty " << ctx->quantity << " success: " << success << std::endl;
+                    bool success = ctx->state->db->insert_card(card.english_name, card.localized_name, card.type, card.localized_type, card.colors, card.set_name, card.mana_cost, card.rarity, ctx->quantity, card.image_url, card.price_usd);
+                    std::cout << "Inserted card: " << card.english_name << " in set " << card.set_name << " qty " << ctx->quantity << " success: " << success << std::endl;
                     if (success) {
                         refresh_card_list(ctx->state);
                         g_main_context_iteration(NULL, FALSE);
@@ -487,8 +680,8 @@ static void on_add_card_clicked(GtkButton *button, gpointer user_data) {
             state->db = new Database(db_path);
             state->db_path = db_path;
             gtk_label_set_text(GTK_LABEL(state->db_name_label), db_path.c_str());
-            Database db(db_path);
-            db.execute("CREATE TABLE IF NOT EXISTS cards (id INTEGER PRIMARY KEY, name TEXT, type TEXT, colors TEXT, set_code TEXT, mana_cost TEXT, rarity TEXT, quantity INTEGER, image_url TEXT)");
+                    Database db(db_path);
+                    db.execute("CREATE TABLE IF NOT EXISTS cards (id INTEGER PRIMARY KEY, name TEXT, type TEXT, colors TEXT, set_code TEXT, mana_cost TEXT, rarity TEXT, quantity INTEGER, image_url TEXT, added_date TEXT, price_usd TEXT)");
             std::ofstream lastdb("lastdb.txt");
             lastdb << db_path << std::endl;
             refresh_card_list(state);
@@ -631,8 +824,8 @@ static void on_new_db_ok_clicked(GtkButton *button, gpointer user_data) {
             std::ofstream lastdb("lastdb.txt");
             lastdb << db_path << std::endl;
         }
-        Database db(db_path);
-        db.execute("CREATE TABLE IF NOT EXISTS cards (id INTEGER PRIMARY KEY, name TEXT, type TEXT, colors TEXT, set_code TEXT, mana_cost TEXT, rarity TEXT, quantity INTEGER, image_url TEXT)");
+    Database db(db_path);
+    db.execute("CREATE TABLE IF NOT EXISTS cards (id INTEGER PRIMARY KEY, name TEXT, type TEXT, colors TEXT, set_code TEXT, mana_cost TEXT, rarity TEXT, quantity INTEGER, image_url TEXT, added_date TEXT, price_usd TEXT)");
     }
     gtk_window_destroy(GTK_WINDOW(widgets->dialog));
     delete widgets;
@@ -887,9 +1080,14 @@ static GdkRGBA get_color_for_mana(const char* colors) {
     return {(float)r, (float)g, (float)b, 1.0f};
 }
 
+static void on_add_card_action(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
+    on_add_card_clicked(NULL, user_data);
+}
+
 static std::string translate_type(const char* type) {
     if (!type) return "";
     std::string t = type;
+    if (current_language == "en") return t;
     static std::map<std::string, std::string> translations = {
         {"Creature", "Creatura"},
         {"Instant", "Istantaneo"},
@@ -940,6 +1138,19 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         "    background-color: rgba(230,237,243,0.03);\n"
         "    transform: translateY(-1px);\n"
         "}\n"
+        "/* Entry */\n"
+        "entry {\n"
+        "    border-radius: 8px;\n"
+        "    padding: 4px 8px;\n"
+        "    background-color: transparent;\n"
+        "    color: #e6edf3;\n"
+        "    border: 1px solid rgba(230,237,243,0.06);\n"
+        "    transition: all 0.14s ease;\n"
+        "}\n"
+        "entry:hover {\n"
+        "    background-color: rgba(230,237,243,0.03);\n"
+        "    transform: translateY(-1px);\n"
+        "}\n"
         "/* Column view / table */\n"
         "columnview {\n"
         "    background-color: #17171a;\n"
@@ -975,8 +1186,6 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     gtk_window_set_title(GTK_WINDOW(window), "Magic: The Gathering Collection");
     gtk_window_set_default_size(GTK_WINDOW(window), 600, 400);
 
-    // Menu model per il GtkMenuButton
-
     GMenu *file_menu = g_menu_new();
     g_menu_append(file_menu, "Nuovo Database", "app.newdb");
     g_menu_append(file_menu, "Apri Database", "app.opendb");
@@ -984,6 +1193,19 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     GtkWidget *file_button = gtk_menu_button_new();
     gtk_menu_button_set_label(GTK_MENU_BUTTON(file_button), "File");
     gtk_menu_button_set_menu_model(GTK_MENU_BUTTON(file_button), G_MENU_MODEL(file_menu));
+
+    // View menu with language submenu
+    GMenu *view_menu = g_menu_new();
+    GMenu *lang_menu = g_menu_new();
+    g_menu_append(lang_menu, "Italiano", "app.lang.it");
+    g_menu_append(lang_menu, "English", "app.lang.en");
+    g_menu_append_submenu(view_menu, "Lingua", G_MENU_MODEL(lang_menu));
+    g_object_unref(lang_menu);
+
+    GtkWidget *view_button = gtk_menu_button_new();
+    gtk_menu_button_set_label(GTK_MENU_BUTTON(view_button), "Visualizza");
+    gtk_menu_button_set_menu_model(GTK_MENU_BUTTON(view_button), G_MENU_MODEL(view_menu));
+    g_object_unref(view_menu);
 
 
     // Box per il nome del database attualmente aperto
@@ -996,10 +1218,64 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     state->db_path = "";
     state->db = nullptr;
     state->db_name_label = db_name_label;
+    state->total_cards_label = gtk_label_new("Totale carte: 0");
 
     // Bottone per aggiungere una nuova carta
     GtkWidget *add_card_button = gtk_button_new_with_label("Nuova Carta");
     g_signal_connect(add_card_button, "clicked", G_CALLBACK(on_add_card_clicked), window);
+
+    // Bottone per refresh delle carte
+    GtkWidget *refresh_button = gtk_button_new_with_label("Refresh");
+    g_signal_connect(refresh_button, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data) {
+        GtkWindow* window = GTK_WINDOW(user_data);
+        AppState* state = (AppState*)g_object_get_data(G_OBJECT(window), "app_state");
+        if (!state || !state->db) return;
+        // Load all cards
+        auto cards = load_cards_from_db(state->db);
+        int updated = 0;
+        for (const auto& row : cards) {
+            std::string search_name = row.at("english_name");
+            if (search_name.empty()) {
+                search_name = row.at("name");  // Fallback to original name if english_name is empty
+            }
+            if (search_name.empty()) continue;
+            auto results = search_cards_from_scryfall(search_name);
+            // Find the one with matching set_code
+            ScryfallCard* found = nullptr;
+            for (auto& card : results) {
+                if (card.set_name == row.at("set_code")) {
+                    found = &card;
+                    break;
+                }
+            }
+            if (found) {
+                bool success = state->db->update_card_info(std::stoi(row.at("id")), found->english_name, found->localized_name, found->type, found->localized_type, found->colors, found->mana_cost, found->rarity, found->image_url, found->price_usd);
+                if (success) updated++;
+                std::cout << "Updated card " << search_name << " success: " << success << std::endl;
+            } else {
+                std::cout << "Card " << search_name << " not found in Scryfall" << std::endl;
+            }
+        }
+        std::cout << "Refreshed " << updated << " cards" << std::endl;
+        refresh_card_list(state);
+    }), window);
+
+    // Campo di ricerca
+    GtkWidget *search_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(search_entry), "Cerca per nome...");
+    gtk_widget_set_size_request(search_entry, 200, -1);
+    g_signal_connect(search_entry, "changed", G_CALLBACK(+[](GtkEditable*, gpointer user_data) {
+        GtkWindow* window = GTK_WINDOW(user_data);
+        AppState* state = (AppState*)g_object_get_data(G_OBJECT(window), "app_state");
+        if (!state) return;
+        refresh_card_list(state);
+    }), window);
+
+    state->search_entry = search_entry;
+
+    state->add_card_button = add_card_button;
+    state->file_button = file_button;
+    state->view_button = view_button;
 
     // Bottone per chiudere l'app
     GtkWidget *close_button = gtk_button_new();
@@ -1014,7 +1290,10 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     // Box per i bottoni
     GtkWidget *button_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
     gtk_box_append(GTK_BOX(button_box), file_button);
+    gtk_box_append(GTK_BOX(button_box), view_button);
     gtk_box_append(GTK_BOX(button_box), add_card_button);
+    gtk_box_append(GTK_BOX(button_box), refresh_button);
+    gtk_box_append(GTK_BOX(button_box), search_entry);
 
     // Tabella carte (GtkColumnView)
     state->card_store = g_list_store_new(card_row_get_type());
@@ -1074,22 +1353,23 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     }), NULL);
     GtkColumnViewColumn *name_col = gtk_column_view_column_new("Nome", name_factory);
     gtk_column_view_column_set_expand(name_col, TRUE);
+    gtk_column_view_column_set_resizable(name_col, FALSE);
     gtk_column_view_append_column(column_view, name_col);
+    state->name_col = name_col;
     // gtk_column_view_column_set_sorter(name_col, GTK_SORTER(gtk_string_sorter_new(gtk_property_expression_new(G_TYPE_STRING, card_row_get_type(), "name"))));
 
     // Colonna Tipo
     GtkListItemFactory *type_factory = gtk_signal_list_item_factory_new();
     g_signal_connect(type_factory, "setup", G_CALLBACK(+[](GtkListItemFactory *, GtkListItem *item, gpointer) {
         GtkWidget *label = gtk_label_new("");
-        gtk_label_set_xalign(GTK_LABEL(label), 0.0);
+        gtk_label_set_xalign(GTK_LABEL(label), 0.5);
         gtk_label_set_ellipsize(GTK_LABEL(label), PANGO_ELLIPSIZE_END);
         gtk_list_item_set_child(item, label);
     }), NULL);
     g_signal_connect(type_factory, "bind", G_CALLBACK(+[](GtkListItemFactory *, GtkListItem *item, gpointer) {
         CardRow *row = (CardRow*)gtk_list_item_get_item(item);
         GtkWidget *label = gtk_list_item_get_child(item);
-        std::string translated = translate_type(row->type);
-        gtk_label_set_text(GTK_LABEL(label), translated.c_str());
+        gtk_label_set_text(GTK_LABEL(label), row->type ? row->type : "");
         // Aggiungi gesture per click destro
         GtkGesture *gesture = gtk_gesture_click_new();
         gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(gesture), GDK_BUTTON_SECONDARY);
@@ -1098,14 +1378,16 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     }), NULL);
     GtkColumnViewColumn *type_col = gtk_column_view_column_new("Tipo", type_factory);
     gtk_column_view_column_set_expand(type_col, TRUE);
+    gtk_column_view_column_set_resizable(type_col, FALSE);
     gtk_column_view_append_column(column_view, type_col);
+    state->type_col = type_col;
     // gtk_column_view_column_set_sorter(type_col, GTK_SORTER(gtk_string_sorter_new(gtk_property_expression_new(G_TYPE_STRING, card_row_get_type(), "type"))));
 
     // Colonna Colori
     GtkListItemFactory *colors_factory = gtk_signal_list_item_factory_new();
     g_signal_connect(colors_factory, "setup", G_CALLBACK(+[](GtkListItemFactory *, GtkListItem *item, gpointer) {
         GtkWidget *label = gtk_label_new("");
-        gtk_label_set_xalign(GTK_LABEL(label), 0.0);
+        gtk_label_set_xalign(GTK_LABEL(label), 0.5);
         gtk_label_set_ellipsize(GTK_LABEL(label), PANGO_ELLIPSIZE_END);
         gtk_list_item_set_child(item, label);
     }), NULL);
@@ -1121,14 +1403,16 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     }), NULL);
     GtkColumnViewColumn *colors_col = gtk_column_view_column_new("Colori", colors_factory);
     gtk_column_view_column_set_expand(colors_col, TRUE);
+    gtk_column_view_column_set_resizable(colors_col, FALSE);
     gtk_column_view_append_column(column_view, colors_col);
+    state->colors_col = colors_col;
     // gtk_column_view_column_set_sorter(colors_col, GTK_SORTER(gtk_string_sorter_new(gtk_property_expression_new(G_TYPE_STRING, card_row_get_type(), "translated-colors"))));
 
     // Colonna Costo Mana
     GtkListItemFactory *mana_factory = gtk_signal_list_item_factory_new();
     g_signal_connect(mana_factory, "setup", G_CALLBACK(+[](GtkListItemFactory *, GtkListItem *item, gpointer) {
         GtkWidget *label = gtk_label_new("");
-        gtk_label_set_xalign(GTK_LABEL(label), 0.0);
+        gtk_label_set_xalign(GTK_LABEL(label), 0.5);
         gtk_label_set_ellipsize(GTK_LABEL(label), PANGO_ELLIPSIZE_END);
         gtk_list_item_set_child(item, label);
     }), NULL);
@@ -1149,8 +1433,10 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         gtk_widget_add_controller(label, GTK_EVENT_CONTROLLER(gesture));
     }), NULL);
     GtkColumnViewColumn *mana_col = gtk_column_view_column_new("Costo Mana", mana_factory);
-    gtk_column_view_column_set_expand(mana_col, TRUE);
+    gtk_column_view_column_set_fixed_width(mana_col, 100);
+    gtk_column_view_column_set_resizable(mana_col, FALSE);
     gtk_column_view_append_column(column_view, mana_col);
+    state->mana_col = mana_col;
     // gtk_column_view_column_set_sorter(mana_col, GTK_SORTER(gtk_numeric_sorter_new(gtk_property_expression_new(G_TYPE_INT, card_row_get_type(), "total-mana-cost"))));
 
     // Colonna Rarità
@@ -1172,9 +1458,36 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         gtk_widget_add_controller(label, GTK_EVENT_CONTROLLER(gesture));
     }), NULL);
     GtkColumnViewColumn *rarity_col = gtk_column_view_column_new("Rarità", rarity_factory);
-    gtk_column_view_column_set_expand(rarity_col, TRUE);
+    gtk_column_view_column_set_fixed_width(rarity_col, 100);
+    gtk_column_view_column_set_resizable(rarity_col, FALSE);
     gtk_column_view_append_column(column_view, rarity_col);
+    state->rarity_col = rarity_col;
     // gtk_column_view_column_set_sorter(rarity_col, GTK_SORTER(gtk_string_sorter_new(gtk_property_expression_new(G_TYPE_STRING, card_row_get_type(), "rarity"))));
+
+    // Colonna Data di aggiunta
+    GtkListItemFactory *date_factory = gtk_signal_list_item_factory_new();
+    g_signal_connect(date_factory, "setup", G_CALLBACK(+[](GtkListItemFactory *, GtkListItem *item, gpointer) {
+        GtkWidget *label = gtk_label_new("");
+        gtk_label_set_xalign(GTK_LABEL(label), 0.5);
+        gtk_label_set_ellipsize(GTK_LABEL(label), PANGO_ELLIPSIZE_END);
+        gtk_list_item_set_child(item, label);
+    }), NULL);
+    g_signal_connect(date_factory, "bind", G_CALLBACK(+[](GtkListItemFactory *, GtkListItem *item, gpointer) {
+        CardRow *row = (CardRow*)gtk_list_item_get_item(item);
+        GtkWidget *label = gtk_list_item_get_child(item);
+        std::string formatted = format_italian_datetime(row->added_date ? row->added_date : "");
+        gtk_label_set_text(GTK_LABEL(label), formatted.c_str());
+        // Aggiungi gesture per click destro
+        GtkGesture *gesture = gtk_gesture_click_new();
+        gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(gesture), GDK_BUTTON_SECONDARY);
+        g_signal_connect(gesture, "pressed", G_CALLBACK(on_row_right_click), item);
+        gtk_widget_add_controller(label, GTK_EVENT_CONTROLLER(gesture));
+    }), NULL);
+    GtkColumnViewColumn *date_col = gtk_column_view_column_new("Data di aggiunta", date_factory);
+    gtk_column_view_column_set_fixed_width(date_col, 150);
+    gtk_column_view_column_set_resizable(date_col, FALSE);
+    gtk_column_view_append_column(column_view, date_col);
+    state->date_col = date_col;
 
     // Colonna Quantità
     GtkListItemFactory *qty_factory = gtk_signal_list_item_factory_new();
@@ -1196,8 +1509,10 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         gtk_widget_add_controller(label, GTK_EVENT_CONTROLLER(gesture));
     }), NULL);
     GtkColumnViewColumn *qty_col = gtk_column_view_column_new("Quantità", qty_factory);
+    gtk_column_view_column_set_fixed_width(qty_col, 80);
+    gtk_column_view_column_set_resizable(qty_col, FALSE);
     gtk_column_view_append_column(column_view, qty_col);
-
+    state->qty_col = qty_col;
     // Menu per ordinamento
     GMenu *name_menu = g_menu_new();
     g_menu_append(name_menu, "Ordina Crescente", "app.sort.name.asc");
@@ -1229,6 +1544,12 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     gtk_column_view_column_set_header_menu(rarity_col, G_MENU_MODEL(rarity_menu));
     g_object_unref(rarity_menu);
 
+    GMenu *date_menu = g_menu_new();
+    g_menu_append(date_menu, "Ordina Crescente", "app.sort.date.asc");
+    g_menu_append(date_menu, "Ordina Decrescente", "app.sort.date.desc");
+    gtk_column_view_column_set_header_menu(date_col, G_MENU_MODEL(date_menu));
+    g_object_unref(date_menu);
+
     GMenu *qty_menu = g_menu_new();
     g_menu_append(qty_menu, "Ordina Crescente", "app.sort.qty.asc");
     g_menu_append(qty_menu, "Ordina Decrescente", "app.sort.qty.desc");
@@ -1257,9 +1578,10 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     // Scrolled window con tabella
     gtk_box_append(GTK_BOX(vbox), scrolled_window);
 
-    // Box inferiore: nome database
+    // Box inferiore: nome database e totale carte
     GtkWidget *bottom_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
     gtk_box_append(GTK_BOX(bottom_box), db_name_box);
+    gtk_box_append(GTK_BOX(bottom_box), state->total_cards_label);
     gtk_box_append(GTK_BOX(vbox), bottom_box);
     gtk_window_set_child(GTK_WINDOW(window), vbox);
     // Salva lo stato globale nella finestra principale
@@ -1399,6 +1721,22 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     }), window);
     g_action_map_add_action(G_ACTION_MAP(app), G_ACTION(sort_rarity_desc));
 
+    GSimpleAction *sort_date_asc = g_simple_action_new("sort.date.asc", NULL);
+    g_signal_connect(sort_date_asc, "activate", G_CALLBACK(+[](GSimpleAction *, GVariant *, gpointer user_data) {
+        GtkWindow *window = GTK_WINDOW(user_data);
+        AppState* state = (AppState*)g_object_get_data(G_OBJECT(window), "app_state");
+        sort_card_list(state, "added_date", true);
+    }), window);
+    g_action_map_add_action(G_ACTION_MAP(app), G_ACTION(sort_date_asc));
+
+    GSimpleAction *sort_date_desc = g_simple_action_new("sort.date.desc", NULL);
+    g_signal_connect(sort_date_desc, "activate", G_CALLBACK(+[](GSimpleAction *, GVariant *, gpointer user_data) {
+        GtkWindow *window = GTK_WINDOW(user_data);
+        AppState* state = (AppState*)g_object_get_data(G_OBJECT(window), "app_state");
+        sort_card_list(state, "added_date", false);
+    }), window);
+    g_action_map_add_action(G_ACTION_MAP(app), G_ACTION(sort_date_desc));
+
     GSimpleAction *sort_qty_asc = g_simple_action_new("sort.qty.asc", NULL);
     g_signal_connect(sort_qty_asc, "activate", G_CALLBACK(+[](GSimpleAction *, GVariant *, gpointer user_data) {
         GtkWindow *window = GTK_WINDOW(user_data);
@@ -1414,6 +1752,53 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         sort_card_list(state, "quantity", false);
     }), window);
     g_action_map_add_action(G_ACTION_MAP(app), G_ACTION(sort_qty_desc));
+    // Azione per aggiungere carta
+    GSimpleAction *add_card_action = g_simple_action_new("add_card", NULL);
+    g_signal_connect(add_card_action, "activate", G_CALLBACK(on_add_card_action), window);
+    g_action_map_add_action(G_ACTION_MAP(app), G_ACTION(add_card_action));
+
+    // Azione per eliminare riga selezionata
+    GSimpleAction *delete_selected_action = g_simple_action_new("delete_selected", NULL);
+    g_signal_connect(delete_selected_action, "activate", G_CALLBACK(+[](GSimpleAction *, GVariant *, gpointer user_data) {
+        GtkWindow *window = GTK_WINDOW(user_data);
+        AppState* state = (AppState*)g_object_get_data(G_OBJECT(window), "app_state");
+        if (!state || !state->db) return;
+        GtkSelectionModel *selection = state->selection;
+        guint selected_pos = gtk_single_selection_get_selected(GTK_SINGLE_SELECTION(selection));
+        if (selected_pos == GTK_INVALID_LIST_POSITION) return;
+        GListModel *model = gtk_single_selection_get_model(GTK_SINGLE_SELECTION(selection));
+        CardRow *row = (CardRow*)g_list_model_get_item(model, selected_pos);
+        if (!row) return;
+        GVariant *param = g_variant_new_int32(row->id);
+        on_delete_card(NULL, param, window);
+        g_variant_unref(param);
+    }), window);
+    g_action_map_add_action(G_ACTION_MAP(app), G_ACTION(delete_selected_action));
+
+    // Language actions
+    GSimpleAction *lang_it = g_simple_action_new("lang.it", NULL);
+    g_signal_connect(lang_it, "activate", G_CALLBACK(+[](GSimpleAction *, GVariant *, gpointer user_data) {
+        GtkWindow *window = GTK_WINDOW(user_data);
+        AppState* state = (AppState*)g_object_get_data(G_OBJECT(window), "app_state");
+        current_language = "it";
+        update_ui_texts(window, state);
+        refresh_card_list(state);
+    }), window);
+    g_action_map_add_action(G_ACTION_MAP(app), G_ACTION(lang_it));
+
+    GSimpleAction *lang_en = g_simple_action_new("lang.en", NULL);
+    g_signal_connect(lang_en, "activate", G_CALLBACK(+[](GSimpleAction *, GVariant *, gpointer user_data) {
+        GtkWindow *window = GTK_WINDOW(user_data);
+        AppState* state = (AppState*)g_object_get_data(G_OBJECT(window), "app_state");
+        current_language = "en";
+        update_ui_texts(window, state);
+        refresh_card_list(state);
+    }), window);
+    g_action_map_add_action(G_ACTION_MAP(app), G_ACTION(lang_en));
+
+    // Imposta acceleratori
+    gtk_application_set_accels_for_action(app, "app.add_card", (const char*[]){"<Control>n", NULL});
+    gtk_application_set_accels_for_action(app, "app.delete_selected", (const char*[]){"Delete", NULL});
 
     // Carica ultimo database usato
     std::ifstream lastdb("lastdb.txt");

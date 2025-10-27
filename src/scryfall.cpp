@@ -75,25 +75,55 @@ static std::vector<ScryfallCard> perform_search(const std::string& query, bool r
                         
                         // Se richiede italiano, usa i campi italiani
                         if (require_italian) {
-                            result.name = card.value("printed_name", card.value("name", ""));
-                            result.type = card.value("printed_type_line", card.value("type_line", ""));
+                            result.english_name = card.value("name", "");
+                            result.localized_name = card.value("printed_name", card.value("name", ""));
+                            result.name = result.localized_name; // For backward compatibility
+                            result.type = card.value("type_line", "");
+                            result.localized_type = card.value("printed_type_line", card.value("type_line", ""));
                             result.oracle_text = card.value("printed_text", card.value("oracle_text", ""));
                         } else {
-                            result.name = card.value("name", "");
+                            result.english_name = card.value("name", "");
+                            result.localized_name = card.value("printed_name", card.value("name", ""));
+                            result.name = result.english_name; // For backward compatibility
                             result.type = card.value("type_line", "");
+                            result.localized_type = card.value("printed_type_line", card.value("type_line", ""));
                             result.oracle_text = card.value("oracle_text", "");
                         }
                         
-                        result.colors = card.value("colors", json::array()).dump();
+                        // Colors
+                        auto colors_json = card["colors"];
+                        if (colors_json.is_null()) {
+                            result.colors = "[]";
+                        } else {
+                            result.colors = colors_json.dump();
+                        }
+                        
                         result.set_name = card.value("set_name", "");
                         result.mana_cost = card.value("mana_cost", "");
                         result.rarity = card.value("rarity", "");
-                        result.image_url = card.value("image_uris", json::object()).value("normal", "");
+                        
+                        // Image URL
+                        auto image_uris = card.value("image_uris", json::object());
+                        if (!image_uris.is_null()) {
+                            result.image_url = image_uris.value("normal", "");
+                        } else {
+                            result.image_url = "";
+                        }
+                        
+                        // Price USD
+                        auto prices = card.value("prices", json::object());
+                        if (!prices.is_null() && prices.contains("usd") && !prices["usd"].is_null()) {
+                            result.price_usd = prices["usd"];
+                        } else {
+                            result.price_usd = "";
+                        }
+                        
+                        std::cout << "Parsed card: " << result.name << ", price_usd: '" << result.price_usd << "'" << std::endl;
                         
                         results.push_back(result);
                         
-                        // Limita a 10 risultati per non sovraccaricare
-                        if (results.size() >= 10) break;
+                        // Limita a 50 risultati per non sovraccaricare
+                        if (results.size() >= 50) break;
                     }
                 } else if (j.contains("object") && j["object"] == "error") {
                     std::cout << "Scryfall error: " << j.value("details", "") << std::endl;
@@ -148,8 +178,11 @@ std::vector<ScryfallCard> search_cards_from_scryfall(const std::string& query) {
                         auto j = json::parse(buffer);
                         if (j.contains("data") && j["data"].is_array() && !j["data"].empty()) {
                             auto& italian_card = j["data"][0];
-                            card.name = italian_card.value("printed_name", card.name);
-                            card.type = italian_card.value("printed_type_line", card.type);
+                            card.english_name = card.name; // Assuming card.name was set to english
+                            card.localized_name = italian_card.value("printed_name", card.name);
+                            card.name = card.localized_name;
+                            card.type = italian_card.value("type_line", card.type);
+                            card.localized_type = italian_card.value("printed_type_line", card.type);
                             card.oracle_text = italian_card.value("printed_text", card.oracle_text);
                         }
                     } catch (...) {

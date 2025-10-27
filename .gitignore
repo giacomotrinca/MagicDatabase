@@ -1,0 +1,20 @@
+# Ignore data directory (contains databases and images)
+data/
+
+# Ignore compiled binary
+magicdb
+
+# Ignore last database file
+lastdb.txt
+
+# Ignore build artifacts
+*.o
+*.exe
+
+# Ignore IDE files
+.vscode/
+.idea/
+
+# Ignore OS files
+.DS_Store
+Thumbs.db
