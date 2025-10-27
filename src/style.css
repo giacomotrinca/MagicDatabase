@@ -1,0 +1,22 @@
+/* Stile moderno per il bottone File */
+.menu-button, menu button {
+    background: linear-gradient(90deg, #232526 0%, #414345 100%);
+    color: #f8f8f2;
+    border-radius: 8px;
+    border: 1px solid #444;
+    padding: 6px 18px;
+    font-weight: bold;
+    font-size: 1.1em;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+    transition: background 0.2s, color 0.2s;
+}
+.menu-button:hover, menu button:hover {
+    background: linear-gradient(90deg, #414345 0%, #232526 100%);
+    color: #ffd700;
+    border-color: #ffd700;
+}
+.menu-button:active, menu button:active {
+    background: #18191a;
+    color: #ffd700;
+    border-color: #ffd700;
+}
