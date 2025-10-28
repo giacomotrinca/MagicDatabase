@@ -140,6 +140,49 @@ Database::Database(const std::string& db_path) : db(nullptr) {
                         std::cout << "Aggiunta colonna 'localized_type' alla tabella cards." << std::endl;
                     }
                 }
+                // Check for decks table
+                bool has_decks_table = false;
+                sqlite3_stmt* stmt_decks = nullptr;
+                const char* decks_sql = "SELECT name FROM sqlite_master WHERE type='table' AND name='decks'";
+                if (sqlite3_prepare_v2(db, decks_sql, -1, &stmt_decks, nullptr) == SQLITE_OK) {
+                    if (sqlite3_step(stmt_decks) == SQLITE_ROW) {
+                        has_decks_table = true;
+                    }
+                    sqlite3_finalize(stmt_decks);
+                }
+                if (!has_decks_table) {
+                    char* err = nullptr;
+                    const char* create_decks = "CREATE TABLE decks (id INTEGER PRIMARY KEY, name TEXT UNIQUE)";
+                    if (sqlite3_exec(db, create_decks, nullptr, nullptr, &err) != SQLITE_OK) {
+                        std::cerr << "Errore creazione tabella decks: " << (err ? err : (char*)"unknown") << std::endl;
+                        if (err) sqlite3_free(err);
+                    } else {
+                        std::cout << "Creata tabella 'decks'." << std::endl;
+                    }
+                }
+                // Check for deck_id column
+                bool has_deck_id = false;
+                pi = nullptr;
+                if (sqlite3_prepare_v2(db, pragma, -1, &pi, nullptr) == SQLITE_OK) {
+                    while (sqlite3_step(pi) == SQLITE_ROW) {
+                        const unsigned char* colname = sqlite3_column_text(pi, 1);
+                        if (colname && strcmp((const char*)colname, "deck_id") == 0) {
+                            has_deck_id = true;
+                            break;
+                        }
+                    }
+                    sqlite3_finalize(pi);
+                }
+                if (!has_deck_id) {
+                    char* err = nullptr;
+                    const char* alter = "ALTER TABLE cards ADD COLUMN deck_id INTEGER REFERENCES decks(id)";
+                    if (sqlite3_exec(db, alter, nullptr, nullptr, &err) != SQLITE_OK) {
+                        std::cerr << "Errore alter table aggiunta deck_id: " << (err ? err : (char*)"unknown") << std::endl;
+                        if (err) sqlite3_free(err);
+                    } else {
+                        std::cout << "Aggiunta colonna 'deck_id' alla tabella cards." << std::endl;
+                    }
+                }
             } else {
                 sqlite3_finalize(stmt);
             }
@@ -164,16 +207,27 @@ bool Database::execute(const std::string& sql) {
     return true;
 }
 
-bool Database::insert_card(const std::string& english_name, const std::string& localized_name, const std::string& type, const std::string& localized_type, const std::string& colors, const std::string& set_code, const std::string& mana_cost, const std::string& rarity, int quantity, const std::string& image_url, const std::string& price_usd) {
-    // Prima controlla se la carta esiste già (stesso english_name e set_code)
-    const char* check_sql = "SELECT id, quantity FROM cards WHERE english_name = ? AND set_code = ?";
+bool Database::insert_card(const std::string& english_name, const std::string& localized_name, const std::string& type, const std::string& localized_type, const std::string& colors, const std::string& set_code, const std::string& mana_cost, const std::string& rarity, int quantity, const std::string& image_url, const std::string& price_usd, int deck_id) {
+    // Prima controlla se la carta esiste già (stesso english_name, set_code e nello stesso deck se specificato)
     sqlite3_stmt* check_stmt;
-    if (sqlite3_prepare_v2(db, check_sql, -1, &check_stmt, nullptr) != SQLITE_OK) {
-        std::cerr << "Errore prepare check: " << sqlite3_errmsg(db) << std::endl;
-        return false;
+    if (deck_id != -1) {
+        const char* check_sql = "SELECT id, quantity FROM cards WHERE english_name = ? AND set_code = ? AND deck_id = ?";
+        if (sqlite3_prepare_v2(db, check_sql, -1, &check_stmt, nullptr) != SQLITE_OK) {
+            std::cerr << "Errore prepare check: " << sqlite3_errmsg(db) << std::endl;
+            return false;
+        }
+        sqlite3_bind_text(check_stmt, 1, english_name.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(check_stmt, 2, set_code.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_int(check_stmt, 3, deck_id);
+    } else {
+        const char* check_sql = "SELECT id, quantity FROM cards WHERE english_name = ? AND set_code = ? AND deck_id IS NULL";
+        if (sqlite3_prepare_v2(db, check_sql, -1, &check_stmt, nullptr) != SQLITE_OK) {
+            std::cerr << "Errore prepare check: " << sqlite3_errmsg(db) << std::endl;
+            return false;
+        }
+        sqlite3_bind_text(check_stmt, 1, english_name.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(check_stmt, 2, set_code.c_str(), -1, SQLITE_STATIC);
     }
-    sqlite3_bind_text(check_stmt, 1, english_name.c_str(), -1, SQLITE_STATIC);
-    sqlite3_bind_text(check_stmt, 2, set_code.c_str(), -1, SQLITE_STATIC);
     int rc = sqlite3_step(check_stmt);
     if (rc == SQLITE_ROW) {
         // Esiste già, aggiorna quantità
@@ -200,7 +254,7 @@ bool Database::insert_card(const std::string& english_name, const std::string& l
     } else {
         sqlite3_finalize(check_stmt);
         // Non esiste, inserisci nuova (imposta added_date alla data/ora corrente in formato ISO)
-        const char* insert_sql = "INSERT INTO cards (english_name, localized_name, name, type, localized_type, colors, set_code, mana_cost, rarity, quantity, image_url, added_date, price_usd) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        const char* insert_sql = "INSERT INTO cards (english_name, localized_name, name, type, localized_type, colors, set_code, mana_cost, rarity, quantity, image_url, added_date, price_usd, deck_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
         sqlite3_stmt* insert_stmt;
         if (sqlite3_prepare_v2(db, insert_sql, -1, &insert_stmt, nullptr) != SQLITE_OK) {
             std::cerr << "Errore prepare insert: " << sqlite3_errmsg(db) << std::endl;
@@ -229,6 +283,11 @@ bool Database::insert_card(const std::string& english_name, const std::string& l
         strftime(timebuf, sizeof(timebuf), "%Y-%m-%dT%H:%M:%S", &local_tm);
         sqlite3_bind_text(insert_stmt, 12, timebuf, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(insert_stmt, 13, price_usd.c_str(), -1, SQLITE_STATIC);
+        if (deck_id != -1) {
+            sqlite3_bind_int(insert_stmt, 14, deck_id);
+        } else {
+            sqlite3_bind_null(insert_stmt, 14);
+        }
         rc = sqlite3_step(insert_stmt);
         sqlite3_finalize(insert_stmt);
         if (rc != SQLITE_DONE) {
@@ -257,31 +316,7 @@ bool Database::delete_card(int id) {
     return true;
 }
 
-bool Database::query(const std::string& sql, const std::function<void(const std::map<std::string, std::string>&)>& callback) {
-    if (!db) return false;
-    struct CallbackData {
-        std::function<void(const std::map<std::string, std::string>&)>* cb;
-        std::vector<std::string> colNames;
-    } data;
-    data.cb = const_cast<std::function<void(const std::map<std::string, std::string>&)>*>(&callback);
-    auto rowCallback = [](void* userData, int argc, char** argv, char** azColName) -> int {
-        CallbackData* d = static_cast<CallbackData*>(userData);
-        std::map<std::string, std::string> row;
-        for (int i = 0; i < argc; ++i) {
-            row[azColName[i] ? azColName[i] : ""] = argv[i] ? argv[i] : "";
-        }
-        (*d->cb)(row);
-        return 0;
-    };
-    char* errMsg = nullptr;
-    int rc = sqlite3_exec(db, sql.c_str(), rowCallback, &data, &errMsg);
-    if (rc != SQLITE_OK) {
-        std::cerr << "Errore SQL: " << errMsg << std::endl;
-        sqlite3_free(errMsg);
-        return false;
-    }
-    return true;
-}
+
 
 bool Database::update_quantity(int id, int new_quantity) {
     const char* sql = "UPDATE cards SET quantity = ? WHERE id = ?";
@@ -344,5 +379,69 @@ bool Database::update_card_info(int id, const std::string& english_name, const s
         std::cerr << "Errore update_card_info: " << sqlite3_errmsg(db) << std::endl;
         return false;
     }
+    return true;
+}
+
+bool Database::create_deck(const std::string& name) {
+    const char* sql = "INSERT INTO decks (name) VALUES (?)";
+    sqlite3_stmt* stmt;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        std::cerr << "Errore prepare create_deck: " << sqlite3_errmsg(db) << std::endl;
+        return false;
+    }
+    sqlite3_bind_text(stmt, 1, name.c_str(), -1, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        std::cerr << "Errore create_deck: " << sqlite3_errmsg(db) << std::endl;
+        return false;
+    }
+    return true;
+}
+
+bool Database::query_decks(const std::function<void(const std::map<std::string, std::string>&)>& callback) {
+    return query("SELECT id, name FROM decks", callback);
+}
+
+bool Database::set_card_deck(int card_id, int deck_id) {
+    const char* sql = "UPDATE cards SET deck_id = ? WHERE id = ?";
+    sqlite3_stmt* stmt;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        std::cerr << "Errore prepare set_card_deck: " << sqlite3_errmsg(db) << std::endl;
+        return false;
+    }
+    if (deck_id != -1) sqlite3_bind_int(stmt, 1, deck_id);
+    else sqlite3_bind_null(stmt, 1);
+    sqlite3_bind_int(stmt, 2, card_id);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        std::cerr << "Errore set_card_deck: " << sqlite3_errmsg(db) << std::endl;
+        return false;
+    }
+    return true;
+}
+
+bool Database::query(const std::string& sql, const std::function<void(const std::map<std::string, std::string>&)>& callback, const std::vector<std::string>& params) {
+    sqlite3_stmt* stmt;
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+        std::cerr << "Errore prepare query: " << sqlite3_errmsg(db) << std::endl;
+        return false;
+    }
+    // Bind params
+    for (size_t i = 0; i < params.size(); ++i) {
+        sqlite3_bind_text(stmt, i + 1, params[i].c_str(), -1, SQLITE_STATIC);
+    }
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        std::map<std::string, std::string> row;
+        int col_count = sqlite3_column_count(stmt);
+        for (int i = 0; i < col_count; ++i) {
+            const char* col_name = sqlite3_column_name(stmt, i);
+            const unsigned char* col_value = sqlite3_column_text(stmt, i);
+            row[col_name ? col_name : ""] = col_value ? (const char*)col_value : "";
+        }
+        callback(row);
+    }
+    sqlite3_finalize(stmt);
     return true;
 }

@@ -1,69 +1,74 @@
 
-#include <fstream>
-#include <iostream>
-#include <iostream>
-#include <gtk/gtk.h>
-#include <cctype>
-#include <string>
-#include <ctime>
-#include <map>
-#include <vector>
-#include <filesystem>
-#include <nlohmann/json.hpp>
-#include "database.h"
-#include "scryfall.h"
-#include "utils.h"
+    // user_data is SearchCtx*
+    struct SearchCtx { GtkListBox *results_box; GtkWindow *main_win; };
+    SearchCtx *sctx = (SearchCtx*)user_data;
+    GtkListBox *results = sctx->results_box;
+    // Clear previous
+    GtkWidget *child = gtk_widget_get_first_child(GTK_WIDGET(results));
+    while (child) {
+        GtkWidget *next = gtk_widget_get_next_sibling(child);
+        gtk_widget_unparent(child);
+        if (G_IS_OBJECT(child)) g_object_unref(child);
+        child = next;
+    }
 
-// Struct per dialog widgets
-typedef struct {
-    GtkWidget *dialog;
-    GtkWidget *entry;
-} DialogWidgets;
-typedef struct _CardRow {
-    GObject parent_instance;
-    int id;
-    gchar *name;
-    gchar *type;
-    gchar *colors;
-    gchar *set_code;
-    gchar *mana_cost;
-    gchar *rarity;
-    int quantity;
-    gchar *translated_colors;
-    int total_mana_cost;
-    gchar *image_url;
-    gchar *added_date; // ISO format: YYYY-MM-DDTHH:MM:SS
-    gchar *price_usd; // Prezzo in USD come stringa
-} CardRow;
+    const char *q = gtk_entry_get_text(entry);
+    if (!q || strlen(q) == 0) return;
+    std::string query = std::string(q);
+    auto cards = search_cards_from_scryfall(query);
+    for (auto &card : cards) {
+        GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+        gtk_widget_set_margin_top(row, 6);
+        gtk_widget_set_margin_bottom(row, 6);
+        GtkWidget *lbl_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+        GtkWidget *title = gtk_label_new(card.english_name.c_str());
+        gtk_label_set_xalign(GTK_LABEL(title), 0.0);
+        gtk_widget_add_css_class(title, "accent");
+        GtkWidget *meta = gtk_label_new((card.set_name + " — " + card.type).c_str());
+        gtk_label_set_xalign(GTK_LABEL(meta), 0.0);
+        gtk_widget_add_css_class(meta, "muted");
+        gtk_box_append(GTK_BOX(lbl_box), title);
+        gtk_box_append(GTK_BOX(lbl_box), meta);
+        gtk_box_append(GTK_BOX(row), lbl_box);
 
-typedef struct _CardRowClass {
-    GObjectClass parent_class;
-} CardRowClass;
+        // Spacer
+        GtkWidget *sp = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+        gtk_widget_set_hexpand(sp, TRUE);
+        gtk_box_append(GTK_BOX(row), sp);
 
-enum {
-    PROP_0,
-    PROP_NAME,
-    PROP_TYPE,
-    PROP_TRANSLATED_COLORS,
-    PROP_TOTAL_MANA_COST,
-    PROP_RARITY,
-    PROP_QUANTITY,
-    N_PROPERTIES
-};
+        // Import button
+        GtkWidget *imp = gtk_button_new_with_label("Importa");
+        gtk_widget_add_css_class(imp, "primary");
+        // Create context for import callback: card + main window
+        struct ImportCtx { ScryfallCard *card; GtkWindow *main_window; };
+        ImportCtx *ictx = new ImportCtx{ new ScryfallCard(card), sctx->main_win };
+        g_signal_connect(imp, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data){
+            ImportCtx *ctx = (ImportCtx*)user_data;
+            ScryfallCard *c = ctx->card;
+            GtkWindow *mainw = ctx->main_window;
+            AppState *state = nullptr;
+            if (mainw) state = (AppState*)g_object_get_data(G_OBJECT(mainw), "app_state");
+            if (!state || !state->db) {
+                g_print("No DB open to import card\n");
+                delete c; delete ctx;
+                return;
+            }
+            int deck_id = -1;
+            int quantity = 1;
+            bool ok = state->db->insert_card(c->english_name, c->localized_name, c->type, c->localized_type, c->colors, c->set_name, c->mana_cost, c->rarity, quantity, c->image_url, c->price_usd, deck_id);
+            if (ok) {
+                g_print("Imported: %s\n", c->english_name.c_str());
+                refresh_card_list(state);
+            } else {
+                g_print("Failed to import %s\n", c->english_name.c_str());
+            }
+            delete c; delete ctx;
+        }), ictx);
+        gtk_box_append(GTK_BOX(row), imp);
 
-G_DEFINE_TYPE(CardRow, card_row, G_TYPE_OBJECT)
-
-static void card_row_finalize(GObject *object) {
-    CardRow *self = (CardRow*)object;
-    g_free(self->name);
-    g_free(self->type);
-    g_free(self->colors);
-    g_free(self->set_code);
-    g_free(self->mana_cost);
-    g_free(self->rarity);
-    g_free(self->translated_colors);
-    g_free(self->image_url);
-    g_free(self->added_date);
+        gtk_list_box_append(results, row);
+    }
+    gtk_widget_show(GTK_WIDGET(results));
     g_free(self->price_usd);
     G_OBJECT_CLASS(card_row_parent_class)->finalize(object);
 }
@@ -168,97 +173,12 @@ static std::string translate_rarity(const std::string& rarity) {
         {"rare", "Rara"},
         {"mythic", "Mitica"}
     };
-    auto it = translations.find(rarity);
-    if (it != translations.end()) return it->second;
-    return rarity; // fallback
-}
-
-static int calculate_total_mana_cost(const std::string& mana_cost) {
-    int total_cost = 0;
-    if (!mana_cost.empty()) {
-        size_t pos = 0;
-        while ((pos = mana_cost.find('{', pos)) != std::string::npos) {
-            size_t end = mana_cost.find('}', pos);
-            if (end != std::string::npos) {
-                std::string symbol = mana_cost.substr(pos + 1, end - pos - 1);
-                try {
-                    int num = std::stoi(symbol);
-                    total_cost += num;
-                } catch (...) {
-                    total_cost += 1;
-                }
-                pos = end + 1;
-            } else {
-                break;
-            }
-        }
-    }
-    return total_cost;
-}
-
-static std::string format_italian_datetime(const std::string& iso) {
-    if (iso.empty()) return "";
-    struct tm tm{};
-    // Parse ISO YYYY-MM-DDTHH:MM:SS
-    if (strptime(iso.c_str(), "%Y-%m-%dT%H:%M:%S", &tm) == nullptr) {
-        return iso;
-    }
-    // Normalize to time_t to get weekday
-    time_t tt = mktime(&tm);
-    if (tt == (time_t)-1) return iso;
-    struct tm local_tm{};
-#if defined(_MSC_VER)
-    localtime_s(&local_tm, &tt);
-#else
-    localtime_r(&tt, &local_tm);
-#endif
-    const char* weekdays[] = {"dom","lun","mar","mer","gio","ven","sab"};
-    const char* months[] = {"gennaio","febbraio","marzo","aprile","maggio","giugno","luglio","agosto","settembre","ottobre","novembre","dicembre"};
-    char buf[128];
-    snprintf(buf, sizeof(buf), "%s %02d %s %d %02d:%02d:%02d",
-             weekdays[local_tm.tm_wday], local_tm.tm_mday, months[local_tm.tm_mon], 1900 + local_tm.tm_year,
-             local_tm.tm_hour, local_tm.tm_min, local_tm.tm_sec);
-    return std::string(buf);
-}
-
-CardRow* card_row_new(int id, const char* name, const char* type, const char* colors, const char* set_code, const char* mana_cost, const char* rarity, int quantity, const char* image_url, const char* added_date, const char* price_usd) {
-    CardRow* row = (CardRow*)g_object_new(card_row_get_type(), NULL);
-    row->id = id;
-    row->name = g_strdup(name);
-    row->type = g_strdup(type);
-    row->colors = g_strdup(colors);
-    row->set_code = g_strdup(set_code);
-    row->mana_cost = g_strdup(mana_cost);
-    std::string trans_rarity = translate_rarity(rarity ? rarity : "");
-    row->rarity = g_strdup(trans_rarity.c_str());
-    row->quantity = quantity;
-    std::string trans = translate_colors(colors ? colors : "");
-    row->translated_colors = g_strdup(trans.c_str());
-    row->total_mana_cost = calculate_total_mana_cost(mana_cost ? mana_cost : "");
-    row->image_url = g_strdup(image_url);
-    row->added_date = g_strdup(added_date ? added_date : "");
-    row->price_usd = g_strdup(price_usd ? price_usd : "");
-    return row;
-}
-
-static std::map<std::string, std::map<std::string, std::string>> translations = {
-    {"Nome", {{"it", "Nome"}, {"en", "Name"}}},
-    {"Tipo", {{"it", "Tipo"}, {"en", "Type"}}},
-    {"Colori", {{"it", "Colori"}, {"en", "Colors"}}},
-    {"Costo Mana", {{"it", "Costo Mana"}, {"en", "Mana Cost"}}},
-    {"Rarità", {{"it", "Rarità"}, {"en", "Rarity"}}},
-    {"Data di aggiunta", {{"it", "Data di aggiunta"}, {"en", "Added Date"}}},
-    {"Quantità", {{"it", "Quantità"}, {"en", "Quantity"}}},
-    {"Nuova Carta", {{"it", "Nuova Carta"}, {"en", "New Card"}}},
-    {"Cerca per nome...", {{"it", "Cerca per nome..."}, {"en", "Search by name..."}}},
-    {"File", {{"it", "File"}, {"en", "File"}}},
-    {"Visualizza", {{"it", "Visualizza"}, {"en", "View"}}},
-    {"Lingua", {{"it", "Lingua"}, {"en", "Language"}}},
-    {"Nuovo Database", {{"it", "Nuovo Database"}, {"en", "New Database"}}},
-    {"Apri Database", {{"it", "Apri Database"}, {"en", "Open Database"}}},
-    {"Ordina Crescente", {{"it", "Ordina Crescente"}, {"en", "Sort Ascending"}}},
-    {"Ordina Decrescente", {{"it", "Ordina Decrescente"}, {"en", "Sort Descending"}}},
-    {"Elimina", {{"it", "Elimina"}, {"en", "Delete"}}},
+    // Search handler uses a small context stored as user_data
+    struct SearchCtx { GtkListBox *results_box; GtkWindow *main_win; };
+    SearchCtx *sctx = new SearchCtx{ GTK_LIST_BOX(results_box), GTK_WINDOW(parent) };
+    // ensure it is freed when window destroyed
+    g_object_set_data_full(G_OBJECT(win), "search_ctx", sctx, +[](gpointer data){ delete (SearchCtx*)data; });
+    g_signal_connect(entry, "activate", G_CALLBACK(on_search_entry_activate), sctx);
     {"Totale carte", {{"it", "Totale carte"}, {"en", "Total cards"}}},
     {"Valore totale", {{"it", "Valore totale"}, {"en", "Total Value"}}}
 };
@@ -329,187 +249,12 @@ struct AppState {
     int selected_deck_id;
     GtkWidget* deck_button;
     GtkWidget* deck_label;
-    GtkWidget* deck_delete_button;
     GMenu *deck_menu;
 };
 
-// Forward declaration for refresh used by deck helpers
+// Forward declarations
 void refresh_card_list(AppState* state);
-// forward-declare populate_deck_menu so helpers can call it
-static void populate_deck_menu(AppState *state);
-// Forward declaration for card-to-deck helper
-static bool add_card_to_deck(AppState* state, int card_id, int to_move, int target_deck_id);
-// Forward declarations for deck-delete handlers (defined later)
-static void on_deck_delete_clicked(GtkButton* button, gpointer user_data);
-static void on_delete_deck_confirmed(GtkButton* button, gpointer user_data);
-static void on_delete_deck_cancel(GtkButton* button, gpointer user_data);
 
-// Forward declarations for export handlers
-static void on_export_database_action(GSimpleAction *action, GVariant *parameter, gpointer user_data);
-static void on_export_deck_action(GSimpleAction *action, GVariant *parameter, gpointer user_data);
-
-// Helper: sanitize a filename (basic), replace spaces with underscore and remove problematic chars
-static std::string sanitize_filename(const std::string &s) {
-    std::string out;
-    for (char c : s) {
-        if (std::isalnum((unsigned char)c) || c == '_' || c == '-' ) out.push_back(c);
-        else if (std::isspace((unsigned char)c)) out.push_back('_');
-        // else skip
-    }
-    if (out.empty()) out = "export";
-    return out;
-}
-
-// Create a styled dialog/window consistent with app theme.
-static GtkWidget* create_styled_dialog(GtkWindow* parent, int width = -1, int height = -1) {
-    GtkWidget* dialog = gtk_window_new();
-    gtk_window_set_modal(GTK_WINDOW(dialog), true);
-    if (parent && GTK_IS_WINDOW(parent)) gtk_window_set_transient_for(GTK_WINDOW(dialog), parent);
-    if (width > 0 && height > 0) gtk_window_set_default_size(GTK_WINDOW(dialog), width, height);
-    // Apply CSS class used earlier for popovers
-    gtk_widget_add_css_class(dialog, "small-popover");
-    return dialog;
-}
-
-// Export helper: queries cards (optionally filtered by deck) and writes a TXT file.
-// If 'deck' is true, deck_id must be provided and file is named <deckname>_data.txt
-// Otherwise file is data/tot_database.txt
-static bool export_cards_to_txt(AppState* state, bool deck, int deck_id, const std::string& lang) {
-    if (!state || !state->db) return false;
-    ensure_data_dir_exists("data");
-    std::string filename;
-    if (deck) {
-        // Query deck name
-        std::string deck_name = "deck";
-        state->db->query("SELECT name FROM decks WHERE id = ?", [&](const std::map<std::string,std::string>& row) {
-            deck_name = row.at("name");
-        }, std::vector<std::string>{std::to_string(deck_id)});
-        std::string safe = sanitize_filename(deck_name);
-        filename = std::string("data/") + safe + "_data.txt";
-    } else {
-        filename = std::string("data/tot_database.txt");
-    }
-
-    std::ofstream out(filename);
-    if (!out) return false;
-
-    // Header
-    out << "id\tname\ttype\tcolors\tset_code\tmana_cost\trarity\tquantity\tadded_date\tprice_usd\n";
-
-    // Build SQL
-    std::string sql = "SELECT id, english_name, localized_name, name, type, localized_type, colors, set_code, mana_cost, rarity, quantity, added_date, price_usd FROM cards";
-    std::vector<std::string> params;
-    if (deck) {
-        sql += " WHERE deck_id = ?";
-        params.push_back(std::to_string(deck_id));
-    }
-    state->db->query(sql, [&](const std::map<std::string,std::string>& row) {
-        std::string name = row.count("english_name") && !row.at("english_name").empty() ? row.at("english_name") : row.at("name");
-        std::string lname = row.count("localized_name") && !row.at("localized_name").empty() ? row.at("localized_name") : row.at("name");
-        std::string type_en = row.count("type") ? row.at("type") : "";
-        std::string type_local = row.count("localized_type") && !row.at("localized_type").empty() ? row.at("localized_type") : type_en;
-        std::string out_name = (lang == "en") ? name : lname;
-        std::string out_type = (lang == "en") ? type_en : type_local;
-        out << row.at("id") << '\t'
-            << out_name << '\t'
-            << out_type << '\t'
-            << (row.count("colors") ? row.at("colors") : "") << '\t'
-            << (row.count("set_code") ? row.at("set_code") : "") << '\t'
-            << (row.count("mana_cost") ? row.at("mana_cost") : "") << '\t'
-            << (row.count("rarity") ? row.at("rarity") : "") << '\t'
-            << (row.count("quantity") ? row.at("quantity") : "0") << '\t'
-            << (row.count("added_date") ? row.at("added_date") : "") << '\t'
-            << (row.count("price_usd") ? row.at("price_usd") : "") << '\n';
-    }, params);
-
-    out.close();
-    std::cout << "Exported to " << filename << std::endl;
-    return true;
-}
-
-// Types and helpers used by the "Aggiungi Carta al Deck" dialog
-struct DeckAddItem {
-    GtkWidget* row;
-    GtkWidget* checkbox;
-    GtkWidget* spin;
-    int card_id;
-    int available;
-};
-
-struct DeckAddOkCtx {
-    AppState* state;
-    GtkWidget* list_box;
-    GtkWindow* dialog;
-};
-
-static void on_deck_add_cancel(GtkButton* button, gpointer user_data) {
-    std::vector<DeckAddItem*>* items = (std::vector<DeckAddItem*>*)user_data;
-    if (!items) return;
-    GtkWidget* dialog = NULL;
-    if (!items->empty() && items->at(0) && items->at(0)->row) {
-        dialog = gtk_widget_get_ancestor(GTK_WIDGET(items->at(0)->row), GTK_TYPE_WINDOW);
-    }
-    // Unref stored widget refs and delete items
-    for (auto p : *items) {
-        if (!p) continue;
-        if (p->row && G_IS_OBJECT(p->row)) g_object_unref(p->row);
-        if (p->checkbox && G_IS_OBJECT(p->checkbox)) g_object_unref(p->checkbox);
-        if (p->spin && G_IS_OBJECT(p->spin)) g_object_unref(p->spin);
-        delete p;
-    }
-    delete items;
-    if (dialog && GTK_IS_WIDGET(dialog)) gtk_window_destroy(GTK_WINDOW(dialog));
-}
-
-static void on_deck_add_ok(GtkButton* button, gpointer user_data) {
-    DeckAddOkCtx* ctx = (DeckAddOkCtx*)user_data;
-    if (!ctx) return;
-    AppState* state = ctx->state;
-    if (!state || !state->db) return;
-    GtkWidget* list_box = ctx->list_box;
-    // Iterate rows in the list_box and for each checked item perform the add/split via helper
-    GtkWidget* row = gtk_widget_get_first_child(GTK_WIDGET(list_box));
-    while (row) {
-        int card_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "card_id"));
-        GtkWidget* hbox = gtk_list_box_row_get_child(GTK_LIST_BOX_ROW(row));
-        if (!hbox) { row = gtk_widget_get_next_sibling(row); continue; }
-        gboolean checked = FALSE;
-        int to_move = 0;
-        GtkWidget* child = gtk_widget_get_first_child(hbox);
-        while (child) {
-            if (GTK_IS_TOGGLE_BUTTON(child)) {
-                checked = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(child));
-            } else if (GTK_IS_SPIN_BUTTON(child)) {
-                to_move = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(child));
-            }
-            child = gtk_widget_get_next_sibling(child);
-        }
-        if (checked && to_move > 0) {
-            if (!add_card_to_deck(state, card_id, to_move, state->selected_deck_id)) {
-                std::cout << "DEBUG: failed to add card " << card_id << " to deck " << state->selected_deck_id << std::endl;
-            }
-        }
-        row = gtk_widget_get_next_sibling(row);
-    }
-    // Refresh UI
-    refresh_card_list(state);
-    populate_deck_menu(state);
-    // Debug: print deck contents after operation to help diagnose UI vs DB discrepancy
-    if (state && state->db) {
-        int did = state->selected_deck_id;
-        std::cout << "DEBUG: on_deck_add_ok selected_deck_id=" << did << std::endl;
-        try {
-            state->db->query("SELECT id, name, quantity FROM cards WHERE deck_id = ?", [&](const std::map<std::string,std::string>& r) {
-                std::cout << "DEBUG: deck row -> id=" << r.at("id") << ", name='" << r.at("name") << "', qty=" << r.at("quantity") << std::endl;
-            }, std::vector<std::string>{std::to_string(did)});
-        } catch (...) {
-            std::cout << "DEBUG: error querying deck contents" << std::endl;
-        }
-    }
-    // Destroy dialog
-    if (ctx->dialog) gtk_window_destroy(GTK_WINDOW(ctx->dialog));
-    delete ctx;
-}
 
 // Populate the File->Seleziona Deck submenu with decks from the DB
 static void populate_deck_menu(AppState *state) {
@@ -558,12 +303,8 @@ static void on_select_deck_id(GSimpleAction *action, GVariant *parameter, gpoint
         gtk_label_set_text(GTK_LABEL(state->deck_label), lbl.c_str());
         gtk_widget_set_visible(state->deck_label, TRUE);
     }
-    if (state->deck_delete_button) {
-        gtk_widget_set_visible(state->deck_delete_button, TRUE);
-    }
     refresh_card_list(state);
 }
-
 
 static void update_ui_texts(GtkWindow *window, AppState* state) {
     gtk_column_view_column_set_title(state->name_col, translate("Nome").c_str());
@@ -577,15 +318,22 @@ static void update_ui_texts(GtkWindow *window, AppState* state) {
     gtk_menu_button_set_label(GTK_MENU_BUTTON(state->file_button), translate("File").c_str());
     gtk_menu_button_set_label(GTK_MENU_BUTTON(state->view_button), translate("Visualizza").c_str());
     gtk_entry_set_placeholder_text(GTK_ENTRY(state->search_entry), translate("Cerca per nome...").c_str());
-    // Update total label (only show total quantity)
+    // Update total label
     char buf[128];
     int total_qty = 0;
+    double total_value = 0.0;
     if (state->db) {
-        state->db->query("SELECT quantity FROM cards", [&](const std::map<std::string, std::string>& row) {
+        state->db->query("SELECT quantity, price_usd FROM cards", [&](const std::map<std::string, std::string>& row) {
             total_qty += std::stoi(row.at("quantity"));
+            if (!row.at("price_usd").empty()) {
+                try {
+                    double price = std::stod(row.at("price_usd"));
+                    total_value += price * std::stoi(row.at("quantity"));
+                } catch (...) {}
+            }
         });
     }
-    snprintf(buf, sizeof(buf), "%s: %d", translate("Totale carte").c_str(), total_qty);
+    snprintf(buf, sizeof(buf), "%s: %d | %s: $%.2f", translate("Totale carte").c_str(), total_qty, translate("Valore totale").c_str(), total_value);
     gtk_label_set_text(GTK_LABEL(state->total_cards_label), buf);
 }
 
@@ -630,7 +378,7 @@ static void sort_card_list(AppState* state, const char* column, bool asc) {
     g_list_store_remove_all(state->card_store);
     for (auto row : items) {
         g_list_store_append(state->card_store, row);
-        g_object_unref(row);
+    if (G_IS_OBJECT(row)) g_object_unref(row);
     }
 }
 
@@ -646,7 +394,6 @@ struct AddCardContext {
 static std::vector<std::map<std::string, std::string>> load_cards_from_db(Database* db, const std::string& filter = "", int deck_filter = -1) {
     std::vector<std::map<std::string, std::string>> cards;
     if (!db) return cards;
-    // Build SQL and optional params for deck filtering
     std::string sql = "SELECT id, english_name, localized_name, name, type, localized_type, colors, set_code, mana_cost, rarity, quantity, image_url, added_date, price_usd FROM cards";
     std::vector<std::string> params;
     if (deck_filter != -1) {
@@ -702,27 +449,12 @@ void refresh_card_list(AppState* state) {
                                      row.count("added_date") ? row.at("added_date").c_str() : "",
                                      row.count("price_usd") ? row.at("price_usd").c_str() : "");
         g_list_store_append(state->card_store, crow);
-        g_object_unref(crow);
-        // Accumulate totals
-        try {
-            int qty = std::stoi(row.at("quantity"));
-            total_quantity += qty;
-            if (row.count("price_usd") && !row.at("price_usd").empty()) {
-                try {
-                    double price = std::stod(row.at("price_usd"));
-                    total_value += price * qty;
-                } catch (...) {}
-            }
-        } catch (...) {
-            // ignore parse errors
-        }
+    if (G_IS_OBJECT(crow)) g_object_unref(crow);
     }
-    // Update total cards label (only total quantity)
+    // Update total cards label
     char buf[128];
-    snprintf(buf, sizeof(buf), "Totale carte: %d", total_quantity);
+    snprintf(buf, sizeof(buf), "Totale carte: %d | Valore totale: $%.2f", total_quantity, total_value);
     gtk_label_set_text(GTK_LABEL(state->total_cards_label), buf);
-    // Debug log to help track down cases where UI shows zero
-    std::cout << "DEBUG: totals computed -> quantity=" << total_quantity << ", value=$" << total_value << std::endl;
     // Update the columnview model
     // GtkSelectionModel *selection = GTK_SELECTION_MODEL(gtk_single_selection_new(G_LIST_MODEL(state->card_store)));
     // gtk_column_view_set_model(state->column_view, selection);
@@ -730,75 +462,6 @@ void refresh_card_list(AppState* state) {
     // Force redraw
     gtk_widget_queue_draw(GTK_WIDGET(state->column_view));
     // gtk_widget_queue_draw(state->listview);
-}
-
-// Helper: remove (move) cards from a deck back to the main database (deck_id NULL).
-// If to_remove >= current quantity -> move entire row to main (merging if main already has it).
-// Otherwise -> reduce deck row quantity and insert/merge the removed quantity into main DB.
-static bool remove_card_from_deck(AppState* state, int card_id, int to_remove) {
-    if (!state || !state->db) return false;
-    int current_qty = 0;
-    if (!state->db->get_card_quantity(card_id, current_qty)) return false;
-    if (to_remove <= 0) return false;
-    // Fetch full row data
-    std::map<std::string,std::string> crow;
-    if (!state->db->query("SELECT english_name, localized_name, type, localized_type, colors, set_code, mana_cost, rarity, image_url, price_usd FROM cards WHERE id = ?", [&](const std::map<std::string,std::string>& r){ crow = r; }, std::vector<std::string>{std::to_string(card_id)})) {
-        return false;
-    }
-    if (crow.empty()) return false;
-    std::string en = crow.count("english_name") ? crow["english_name"] : "";
-    std::string ln = crow.count("localized_name") ? crow["localized_name"] : en;
-    std::string ty = crow.count("type") ? crow["type"] : "";
-    std::string lty = crow.count("localized_type") ? crow["localized_type"] : ty;
-    std::string cols = crow.count("colors") ? crow["colors"] : "";
-    std::string setc = crow.count("set_code") ? crow["set_code"] : "";
-    std::string mana = crow.count("mana_cost") ? crow["mana_cost"] : "";
-    std::string rar = crow.count("rarity") ? crow["rarity"] : "";
-    std::string img = crow.count("image_url") ? crow["image_url"] : "";
-    std::string price = crow.count("price_usd") ? crow["price_usd"] : "";
-
-    if (to_remove >= current_qty) {
-        // Move entire row: insert into main (deck_id = -1) merged, then delete original
-        bool ok = state->db->insert_card(en, ln, ty, lty, cols, setc, mana, rar, current_qty, img, price, -1);
-        if (!ok) return false;
-        return state->db->delete_card(card_id);
-    }
-    // Partial remove: decrease original and insert into main deckless rows
-    if (!state->db->update_quantity(card_id, current_qty - to_remove)) return false;
-    return state->db->insert_card(en, ln, ty, lty, cols, setc, mana, rar, to_remove, img, price, -1);
-}
-
-// Helper: move or split a card into a deck. If to_move >= current quantity, the card's deck_id
-// is set to target_deck_id. Otherwise original quantity is reduced and a new/merged card row
-// is inserted for the target deck using Database::insert_card.
-static bool add_card_to_deck(AppState* state, int card_id, int to_move, int target_deck_id) {
-    if (!state || !state->db) return false;
-    int current_qty = 0;
-    if (!state->db->get_card_quantity(card_id, current_qty)) return false;
-    if (to_move <= 0) return false;
-    if (to_move >= current_qty) {
-        return state->db->set_card_deck(card_id, target_deck_id);
-    }
-    // Need to split: reduce original quantity and insert/move 'to_move' to target deck
-    if (!state->db->update_quantity(card_id, current_qty - to_move)) return false;
-    // Fetch full row for insertion
-    std::map<std::string,std::string> crow;
-    if (!state->db->query("SELECT english_name, localized_name, type, localized_type, colors, set_code, mana_cost, rarity, image_url, price_usd FROM cards WHERE id = ?", [&](const std::map<std::string,std::string>& r){ crow = r; }, std::vector<std::string>{std::to_string(card_id)})) {
-        return false;
-    }
-    if (crow.empty()) return false;
-    std::string en = crow.count("english_name") ? crow["english_name"] : "";
-    std::string ln = crow.count("localized_name") ? crow["localized_name"] : en;
-    std::string ty = crow.count("type") ? crow["type"] : "";
-    std::string lty = crow.count("localized_type") ? crow["localized_type"] : ty;
-    std::string cols = crow.count("colors") ? crow["colors"] : "";
-    std::string setc = crow.count("set_code") ? crow["set_code"] : "";
-    std::string mana = crow.count("mana_cost") ? crow["mana_cost"] : "";
-    std::string rar = crow.count("rarity") ? crow["rarity"] : "";
-    std::string img = crow.count("image_url") ? crow["image_url"] : "";
-    std::string price = crow.count("price_usd") ? crow["price_usd"] : "";
-    // Use Database::insert_card which will merge into existing identical card in the target deck
-    return state->db->insert_card(en, ln, ty, lty, cols, setc, mana, rar, to_move, img, price, target_deck_id);
 }
 
 static void on_add_card_ok_clicked(GtkButton *button, gpointer user_data) {
@@ -812,14 +475,16 @@ static void on_add_card_ok_clicked(GtkButton *button, gpointer user_data) {
     auto cards = search_cards_from_scryfall(card_name);
     
     if (cards.empty()) {
-    GtkWindow* parent = ctx->parent;
-    GtkWidget *anc = gtk_widget_get_ancestor(ctx->entry, GTK_TYPE_WINDOW);
-    if (anc && GTK_IS_WIDGET(anc)) gtk_window_destroy(GTK_WINDOW(anc));
-    delete ctx;
+        GtkWindow* parent = ctx->parent;
+        {
+            GtkWidget* anc = gtk_widget_get_ancestor(ctx->entry, GTK_TYPE_WINDOW);
+            if (anc && GTK_IS_WIDGET(anc)) gtk_window_destroy(GTK_WINDOW(anc));
+        }
+        delete ctx;
         std::string msg = "Nessuna carta trovata per: " + std::string(card_name);
         GtkAlertDialog *alert = gtk_alert_dialog_new("%s", msg.c_str());
         gtk_alert_dialog_show(alert, parent);
-        g_object_unref(alert);
+    if (G_IS_OBJECT(alert)) g_object_unref(alert);
     } else if (cards.size() == 1 && cards[0].is_exact_match) {
         // Carta singola trovata esattamente
         auto& card = cards[0];
@@ -835,7 +500,8 @@ static void on_add_card_ok_clicked(GtkButton *button, gpointer user_data) {
         msg += "Testo: " + card.oracle_text;
         
         if (state && state->db) {
-            bool success = state->db->insert_card(card.english_name, card.localized_name, card.type, card.localized_type, card.colors, card.set_name, card.mana_cost, card.rarity, quantity, card.image_url, card.price_usd);
+            int deck_id = state->selected_deck_id;
+            bool success = state->db->insert_card(card.english_name, card.localized_name, card.type, card.localized_type, card.colors, card.set_name, card.mana_cost, card.rarity, quantity, card.image_url, card.price_usd, deck_id);
             std::cout << "Inserted card: " << card.english_name << " in set " << card.set_name << " qty " << quantity << " success: " << success << std::endl;
             if (success) {
                 refresh_card_list(state);
@@ -848,17 +514,22 @@ static void on_add_card_ok_clicked(GtkButton *button, gpointer user_data) {
             msg += "\n\n[ERRORE: Nessun database aperto]";
         }
         
-    GtkWindow* parent = ctx->parent;
-    GtkWidget *anc = gtk_widget_get_ancestor(ctx->entry, GTK_TYPE_WINDOW);
-    if (anc && GTK_IS_WIDGET(anc)) gtk_window_destroy(GTK_WINDOW(anc));
-    delete ctx;
+        GtkWindow* parent = ctx->parent;
+        {
+            GtkWidget* anc = gtk_widget_get_ancestor(ctx->entry, GTK_TYPE_WINDOW);
+            if (anc && GTK_IS_WIDGET(anc)) gtk_window_destroy(GTK_WINDOW(anc));
+        }
+        delete ctx;
         GtkAlertDialog *alert = gtk_alert_dialog_new("%s", msg.c_str());
         gtk_alert_dialog_show(alert, parent);
-        g_object_unref(alert);
+    if (G_IS_OBJECT(alert)) g_object_unref(alert);
     } else {
-    // Multiple corrispondenze - mostra finestra di dialogo per scegliere
-    GtkWidget *dialog = create_styled_dialog(GTK_WINDOW(ctx->parent), 400, 300);
-    gtk_window_set_title(GTK_WINDOW(dialog), "Seleziona Carta");
+        // Multiple corrispondenze - mostra finestra di dialogo per scegliere
+        GtkWidget *dialog = gtk_window_new();
+        gtk_window_set_title(GTK_WINDOW(dialog), "Seleziona Carta");
+        gtk_window_set_modal(GTK_WINDOW(dialog), true);
+        gtk_window_set_transient_for(GTK_WINDOW(dialog), ctx->parent);
+        gtk_window_set_default_size(GTK_WINDOW(dialog), 400, 300);
 
         GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
         gtk_window_set_child(GTK_WINDOW(dialog), box);
@@ -941,7 +612,8 @@ static void on_add_card_ok_clicked(GtkButton *button, gpointer user_data) {
                 msg += "Testo: " + card.oracle_text;
                 
                 if (ctx->state && ctx->state->db) {
-                    bool success = ctx->state->db->insert_card(card.english_name, card.localized_name, card.type, card.localized_type, card.colors, card.set_name, card.mana_cost, card.rarity, ctx->quantity, card.image_url, card.price_usd);
+                    int deck_id = ctx->state->selected_deck_id;
+                    bool success = ctx->state->db->insert_card(card.english_name, card.localized_name, card.type, card.localized_type, card.colors, card.set_name, card.mana_cost, card.rarity, ctx->quantity, card.image_url, card.price_usd, deck_id);
                     std::cout << "Inserted card: " << card.english_name << " in set " << card.set_name << " qty " << ctx->quantity << " success: " << success << std::endl;
                     if (success) {
                         refresh_card_list(ctx->state);
@@ -956,7 +628,7 @@ static void on_add_card_ok_clicked(GtkButton *button, gpointer user_data) {
                 
                 GtkAlertDialog *alert = gtk_alert_dialog_new("%s", msg.c_str());
                 gtk_alert_dialog_show(alert, ctx->parent);
-                g_object_unref(alert);
+                if (G_IS_OBJECT(alert)) g_object_unref(alert);
                 
                 // Chiudi entrambe le finestre
                 GtkWidget* search_dialog = gtk_widget_get_ancestor(ctx->original_ctx->entry, GTK_TYPE_WINDOW);
@@ -981,7 +653,6 @@ static void on_add_card_ok_clicked(GtkButton *button, gpointer user_data) {
 static void on_add_card_clicked(GtkButton *button, gpointer user_data) {
     GtkWindow *parent = GTK_WINDOW(user_data);
     AppState* state = (AppState*)g_object_get_data(G_OBJECT(parent), "app_state");
-    std::cout << "DEBUG: on_add_card_clicked called; parent=" << parent << ", state=" << state << std::endl;
     
     // Controlla se c'è un database aperto
     if (!state->db) {
@@ -997,7 +668,6 @@ static void on_add_card_clicked(GtkButton *button, gpointer user_data) {
         
         if (dbs.empty()) {
             // Crea nuovo database automaticamente
-            std::cout << "DEBUG: no db files found; creating new DB at data/collection.db" << std::endl;
             std::string db_path = "data/collection.db";
             if (state->db) delete state->db;
             state->db = new Database(db_path);
@@ -1008,13 +678,13 @@ static void on_add_card_clicked(GtkButton *button, gpointer user_data) {
             std::ofstream lastdb("lastdb.txt");
             lastdb << db_path << std::endl;
             refresh_card_list(state);
-            // Populate deck menu for the auto-created DB
-            populate_deck_menu(state);
         } else {
             // Mostra dialogo per scegliere database
-            std::cout << "DEBUG: showing DB selection dialog" << std::endl;
-            GtkWidget *dialog = create_styled_dialog(parent, 300, 200);
+            GtkWidget *dialog = gtk_window_new();
             gtk_window_set_title(GTK_WINDOW(dialog), "Scegli Database");
+            gtk_window_set_modal(GTK_WINDOW(dialog), true);
+            gtk_window_set_transient_for(GTK_WINDOW(dialog), parent);
+            gtk_window_set_default_size(GTK_WINDOW(dialog), 300, 200);
             
             GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
             gtk_window_set_child(GTK_WINDOW(dialog), box);
@@ -1080,75 +750,16 @@ static void on_add_card_clicked(GtkButton *button, gpointer user_data) {
             }), ctx);
             
             gtk_window_present(GTK_WINDOW(dialog));
-            std::cout << "DEBUG: DB selection dialog presented" << std::endl;
             return;  // Non continuare se stiamo mostrando il dialogo di selezione
         }
     }
     
-    // If we're currently viewing a specific deck, open the "Aggiungi Carta" dialog
-    if (state && state->selected_deck_id != -1) {
-        std::cout << "DEBUG: in deck view, opening 'Aggiungi Carta al Deck' dialog; selected_deck_id=" << state->selected_deck_id << std::endl;
-        GtkWidget *dialog = create_styled_dialog(parent, 500, 400);
-        gtk_window_set_title(GTK_WINDOW(dialog), "Aggiungi Carta al Deck");
-
-        GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
-        gtk_window_set_child(GTK_WINDOW(dialog), vbox);
-
-        GtkWidget *scrolled = gtk_scrolled_window_new();
-        gtk_widget_set_vexpand(scrolled, TRUE);
-        gtk_box_append(GTK_BOX(vbox), scrolled);
-
-        GtkWidget *list_box = gtk_list_box_new();
-        gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scrolled), list_box);
-
-        // Query cards with deck_id IS NULL
-        state->db->query("SELECT id, english_name, localized_name, name, set_code, quantity FROM cards WHERE deck_id IS NULL ORDER BY name", [&](const std::map<std::string, std::string>& row) {
-            int cid = std::stoi(row.at("id"));
-            int qty = 0;
-            try { qty = std::stoi(row.at("quantity")); } catch(...) { qty = 0; }
-            if (qty <= 0) return; // skip
-            std::string display = row.count("localized_name") && !row.at("localized_name").empty() ? row.at("localized_name") : row.at("english_name");
-            display += " (" + row.at("set_code") + ") - Disponibili: " + std::to_string(qty);
-            GtkWidget *roww = gtk_list_box_row_new();
-            GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-            gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(roww), hbox);
-
-            GtkWidget *check = gtk_check_button_new();
-            gtk_box_append(GTK_BOX(hbox), check);
-            GtkWidget *label = gtk_label_new(display.c_str());
-            gtk_label_set_xalign(GTK_LABEL(label), 0.0);
-            gtk_box_append(GTK_BOX(hbox), label);
-            GtkWidget *spin = gtk_spin_button_new_with_range(1, qty, 1);
-            gtk_spin_button_set_value(GTK_SPIN_BUTTON(spin), 1);
-            gtk_box_append(GTK_BOX(hbox), spin);
-
-            // Store the card id on the row so we can read it later from the list box
-            g_object_set_data(G_OBJECT(roww), "card_id", GINT_TO_POINTER(cid));
-            gtk_list_box_append(GTK_LIST_BOX(list_box), roww);
-        });
-
-        GtkWidget *button_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-        gtk_box_append(GTK_BOX(vbox), button_box);
-        GtkWidget *ok_button = gtk_button_new_with_label("Aggiungi");
-        GtkWidget *cancel_button = gtk_button_new_with_label("Annulla");
-        gtk_box_append(GTK_BOX(button_box), ok_button);
-        gtk_box_append(GTK_BOX(button_box), cancel_button);
-
-        // Handle Cancel / OK
-        g_signal_connect_swapped(cancel_button, "clicked", G_CALLBACK(gtk_window_destroy), dialog);
-    DeckAddOkCtx* okctx = new DeckAddOkCtx;
-    okctx->state = state;
-    okctx->list_box = list_box;
-    okctx->dialog = GTK_WINDOW(dialog);
-    g_signal_connect(ok_button, "clicked", G_CALLBACK(on_deck_add_ok), okctx);
-
-        gtk_window_present(GTK_WINDOW(dialog));
-        std::cout << "DEBUG: Aggiungi Carta al Deck dialog presented" << std::endl;
-        return;
-    }
     // Ora che abbiamo un database aperto, mostra il dialogo di ricerca
-    GtkWidget *dialog = create_styled_dialog(parent, 350, 100);
+    GtkWidget *dialog = gtk_window_new();
     gtk_window_set_title(GTK_WINDOW(dialog), "Cerca carta su Scryfall");
+    gtk_window_set_modal(GTK_WINDOW(dialog), true);
+    gtk_window_set_transient_for(GTK_WINDOW(dialog), parent);
+    gtk_window_set_default_size(GTK_WINDOW(dialog), 350, 100);
 
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
     gtk_window_set_child(GTK_WINDOW(dialog), box);
@@ -1161,7 +772,7 @@ static void on_add_card_clicked(GtkButton *button, gpointer user_data) {
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(spin), 1);
     gtk_box_append(GTK_BOX(box), spin);
 
-    GtkWidget *button_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    GtkWidget *button_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     gtk_box_append(GTK_BOX(box), button_box);
     GtkWidget *ok_button = gtk_button_new_with_label("Cerca");
     GtkWidget *cancel_button = gtk_button_new_with_label("Annulla");
@@ -1180,7 +791,6 @@ static void on_add_card_clicked(GtkButton *button, gpointer user_data) {
     g_signal_connect(entry, "activate", G_CALLBACK(on_add_card_ok_clicked), ctx);
 
     gtk_window_present(GTK_WINDOW(dialog));
-    std::cout << "DEBUG: Cerca carta su Scryfall dialog presented" << std::endl;
 }
 
 static void on_new_db_ok_clicked(GtkButton *button, gpointer user_data) {
@@ -1206,8 +816,6 @@ static void on_new_db_ok_clicked(GtkButton *button, gpointer user_data) {
             // Salva percorso su file
             std::ofstream lastdb("lastdb.txt");
             lastdb << db_path << std::endl;
-            // Populate deck menu for the new database
-            populate_deck_menu(state);
         }
     Database db(db_path);
     db.execute("CREATE TABLE IF NOT EXISTS cards (id INTEGER PRIMARY KEY, name TEXT, type TEXT, colors TEXT, set_code TEXT, mana_cost TEXT, rarity TEXT, quantity INTEGER, image_url TEXT, added_date TEXT, price_usd TEXT)");
@@ -1224,8 +832,11 @@ static void on_new_db_cancel_clicked(GtkButton *button, gpointer user_data) {
 
 static void on_new_db_clicked(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
     GtkWindow *parent = GTK_WINDOW(user_data);
-    GtkWidget *dialog = create_styled_dialog(parent, 320, 140);
+    GtkWidget *dialog = gtk_window_new();
     gtk_window_set_title(GTK_WINDOW(dialog), "Nuovo Database");
+    gtk_window_set_modal(GTK_WINDOW(dialog), true);
+    gtk_window_set_transient_for(GTK_WINDOW(dialog), parent);
+    gtk_window_set_default_size(GTK_WINDOW(dialog), 100, 100);
 
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
     gtk_window_set_child(GTK_WINDOW(dialog), box);
@@ -1291,7 +902,7 @@ static void on_row_enter(GtkEventControllerMotion*, double x, double y, gpointer
         GdkTexture *texture = gdk_texture_new_from_bytes(bytes, nullptr);
         if (texture) {
             gtk_picture_set_paintable(GTK_PICTURE(picture), GDK_PAINTABLE(texture));
-            g_object_unref(texture);
+            if (G_IS_OBJECT(texture)) g_object_unref(texture);
         }
         g_bytes_unref(bytes);
     }
@@ -1306,14 +917,12 @@ static void on_row_enter(GtkEventControllerMotion*, double x, double y, gpointer
     gtk_box_append(GTK_BOX(box), picture);
     gtk_widget_set_size_request(box, 60, 84);
     GtkWidget *window = gtk_window_new();
-    // Style the preview window to match app theme
-    gtk_widget_add_css_class(window, "small-popover");
     gtk_window_set_decorated(GTK_WINDOW(window), FALSE);
     gtk_window_set_modal(GTK_WINDOW(window), FALSE);
     {
-        GtkWidget *parent_win = gtk_widget_get_ancestor(label, GTK_TYPE_WINDOW);
-        if (parent_win && GTK_IS_WIDGET(parent_win)) {
-            gtk_window_set_transient_for(GTK_WINDOW(window), GTK_WINDOW(parent_win));
+        GtkWidget* parent = gtk_widget_get_ancestor(label, GTK_TYPE_WINDOW);
+        if (parent && GTK_IS_WIDGET(parent)) {
+            gtk_window_set_transient_for(GTK_WINDOW(window), GTK_WINDOW(parent));
         }
     }
     gtk_window_set_child(GTK_WINDOW(window), box);
@@ -1334,14 +943,12 @@ static void on_row_right_click(GtkGestureClick *gesture, int n_press, double x, 
     std::cout << "Right click on row id: " << row->id << ", name: " << (row->name ? row->name : "NULL") << std::endl;
     // Trova lo state dal widget
     GtkWidget *label = gtk_event_controller_get_widget(GTK_EVENT_CONTROLLER(gesture));
+    if (!label || !GTK_IS_WIDGET(label)) return;
     GtkWidget *column_view = gtk_widget_get_ancestor(label, GTK_TYPE_COLUMN_VIEW);
-    if (!column_view) return;
-    /* Safely obtain the application state stored on the root/toplevel object. */
+    if (!column_view || !GTK_IS_WIDGET(column_view)) return;
     GtkRoot *root = gtk_widget_get_root(column_view);
-    AppState *state = NULL;
-    if (root && G_IS_OBJECT(root)) {
-        state = (AppState*)g_object_get_data(G_OBJECT(root), "app_state");
-    }
+    if (!root) return;
+    AppState *state = (AppState*)g_object_get_data(G_OBJECT(root), "app_state");
     if (!state) return;
     // Mostra menu
     GtkWidget *menu = gtk_popover_menu_new_from_model(G_MENU_MODEL(create_context_menu(row, state)));
@@ -1366,28 +973,20 @@ static void on_delete_card(GSimpleAction *action, GVariant *parameter, gpointer 
         std::cout << "Error getting quantity for card " << id << std::endl;
         return;
     }
-    bool in_deck_view = state->selected_deck_id != -1;
     if (qty == 1) {
-        if (in_deck_view) {
-            // Remove single copy from this deck (move back to main/merge)
-            if (remove_card_from_deck(state, id, 1)) {
-                std::cout << "Removed card id " << id << " from deck " << state->selected_deck_id << std::endl;
-                refresh_card_list(state);
-            } else {
-                std::cout << "Error removing card from deck" << std::endl;
-            }
+        if (state->db->delete_card(id)) {
+            std::cout << "Deleted card with id " << id << std::endl;
+            refresh_card_list(state);
         } else {
-            if (state->db->delete_card(id)) {
-                std::cout << "Deleted card with id " << id << std::endl;
-                refresh_card_list(state);
-            } else {
-                std::cout << "Error deleting card" << std::endl;
-            }
+            std::cout << "Error deleting card" << std::endl;
         }
     } else {
-    // Show dialog to choose how many to delete
-    GtkWidget *dialog = create_styled_dialog(window, 320, 120);
-    gtk_window_set_title(GTK_WINDOW(dialog), "Elimina Carte");
+        // Mostra dialogo per scegliere quante eliminare
+        GtkWidget *dialog = gtk_window_new();
+        gtk_window_set_title(GTK_WINDOW(dialog), "Elimina Carte");
+        gtk_window_set_modal(GTK_WINDOW(dialog), true);
+        gtk_window_set_transient_for(GTK_WINDOW(dialog), window);
+        gtk_window_set_default_size(GTK_WINDOW(dialog), 300, 100);
 
         GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
         gtk_window_set_child(GTK_WINDOW(dialog), box);
@@ -1416,43 +1015,33 @@ static void on_delete_card(GSimpleAction *action, GVariant *parameter, gpointer 
             GtkWidget* spin;
             GtkWidget* dialog;
         };
-
+        
         DeleteContext* ctx = new DeleteContext{state, id, qty, spin, dialog};
-
+        
         g_signal_connect(ok_button, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data) {
             DeleteContext* ctx = (DeleteContext*)user_data;
             int to_delete = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(ctx->spin));
-            bool in_deck_view = ctx->state->selected_deck_id != -1;
-            if (in_deck_view) {
-                // Remove from deck (move back to main) — helper handles full or partial
-                if (remove_card_from_deck(ctx->state, ctx->id, to_delete)) {
-                    std::cout << "Removed " << to_delete << " of card id " << ctx->id << " from deck " << ctx->state->selected_deck_id << std::endl;
+            if (to_delete >= ctx->qty) {
+                // Elimina completamente
+                if (ctx->state->db->delete_card(ctx->id)) {
+                    std::cout << "Deleted card with id " << ctx->id << std::endl;
                 } else {
-                    std::cout << "Error removing card from deck" << std::endl;
+                    std::cout << "Error deleting card" << std::endl;
                 }
             } else {
-                if (to_delete >= ctx->qty) {
-                    // Delete completely from main DB
-                    if (ctx->state->db->delete_card(ctx->id)) {
-                        std::cout << "Deleted card with id " << ctx->id << std::endl;
-                    } else {
-                        std::cout << "Error deleting card" << std::endl;
-                    }
+                // Aggiorna quantità
+                int new_qty = ctx->qty - to_delete;
+                if (ctx->state->db->update_quantity(ctx->id, new_qty)) {
+                    std::cout << "Updated card id " << ctx->id << " quantity to " << new_qty << std::endl;
                 } else {
-                    // Update quantity in main DB
-                    int new_qty = ctx->qty - to_delete;
-                    if (ctx->state->db->update_quantity(ctx->id, new_qty)) {
-                        std::cout << "Updated card id " << ctx->id << " quantity to " << new_qty << std::endl;
-                    } else {
-                        std::cout << "Error updating quantity" << std::endl;
-                    }
+                    std::cout << "Error updating quantity" << std::endl;
                 }
             }
             refresh_card_list(ctx->state);
             gtk_window_destroy(GTK_WINDOW(ctx->dialog));
             delete ctx;
         }), ctx);
-
+        
         g_signal_connect(cancel_button, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data) {
             DeleteContext* ctx = (DeleteContext*)user_data;
             gtk_window_destroy(GTK_WINDOW(ctx->dialog));
@@ -1463,83 +1052,6 @@ static void on_delete_card(GSimpleAction *action, GVariant *parameter, gpointer 
     }
 }
 
-// Context for deleting a deck (used by the dialog handlers)
-struct DeleteDeckCtx {
-    AppState* state;
-    int deck_id;
-    GtkWidget* dialog;
-};
-
-static void on_delete_deck_confirmed(GtkButton* button, gpointer user_data) {
-    DeleteDeckCtx* ctx = (DeleteDeckCtx*)user_data;
-    AppState* state = ctx->state;
-    int deck_id = ctx->deck_id;
-    if (!state || !state->db) {
-        if (ctx->dialog) gtk_window_destroy(GTK_WINDOW(ctx->dialog));
-        delete ctx;
-        return;
-    }
-    // Move all cards from this deck back to main collection
-    state->db->query("SELECT id, quantity FROM cards WHERE deck_id = ?", [&](const std::map<std::string,std::string>& row) {
-        int cid = 0;
-        int qty = 0;
-        try { cid = std::stoi(row.at("id")); } catch(...) { cid = 0; }
-        try { qty = std::stoi(row.at("quantity")); } catch(...) { qty = 0; }
-        if (cid > 0 && qty > 0) {
-            if (!remove_card_from_deck(state, cid, qty)) {
-                std::cout << "Error moving card id " << cid << " from deck " << deck_id << std::endl;
-            }
-        }
-    }, std::vector<std::string>{std::to_string(deck_id)});
-    // Delete the deck record
-    std::string delsql = "DELETE FROM decks WHERE id = " + std::to_string(deck_id);
-    state->db->execute(delsql);
-    // Clear selection and hide controls
-    state->selected_deck_id = -1;
-    if (state->deck_button) {
-        gtk_widget_set_visible(state->deck_button, FALSE);
-        gtk_button_set_label(GTK_BUTTON(state->deck_button), "");
-    }
-    if (state->deck_label) gtk_widget_set_visible(state->deck_label, FALSE);
-    if (state->deck_delete_button) gtk_widget_set_visible(state->deck_delete_button, FALSE);
-    populate_deck_menu(state);
-    refresh_card_list(state);
-    if (ctx->dialog) gtk_window_destroy(GTK_WINDOW(ctx->dialog));
-    delete ctx;
-}
-
-static void on_delete_deck_cancel(GtkButton* button, gpointer user_data) {
-    DeleteDeckCtx* ctx = (DeleteDeckCtx*)user_data;
-    if (ctx->dialog) gtk_window_destroy(GTK_WINDOW(ctx->dialog));
-    delete ctx;
-}
-
-static void on_deck_delete_clicked(GtkButton* button, gpointer user_data) {
-    GtkWindow *window = GTK_WINDOW(user_data);
-    AppState* state = (AppState*)g_object_get_data(G_OBJECT(window), "app_state");
-    if (!state || !state->db) return;
-    int deck_id = state->selected_deck_id;
-    if (deck_id == -1) return;
-    // Confirmation dialog
-    GtkWidget *dialog = create_styled_dialog(window, 360, 140);
-    gtk_window_set_title(GTK_WINDOW(dialog), "Elimina Deck");
-    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
-    gtk_window_set_child(GTK_WINDOW(dialog), box);
-    GtkWidget *label = gtk_label_new("Sei sicuro di voler eliminare il deck? Le carte torneranno nella collezione principale.");
-    gtk_box_append(GTK_BOX(box), label);
-    GtkWidget *button_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
-    gtk_box_append(GTK_BOX(box), button_box);
-    GtkWidget *ok_button = gtk_button_new_with_label("Elimina");
-    GtkWidget *cancel_button = gtk_button_new_with_label("Annulla");
-    gtk_box_append(GTK_BOX(button_box), ok_button);
-    gtk_box_append(GTK_BOX(button_box), cancel_button);
-
-    DeleteDeckCtx* ctx = new DeleteDeckCtx{state, deck_id, dialog};
-    g_signal_connect(ok_button, "clicked", G_CALLBACK(on_delete_deck_confirmed), ctx);
-    g_signal_connect(cancel_button, "clicked", G_CALLBACK(on_delete_deck_cancel), ctx);
-    gtk_window_present(GTK_WINDOW(dialog));
-}
-
 // Handler per aggiungere una carta a un mazzo (action: app.add_to_deck, parameter: int card_id)
 static void on_add_to_deck(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
     int card_id = g_variant_get_int32(parameter);
@@ -1547,8 +1059,11 @@ static void on_add_to_deck(GSimpleAction *action, GVariant *parameter, gpointer 
     AppState* state = (AppState*)g_object_get_data(G_OBJECT(window), "app_state");
     if (!state || !state->db) return;
     // Dialog to select deck
-    GtkWidget *dialog = create_styled_dialog(window, 320, 320);
+    GtkWidget *dialog = gtk_window_new();
     gtk_window_set_title(GTK_WINDOW(dialog), "Aggiungi a Deck");
+    gtk_window_set_modal(GTK_WINDOW(dialog), true);
+    gtk_window_set_transient_for(GTK_WINDOW(dialog), window);
+    gtk_window_set_default_size(GTK_WINDOW(dialog), 300, 300);
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
     gtk_window_set_child(GTK_WINDOW(dialog), box);
     GtkWidget *scrolled = gtk_scrolled_window_new();
@@ -1582,13 +1097,8 @@ static void on_add_to_deck(GSimpleAction *action, GVariant *parameter, gpointer 
             char* idstr = (char*)g_object_get_data(G_OBJECT(sel), "deck_id");
             if (idstr) {
                 int deck_id = atoi(idstr);
-                // Use helper to perform move (handles splitting if needed)
-                int current_qty = 0;
-                if (c->state->db->get_card_quantity(c->card_id, current_qty)) {
-                    // move entire quantity
-                    if (add_card_to_deck(c->state, c->card_id, current_qty, deck_id)) {
-                        std::cout << "Moved card " << c->card_id << " to deck " << deck_id << std::endl;
-                    }
+                if (c->state->db->set_card_deck(c->card_id, deck_id)) {
+                    std::cout << "Set card " << c->card_id << " deck to " << deck_id << std::endl;
                 }
             }
         }
@@ -1616,13 +1126,11 @@ static void on_clear_deck(GSimpleAction *action, GVariant *parameter, gpointer u
         // clear label
         gtk_button_set_label(GTK_BUTTON(state->deck_button), "");
     }
-    if (state->deck_delete_button) {
-        gtk_widget_set_visible(state->deck_delete_button, FALSE);
-    }
     refresh_card_list(state);
 }
 
-// Forward declarations for global key handler actions
+// Global key handler to provide reliable shortcuts for deck actions
+// Forward declarations for actions invoked from the global key handler
 static void on_create_deck_action(GSimpleAction *action, GVariant *parameter, gpointer user_data);
 static void on_select_deck_action(GSimpleAction *action, GVariant *parameter, gpointer user_data);
 
@@ -1648,8 +1156,11 @@ static gboolean on_key_pressed(GtkEventControllerKey *controller, guint keyval, 
 // Action handler: Crea Deck (menu)
 static void on_create_deck_action(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
     GtkWindow *parent = GTK_WINDOW(user_data);
-    GtkWidget *dialog = create_styled_dialog(parent, 360, 140);
+    AppState* state = (AppState*)g_object_get_data(G_OBJECT(parent), "app_state");
+    GtkWidget *dialog = gtk_window_new();
     gtk_window_set_title(GTK_WINDOW(dialog), "Crea Deck");
+    gtk_window_set_modal(GTK_WINDOW(dialog), true);
+    gtk_window_set_transient_for(GTK_WINDOW(dialog), parent);
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
     gtk_window_set_child(GTK_WINDOW(dialog), box);
     GtkWidget *entry = gtk_entry_new();
@@ -1675,139 +1186,11 @@ static void on_create_deck_action(GSimpleAction *action, GVariant *parameter, gp
         gtk_window_destroy(GTK_WINDOW(c->dialog));
         delete c;
     }), cctx);
-    // Also trigger the same create behavior when pressing Enter in the entry
-    g_signal_connect(entry, "activate", G_CALLBACK(+[](GtkEditable*, gpointer user_data) {
-        CDContext* c = (CDContext*)user_data;
-        const char* name = gtk_editable_get_text(GTK_EDITABLE(c->entry));
-        AppState* state = (AppState*)g_object_get_data(G_OBJECT(c->parent), "app_state");
-        if (state && state->db && name && *name) {
-            state->db->create_deck(name);
-            populate_deck_menu(state);
-            gtk_window_destroy(GTK_WINDOW(c->dialog));
-            delete c;
-        } else {
-            // Force focus back to entry and hint
-            gtk_entry_set_placeholder_text(GTK_ENTRY(c->entry), "Devi inserire un nome");
-            gtk_widget_grab_focus(c->entry);
-        }
-    }), cctx);
     g_signal_connect(cancel_button, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data) {
         CDContext* c = (CDContext*)user_data;
         gtk_window_destroy(GTK_WINDOW(c->dialog));
         delete c;
     }), cctx);
-    gtk_window_present(GTK_WINDOW(dialog));
-}
-
-// Show a dialog to choose language and then export the whole database
-static void on_export_database_action(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
-    GtkWindow *parent = GTK_WINDOW(user_data);
-    AppState* state = (AppState*)g_object_get_data(G_OBJECT(parent), "app_state");
-    if (!state || !state->db) {
-        GtkAlertDialog *alert = gtk_alert_dialog_new("%s", "Nessun database aperto");
-        gtk_alert_dialog_show(alert, parent);
-        g_object_unref(alert);
-        return;
-    }
-    // Dialog: choose language
-    GtkWidget *dialog = create_styled_dialog(parent, 360, 140);
-    gtk_window_set_title(GTK_WINDOW(dialog), "Esporta Database");
-    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
-    gtk_window_set_child(GTK_WINDOW(dialog), box);
-    GtkWidget *label = gtk_label_new("Scegli lingua per l'esportazione:");
-    gtk_box_append(GTK_BOX(box), label);
-    GtkWidget *combo = gtk_combo_box_text_new();
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo), "Italiano");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo), "English");
-    gtk_combo_box_set_active(GTK_COMBO_BOX(combo), 0);
-    gtk_box_append(GTK_BOX(box), combo);
-    GtkWidget *button_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gtk_box_append(GTK_BOX(box), button_box);
-    GtkWidget *ok_button = gtk_button_new_with_label("Esporta");
-    GtkWidget *cancel_button = gtk_button_new_with_label("Annulla");
-    gtk_box_append(GTK_BOX(button_box), ok_button);
-    gtk_box_append(GTK_BOX(button_box), cancel_button);
-
-    struct ExportCtx { AppState* state; GtkWidget* combo; GtkWidget* dialog; };
-    ExportCtx* ctx = new ExportCtx{state, combo, dialog};
-
-    g_signal_connect(ok_button, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data) {
-        ExportCtx* c = (ExportCtx*)user_data;
-        int idx = gtk_combo_box_get_active(GTK_COMBO_BOX(c->combo));
-        std::string lang = (idx == 1) ? "en" : "it";
-        bool ok = export_cards_to_txt(c->state, false, -1, lang);
-        GtkAlertDialog *alert = gtk_alert_dialog_new("%s", ok ? "Esportazione completata" : "Errore durante esportazione");
-        gtk_alert_dialog_show(alert, GTK_WINDOW(c->dialog));
-        g_object_unref(alert);
-        gtk_window_destroy(GTK_WINDOW(c->dialog));
-        delete c;
-    }), ctx);
-
-    g_signal_connect(cancel_button, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data) {
-        ExportCtx* c = (ExportCtx*)user_data;
-        gtk_window_destroy(GTK_WINDOW(c->dialog));
-        delete c;
-    }), ctx);
-
-    gtk_window_present(GTK_WINDOW(dialog));
-}
-
-// Export selected deck (uses state->selected_deck_id)
-static void on_export_deck_action(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
-    GtkWindow *parent = GTK_WINDOW(user_data);
-    AppState* state = (AppState*)g_object_get_data(G_OBJECT(parent), "app_state");
-    if (!state || !state->db) {
-        GtkAlertDialog *alert = gtk_alert_dialog_new("%s", "Nessun database aperto");
-        gtk_alert_dialog_show(alert, parent);
-        g_object_unref(alert);
-        return;
-    }
-    if (state->selected_deck_id == -1) {
-        GtkAlertDialog *alert = gtk_alert_dialog_new("%s", "Nessun deck selezionato");
-        gtk_alert_dialog_show(alert, parent);
-        g_object_unref(alert);
-        return;
-    }
-    // Language selection dialog similar to database export
-    GtkWidget *dialog = create_styled_dialog(parent, 360, 140);
-    gtk_window_set_title(GTK_WINDOW(dialog), "Esporta Deck");
-    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
-    gtk_window_set_child(GTK_WINDOW(dialog), box);
-    GtkWidget *label = gtk_label_new("Scegli lingua per l'esportazione:");
-    gtk_box_append(GTK_BOX(box), label);
-    GtkWidget *combo = gtk_combo_box_text_new();
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo), "Italiano");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo), "English");
-    gtk_combo_box_set_active(GTK_COMBO_BOX(combo), 0);
-    gtk_box_append(GTK_BOX(box), combo);
-    GtkWidget *button_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gtk_box_append(GTK_BOX(box), button_box);
-    GtkWidget *ok_button = gtk_button_new_with_label("Esporta");
-    GtkWidget *cancel_button = gtk_button_new_with_label("Annulla");
-    gtk_box_append(GTK_BOX(button_box), ok_button);
-    gtk_box_append(GTK_BOX(button_box), cancel_button);
-
-    struct ExportDeckCtx { AppState* state; GtkWidget* combo; GtkWidget* dialog; int deck_id; };
-    ExportDeckCtx* ctx = new ExportDeckCtx{state, combo, dialog, state->selected_deck_id};
-
-    g_signal_connect(ok_button, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data) {
-        ExportDeckCtx* c = (ExportDeckCtx*)user_data;
-        int idx = gtk_combo_box_get_active(GTK_COMBO_BOX(c->combo));
-        std::string lang = (idx == 1) ? "en" : "it";
-        bool ok = export_cards_to_txt(c->state, true, c->deck_id, lang);
-        GtkAlertDialog *alert = gtk_alert_dialog_new("%s", ok ? "Esportazione completata" : "Errore durante esportazione");
-        gtk_alert_dialog_show(alert, GTK_WINDOW(c->dialog));
-        g_object_unref(alert);
-        gtk_window_destroy(GTK_WINDOW(c->dialog));
-        delete c;
-    }), ctx);
-
-    g_signal_connect(cancel_button, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data) {
-        ExportDeckCtx* c = (ExportDeckCtx*)user_data;
-        gtk_window_destroy(GTK_WINDOW(c->dialog));
-        delete c;
-    }), ctx);
-
     gtk_window_present(GTK_WINDOW(dialog));
 }
 
@@ -1816,8 +1199,11 @@ static void on_select_deck_action(GSimpleAction *action, GVariant *parameter, gp
     GtkWindow *parent = GTK_WINDOW(user_data);
     AppState* state = (AppState*)g_object_get_data(G_OBJECT(parent), "app_state");
     if (!state || !state->db) return;
-    GtkWidget *dialog = create_styled_dialog(parent, 360, 320);
+    GtkWidget *dialog = gtk_window_new();
     gtk_window_set_title(GTK_WINDOW(dialog), "Seleziona Deck");
+    gtk_window_set_modal(GTK_WINDOW(dialog), true);
+    gtk_window_set_transient_for(GTK_WINDOW(dialog), parent);
+    gtk_window_set_default_size(GTK_WINDOW(dialog), 300, 300);
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
     gtk_window_set_child(GTK_WINDOW(dialog), box);
     GtkWidget *scrolled = gtk_scrolled_window_new();
@@ -1858,9 +1244,6 @@ static void on_select_deck_action(GSimpleAction *action, GVariant *parameter, gp
                 if (c->state->deck_button) {
                     gtk_button_set_label(GTK_BUTTON(c->state->deck_button), namestr ? namestr : "");
                     gtk_widget_set_visible(c->state->deck_button, TRUE);
-                }
-                if (c->state->deck_delete_button) {
-                    gtk_widget_set_visible(c->state->deck_delete_button, TRUE);
                 }
                 if (c->state->deck_label) {
                     std::string lbl = std::string("Filtrando: ") + (namestr ? namestr : "");
@@ -1943,74 +1326,103 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     // Carica CSS personalizzato
     GtkCssProvider *provider = gtk_css_provider_new();
     gtk_css_provider_load_from_string(provider,
-        "/* Dark, modern palette: deep background, subtle surfaces and a warm accent */\n"
-        ".small-popover { padding: 0px; margin: 0px; border: none; background-color: #222426; color: #e6edf3; }\n"
+        "/* Modern dark theme: cleaner spacing, rounded surfaces, subtle elevation */\n"
+        "/* Note: GTK CSS does not support @font-face rules.\n"
+        "   To use a bundled font, install the TTF into your user fonts (e.g. ~/.local/share/fonts/)\n"
+        "   or system fonts and run `fc-cache -f` so Pango can find it. The CSS below still lists 'Inter'\n"
+        "   as preferred font-family; install Inter on your system to use it. See data/fonts/README.md. */\n"
         "window {\n"
-        "    background-color: #121316;\n"
+        "    background-color: #0b0c0d;\n"
         "    color: #e6edf3;\n"
-        "    font-family: 'Inter', 'Segoe UI', 'Ubuntu', sans-serif;\n"
+        "    font-family: 'Inter', 'Segoe UI', 'Roboto', 'Noto Sans', sans-serif;\n"
         "    font-size: 13px;\n"
+        "    -gtk-icon-transform: none;\n"
         "}\n"
         "/* Top bar */\n"
-        ".topbar {\n"
-        "    padding: 2px 4px;\n"
-        "    min-height: 28px;\n"
-        "}\n"
-        "/* Buttons */\n"
-        "button, menubutton {\n"
-        "    border-radius: 8px;\n"
-        "    padding: 4px 8px;\n"
-        "    background-color: transparent;\n"
-        "    color: #e6edf3;\n"
-        "    border: 1px solid rgba(230,237,243,0.06);\n"
-        "    transition: all 0.14s ease;\n"
+    ".topbar {\n"
+    "    padding: 2px 4px;\n"
+    "    min-height: 22px; /* slimmer top bar */\n"
+    "    /* 'gap' is not supported by GTK CSS; spacing is handled by container creation */\n"
+    "}\n"
+        "/* Buttons and menubuttons: soft surfaces with subtle borders and hover lift */\n"
+    "button, menubutton {\n"
+    "    background-color: rgba(255,255,255,0.02);\n"
+    "    border: 1px solid rgba(255,255,255,0.04);\n"
+    "    color: inherit;\n"
+    "    padding: 4px 6px; /* tighter padding for compact buttons */\n"
+    "    min-height: 20px;\n"
+    "    border-radius: 8px;\n"
+    "    transition: transform 0.12s ease, background-color 0.12s ease, box-shadow 0.12s ease;\n"
+    "    box-shadow: 0 2px 6px rgba(0,0,0,0.6);\n"
+    "}\n"
+        "button.primary {\n"
+        "    background-image: linear-gradient(135deg,#6e4cff,#7c5cff);\n"
+        "    color: white;\n"
+        "    border: none;\n"
         "}\n"
         "button:hover, menubutton:hover {\n"
-        "    background-color: rgba(230,237,243,0.03);\n"
-        "    transform: translateY(-1px);\n"
+        "    transform: translateY(-2px);\n"
+        "    background-color: rgba(255,255,255,0.04);\n"
         "}\n"
-        "/* Entry */\n"
+        "/* Entries */\n"
         "entry {\n"
-        "    border-radius: 8px;\n"
-        "    padding: 4px 8px;\n"
-        "    background-color: transparent;\n"
-        "    color: #e6edf3;\n"
-        "    border: 1px solid rgba(230,237,243,0.06);\n"
-        "    transition: all 0.14s ease;\n"
+        "    border-radius: 10px;\n"
+        "    padding: 8px 10px;\n"
+        "    background-color: rgba(255,255,255,0.02);\n"
+        "    color: inherit;\n"
+        "    border: 1px solid rgba(255,255,255,0.04);\n"
         "}\n"
-        "entry:hover {\n"
-        "    background-color: rgba(230,237,243,0.03);\n"
-        "    transform: translateY(-1px);\n"
+        "entry:focus {\n"
+        "    box-shadow: 0 6px 18px rgba(110,76,255,0.12);\n"
+        "    border-color: rgba(124,92,255,0.6);\n"
         "}\n"
         "/* Column view / table */\n"
         "columnview {\n"
-        "    background-color: #17171a;\n"
-        "    border: 1px solid rgba(255,255,255,0.04);\n"
-        "    border-radius: 8px;\n"
+        "    background-color: #0f1113;\n"
+        "    border: 1px solid rgba(255,255,255,0.03);\n"
+        "    border-radius: 12px;\n"
         "    color: #e6edf3;\n"
+        "    padding: 6px;\n"
         "}\n"
         "columnview row {\n"
-        "    padding: 8px 12px;\n"
+        "    padding: 10px 12px;\n"
+        "    border-radius: 8px;\n"
         "}\n"
         "columnview row:nth-child(even) {\n"
-        "    background-color: #151518;\n"
+        "    background-color: rgba(255,255,255,0.01);\n"
         "}\n"
-        "columnview row:hover {\n"
-        "    background-color: #1f2023;\n"
+        "columnview row:selected, columnview row:hover {\n"
+        "    background-color: rgba(124,92,255,0.08);\n"
         "}\n"
+        "/* Labels */\n"
         "label { color: #e6edf3; }\n"
-        "scrolledwindow { box-shadow: 0 6px 18px rgba(0,0,0,0.6); border-radius: 8px; }\n"
-        "/* Accent colors: violet + amber for highlights */\n"
-        ".accent { color: #b388ff; }\n"
-        ".accent-bg { background-color: #3a2a4a; border-radius:6px; padding:2px 6px; }\n"
-        "/* Smaller menubutton */\n"
-        "menubutton { padding: 6px 10px; border-radius: 6px; }\n"
+        ".muted { color: rgba(230,237,243,0.7); font-size: 12px; }\n"
+        "/* Accent */\n"
+        ".accent { color: #7c5cff; }\n"
+        ".accent-bg { background-color: #6e4cff; color: white; padding: 4px 8px; border-radius: 8px; }\n"
+        "/* Popovers and dialogs */\n"
+        ".popover, window.window {\n"
+        "    background-color: #0b0c0d;\n"
+        "    border-radius: 12px;\n"
+        "    box-shadow: 0 8px 30px rgba(0,0,0,0.7);\n"
+        "}\n"
+        "/* Scrollbar tweaks */\n"
+        "scrollbar slider {\n"
+        "    background-color: rgba(255,255,255,0.04);\n"
+        "    min-width: 8px; min-height: 8px;\n"
+        "    border-radius: 6px;\n"
+        "}\n"
+        "/* Small helpers */\n"
+        ".topbar menubutton { padding: 4px 6px; }\n"
+        "menubutton { border-radius: 10px; }\n"
+        "/* Make header menus look lighter */\n"
+        "columnview column header, columnview column header button { background: transparent; color: rgba(230,237,243,0.9); }\n"
     );
     gtk_style_context_add_provider_for_display(
         gdk_display_get_default(),
         GTK_STYLE_PROVIDER(provider),
         GTK_STYLE_PROVIDER_PRIORITY_USER);
-    g_object_unref(provider);
+    if (G_IS_OBJECT(provider)) g_object_unref(provider);
     ensure_data_dir_exists("data");
     ensure_data_dir_exists("data/img");
     GtkWidget *window = gtk_application_window_new(app);
@@ -2021,8 +1433,6 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     g_menu_append(file_menu, "Nuovo Database", "app.newdb");
     g_menu_append(file_menu, "Apri Database", "app.opendb");
     g_menu_append(file_menu, "Crea Deck", "app.create_deck");
-    g_menu_append(file_menu, "Esporta Database", "app.export_db");
-    g_menu_append(file_menu, "Esporta Deck", "app.export_deck");
     // Create a submenu for selecting decks dynamically
     GMenu *deck_menu = g_menu_new();
     g_menu_append_submenu(file_menu, "Seleziona Deck", G_MENU_MODEL(deck_menu));
@@ -2037,12 +1447,14 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     g_menu_append(lang_menu, "Italiano", "app.lang.it");
     g_menu_append(lang_menu, "English", "app.lang.en");
     g_menu_append_submenu(view_menu, "Lingua", G_MENU_MODEL(lang_menu));
-    g_object_unref(lang_menu);
+    if (G_IS_OBJECT(lang_menu)) g_object_unref(lang_menu);
 
     GtkWidget *view_button = gtk_menu_button_new();
     gtk_menu_button_set_label(GTK_MENU_BUTTON(view_button), "Visualizza");
     gtk_menu_button_set_menu_model(GTK_MENU_BUTTON(view_button), G_MENU_MODEL(view_menu));
-    g_object_unref(view_menu);
+    if (G_IS_OBJECT(view_menu)) g_object_unref(view_menu);
+
+    // store deck_menu in state later after state is created
 
 
     // Box per il nome del database attualmente aperto
@@ -2059,11 +1471,42 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     state->selected_deck_id = -1;
     state->deck_button = NULL;
     state->deck_label = NULL;
-    state->deck_delete_button = NULL;
 
     // Bottone per aggiungere una nuova carta
     GtkWidget *add_card_button = gtk_button_new_with_label("Nuova Carta");
     g_signal_connect(add_card_button, "clicked", G_CALLBACK(on_add_card_clicked), window);
+    // Make this a primary action button (uses .primary CSS class)
+    gtk_widget_add_css_class(add_card_button, "primary");
+
+    // Bottone per aprire la finestra di ricerca carta
+    GtkWidget *search_button = gtk_button_new_with_label("Cerca Carta");
+    g_signal_connect(search_button, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data){
+        GtkWindow *w = GTK_WINDOW(user_data);
+        show_card_search_window(w);
+    }), window);
+    gtk_widget_add_css_class(search_button, "primary");
+
+    // (Create/Select Deck actions moved to File menu)
+
+    // Deck indicator / clear-filter button (hidden when not filtering)
+    GtkWidget *deck_button = gtk_button_new_with_label("");
+    GtkWidget *deck_label = gtk_label_new("");
+    gtk_widget_set_visible(deck_label, FALSE);
+    // Clicking it clears the deck filter
+    g_signal_connect(deck_button, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data) {
+        GtkWindow *window = GTK_WINDOW(user_data);
+        AppState* state = (AppState*)g_object_get_data(G_OBJECT(window), "app_state");
+        if (!state) return;
+        state->selected_deck_id = -1;
+        if (state->deck_button) gtk_widget_set_visible(state->deck_button, FALSE);
+        refresh_card_list(state);
+    }), window);
+    state->deck_button = deck_button;
+    state->deck_label = deck_label;
+    // Attach deck_menu (created above) to state so we can populate it dynamically
+    state->deck_menu = deck_menu;
+    // Populate initial deck menu (if DB already open later we'll re-populate)
+    populate_deck_menu(state);
 
     // Bottone per refresh delle carte
     GtkWidget *refresh_button = gtk_button_new_with_label("Refresh");
@@ -2071,8 +1514,12 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         GtkWindow* window = GTK_WINDOW(user_data);
         AppState* state = (AppState*)g_object_get_data(G_OBJECT(window), "app_state");
         if (!state || !state->db) return;
-    // Load all cards (respecting current deck filter)
-    auto cards = load_cards_from_db(state->db, std::string(""), state->selected_deck_id);
+        // Load all cards
+        auto cards = load_cards_from_db(state->db);
+            if (state->deck_label) {
+                gtk_widget_set_visible(state->deck_label, FALSE);
+                gtk_label_set_text(GTK_LABEL(state->deck_label), "");
+            }
         int updated = 0;
         for (const auto& row : cards) {
             std::string search_name = row.at("english_name");
@@ -2100,6 +1547,8 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         std::cout << "Refreshed " << updated << " cards" << std::endl;
         refresh_card_list(state);
     }), window);
+    // Make refresh a prominent primary button as well
+    gtk_widget_add_css_class(refresh_button, "primary");
 
     // Campo di ricerca
     GtkWidget *search_entry = gtk_entry_new();
@@ -2117,32 +1566,6 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     state->add_card_button = add_card_button;
     state->file_button = file_button;
     state->view_button = view_button;
-    // Attach deck_menu (created above) to state so we can populate it dynamically
-    state->deck_menu = deck_menu;
-    // Populate initial deck menu (if DB already open later we'll re-populate)
-    populate_deck_menu(state);
-
-    // Deck indicator / clear-filter button (hidden when not filtering)
-    GtkWidget *deck_button = gtk_button_new_with_label("");
-    GtkWidget *deck_label = gtk_label_new("");
-    gtk_widget_set_visible(deck_label, FALSE);
-    // Clicking it clears the deck filter
-    g_signal_connect(deck_button, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data) {
-        GtkWindow *window = GTK_WINDOW(user_data);
-        AppState* state = (AppState*)g_object_get_data(G_OBJECT(window), "app_state");
-        if (!state) return;
-        state->selected_deck_id = -1;
-        if (state->deck_button) gtk_widget_set_visible(state->deck_button, FALSE);
-        refresh_card_list(state);
-    }), window);
-    state->deck_button = deck_button;
-    state->deck_label = deck_label;
-    // Button to delete the currently selected deck (hidden when no deck selected)
-    GtkWidget *deck_delete_button = gtk_button_new_with_label("Elimina Deck");
-    gtk_widget_set_visible(deck_delete_button, FALSE);
-    gtk_widget_set_tooltip_text(deck_delete_button, "Elimina il deck e sposta le carte nella collezione principale");
-    g_signal_connect(deck_delete_button, "clicked", G_CALLBACK(on_deck_delete_clicked), window);
-    state->deck_delete_button = deck_delete_button;
 
     // Bottone per chiudere l'app
     GtkWidget *close_button = gtk_button_new();
@@ -2154,14 +1577,15 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         g_application_quit(G_APPLICATION(app));
     }), app);
 
-    // Box per i bottoni
+    // Box per i bottoni (top bar)
     GtkWidget *button_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
     gtk_box_append(GTK_BOX(button_box), file_button);
     gtk_box_append(GTK_BOX(button_box), view_button);
     gtk_box_append(GTK_BOX(button_box), add_card_button);
+    gtk_box_append(GTK_BOX(button_box), search_button);
+    // Deck management moved to File menu; remove top deck button (keep bottom label)
     gtk_box_append(GTK_BOX(button_box), refresh_button);
     gtk_box_append(GTK_BOX(button_box), search_entry);
-    if (deck_delete_button) gtk_box_append(GTK_BOX(button_box), deck_delete_button);
 
     // Tabella carte (GtkColumnView)
     state->card_store = g_list_store_new(card_row_get_type());
@@ -2187,7 +1611,7 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         GtkCssProvider *prov = gtk_css_provider_new();
         gtk_css_provider_load_from_string(prov, css_buf);
         gtk_style_context_add_provider(gtk_widget_get_style_context(box), GTK_STYLE_PROVIDER(prov), GTK_STYLE_PROVIDER_PRIORITY_USER);
-        g_object_unref(prov);
+    if (G_IS_OBJECT(prov)) g_object_unref(prov);
         // Aggiungi gesture per click destro
         GtkGesture *gesture = gtk_gesture_click_new();
         gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(gesture), GDK_BUTTON_SECONDARY);
@@ -2386,43 +1810,43 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     g_menu_append(name_menu, "Ordina Crescente", "app.sort.name.asc");
     g_menu_append(name_menu, "Ordina Decrescente", "app.sort.name.desc");
     gtk_column_view_column_set_header_menu(name_col, G_MENU_MODEL(name_menu));
-    g_object_unref(name_menu);
+    if (G_IS_OBJECT(name_menu)) g_object_unref(name_menu);
 
     GMenu *type_menu = g_menu_new();
     g_menu_append(type_menu, "Ordina Crescente", "app.sort.type.asc");
     g_menu_append(type_menu, "Ordina Decrescente", "app.sort.type.desc");
     gtk_column_view_column_set_header_menu(type_col, G_MENU_MODEL(type_menu));
-    g_object_unref(type_menu);
+    if (G_IS_OBJECT(type_menu)) g_object_unref(type_menu);
 
     GMenu *colors_menu = g_menu_new();
     g_menu_append(colors_menu, "Ordina Crescente", "app.sort.colors.asc");
     g_menu_append(colors_menu, "Ordina Decrescente", "app.sort.colors.desc");
     gtk_column_view_column_set_header_menu(colors_col, G_MENU_MODEL(colors_menu));
-    g_object_unref(colors_menu);
+    if (G_IS_OBJECT(colors_menu)) g_object_unref(colors_menu);
 
     GMenu *mana_menu = g_menu_new();
     g_menu_append(mana_menu, "Ordina Crescente", "app.sort.mana.asc");
     g_menu_append(mana_menu, "Ordina Decrescente", "app.sort.mana.desc");
     gtk_column_view_column_set_header_menu(mana_col, G_MENU_MODEL(mana_menu));
-    g_object_unref(mana_menu);
+    if (G_IS_OBJECT(mana_menu)) g_object_unref(mana_menu);
 
     GMenu *rarity_menu = g_menu_new();
     g_menu_append(rarity_menu, "Ordina Crescente", "app.sort.rarity.asc");
     g_menu_append(rarity_menu, "Ordina Decrescente", "app.sort.rarity.desc");
     gtk_column_view_column_set_header_menu(rarity_col, G_MENU_MODEL(rarity_menu));
-    g_object_unref(rarity_menu);
+    if (G_IS_OBJECT(rarity_menu)) g_object_unref(rarity_menu);
 
     GMenu *date_menu = g_menu_new();
     g_menu_append(date_menu, "Ordina Crescente", "app.sort.date.asc");
     g_menu_append(date_menu, "Ordina Decrescente", "app.sort.date.desc");
     gtk_column_view_column_set_header_menu(date_col, G_MENU_MODEL(date_menu));
-    g_object_unref(date_menu);
+    if (G_IS_OBJECT(date_menu)) g_object_unref(date_menu);
 
     GMenu *qty_menu = g_menu_new();
     g_menu_append(qty_menu, "Ordina Crescente", "app.sort.qty.asc");
     g_menu_append(qty_menu, "Ordina Decrescente", "app.sort.qty.desc");
     gtk_column_view_column_set_header_menu(qty_col, G_MENU_MODEL(qty_menu));
-    g_object_unref(qty_menu);
+    if (G_IS_OBJECT(qty_menu)) g_object_unref(qty_menu);
     // gtk_column_view_column_set_sorter(qty_col, GTK_SORTER(gtk_numeric_sorter_new(gtk_property_expression_new(G_TYPE_INT, card_row_get_type(), "quantity"))));
 
     state->selection = GTK_SELECTION_MODEL(gtk_column_view_get_model(column_view));
@@ -2446,7 +1870,7 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     // Scrolled window con tabella
     gtk_box_append(GTK_BOX(vbox), scrolled_window);
 
-    // Box inferiore: nome database e totale carte
+    // Box inferiore: nome database, deck filter label e totale carte
     GtkWidget *bottom_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
     gtk_box_append(GTK_BOX(bottom_box), db_name_box);
     if (state->deck_label) gtk_box_append(GTK_BOX(bottom_box), state->deck_label);
@@ -2495,19 +1919,19 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
                     std::ofstream lastdb("lastdb.txt");
                     lastdb << filename << std::endl;
                     // Ricrea la GListStore e aggiorna la ColumnView
-                    if (state->card_store) g_object_unref(state->card_store);
+                    if (state->card_store && G_IS_OBJECT(state->card_store)) g_object_unref(state->card_store);
                     state->card_store = g_list_store_new(card_row_get_type());
                     GtkSelectionModel *selection = GTK_SELECTION_MODEL(gtk_single_selection_new(G_LIST_MODEL(state->card_store)));
                     gtk_column_view_set_model(state->column_view, selection);
-                        refresh_card_list(state);
-                        // Populate deck menu now that a DB is open
-                        populate_deck_menu(state);
+                    refresh_card_list(state);
+                    // Update deck submenu now that DB is loaded
+                    populate_deck_menu(state);
                     g_free(filename);
                 }
-                g_object_unref(file);
+                if (G_IS_OBJECT(file)) g_object_unref(file);
             }
         }, parent);
-        g_object_unref(dialog);
+    if (G_IS_OBJECT(dialog)) g_object_unref(dialog);
     }), window);
     g_action_map_add_action(G_ACTION_MAP(app), G_ACTION(opendb_action));
 
@@ -2526,6 +1950,11 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     g_signal_connect(select_deck_action, "activate", G_CALLBACK(on_select_deck_action), window);
     g_action_map_add_action(G_ACTION_MAP(app), G_ACTION(select_deck_action));
 
+    // Azione per eliminare carta
+    GSimpleAction *delete_action = g_simple_action_new("delete_card", G_VARIANT_TYPE_INT32);
+    g_signal_connect(delete_action, "activate", G_CALLBACK(on_delete_card), window);
+    g_action_map_add_action(G_ACTION_MAP(app), G_ACTION(delete_action));
+
     // Azione per aggiungere carta ad un mazzo (invocata dal context menu)
     GSimpleAction *add_to_deck_action = g_simple_action_new("add_to_deck", G_VARIANT_TYPE_INT32);
     g_signal_connect(add_to_deck_action, "activate", G_CALLBACK(on_add_to_deck), window);
@@ -2535,21 +1964,6 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     GSimpleAction *clear_deck_action = g_simple_action_new("clear_deck", NULL);
     g_signal_connect(clear_deck_action, "activate", G_CALLBACK(on_clear_deck), window);
     g_action_map_add_action(G_ACTION_MAP(app), G_ACTION(clear_deck_action));
-
-
-    // Azione per eliminare carta
-    GSimpleAction *delete_action = g_simple_action_new("delete_card", G_VARIANT_TYPE_INT32);
-    g_signal_connect(delete_action, "activate", G_CALLBACK(on_delete_card), window);
-    g_action_map_add_action(G_ACTION_MAP(app), G_ACTION(delete_action));
-
-    // Export actions
-    GSimpleAction *export_db_action = g_simple_action_new("export_db", NULL);
-    g_signal_connect(export_db_action, "activate", G_CALLBACK(on_export_database_action), window);
-    g_action_map_add_action(G_ACTION_MAP(app), G_ACTION(export_db_action));
-
-    GSimpleAction *export_deck_action = g_simple_action_new("export_deck", NULL);
-    g_signal_connect(export_deck_action, "activate", G_CALLBACK(on_export_deck_action), window);
-    g_action_map_add_action(G_ACTION_MAP(app), G_ACTION(export_deck_action));
 
     // Azioni per ordinamento
     GSimpleAction *sort_name_asc = g_simple_action_new("sort.name.asc", NULL);
@@ -2668,6 +2082,14 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     g_signal_connect(add_card_action, "activate", G_CALLBACK(on_add_card_action), window);
     g_action_map_add_action(G_ACTION_MAP(app), G_ACTION(add_card_action));
 
+    // Azione per aprire la finestra di ricerca carta
+    GSimpleAction *search_action = g_simple_action_new("search_card", NULL);
+    g_signal_connect(search_action, "activate", G_CALLBACK(on_search_card_action), window);
+    g_action_map_add_action(G_ACTION_MAP(app), G_ACTION(search_action));
+
+    // Acceleratore per ricerca
+    gtk_application_set_accels_for_action(app, "app.search_card", (const char*[]){"<Control>f", NULL});
+
     // Azione per eliminare riga selezionata
     GSimpleAction *delete_selected_action = g_simple_action_new("delete_selected", NULL);
     g_signal_connect(delete_selected_action, "activate", G_CALLBACK(+[](GSimpleAction *, GVariant *, gpointer user_data) {
@@ -2710,6 +2132,9 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     // Imposta acceleratori
     gtk_application_set_accels_for_action(app, "app.add_card", (const char*[]){"<Control>n", NULL});
     gtk_application_set_accels_for_action(app, "app.delete_selected", (const char*[]){"Delete", NULL});
+    // Acceleratori per Create/Select Deck
+    gtk_application_set_accels_for_action(app, "app.create_deck", (const char*[]){"<Control><Shift>d", NULL});
+    gtk_application_set_accels_for_action(app, "app.select_deck", (const char*[]){"<Control><Shift>s", NULL});
 
     // Carica ultimo database usato
     std::ifstream lastdb("lastdb.txt");
@@ -2722,7 +2147,6 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
             state->db_path = path;
             gtk_label_set_text(GTK_LABEL(state->db_name_label), path.c_str());
             refresh_card_list(state);
-            // Ensure the deck submenu is up-to-date when loading the last used DB at startup
             populate_deck_menu(state);
         }
     }
@@ -2730,8 +2154,161 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     gtk_window_present(GTK_WINDOW(window));
 }
 
+// Forward declarations for search window / actions
+static void show_card_search_window(GtkWindow *parent);
+static void on_search_card_action(GSimpleAction *action, GVariant *parameter, gpointer user_data);
+static void on_search_entry_activate(GtkEntry *entry, gpointer user_data);
+static void on_import_button_clicked(GtkButton *button, gpointer user_data);
+
+// Shared context for search callbacks
+typedef struct {
+    GtkListBox *results_box;
+    GtkWindow *main_win;
+} SearchCtx;
+
+
+// --- Card search window ---------------------------------------------------
+static void show_card_search_window(GtkWindow *parent) {
+    if (!GTK_IS_WINDOW(parent)) return;
+    AppState* state = (AppState*)g_object_get_data(G_OBJECT(parent), "app_state");
+    GtkWidget *win = gtk_window_new();
+    gtk_window_set_title(GTK_WINDOW(win), "Cerca carta");
+    gtk_window_set_transient_for(GTK_WINDOW(win), parent);
+    gtk_window_set_default_size(GTK_WINDOW(win), 640, 360);
+
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_margin_top(vbox, 8);
+    gtk_widget_set_margin_bottom(vbox, 8);
+    gtk_widget_set_margin_start(vbox, 8);
+    gtk_widget_set_margin_end(vbox, 8);
+
+    // Search entry
+    GtkWidget *entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(entry), "Digita il nome della carta e premi Invio...");
+    gtk_widget_set_hexpand(entry, TRUE);
+    gtk_box_append(GTK_BOX(vbox), entry);
+
+    // Results area
+    GtkWidget *scrolled = gtk_scrolled_window_new();
+    gtk_widget_set_vexpand(scrolled, TRUE);
+    GtkWidget *results_box = gtk_list_box_new();
+    gtk_list_box_set_selection_mode(GTK_LIST_BOX(results_box), GTK_SELECTION_NONE);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scrolled), results_box);
+    gtk_box_append(GTK_BOX(vbox), scrolled);
+
+    // Bottom actions
+    GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    GtkWidget *close_btn = gtk_button_new_with_label("Chiudi");
+    g_signal_connect(close_btn, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data){
+        GtkWindow *w = GTK_WINDOW(user_data);
+        gtk_window_destroy(w);
+    }), win);
+    gtk_box_append(GTK_BOX(hbox), close_btn);
+    gtk_box_append(GTK_BOX(vbox), hbox);
+
+    gtk_window_set_child(GTK_WINDOW(win), vbox);
+
+    // Prepare a small context object and connect the entry to the handler
+    SearchCtx *sctx = new SearchCtx{ GTK_LIST_BOX(results_box), GTK_WINDOW(parent) };
+    // Free sctx when window is destroyed
+    g_object_set_data_full(G_OBJECT(win), "search_ctx", sctx, +[](gpointer data){ delete (SearchCtx*)data; });
+    g_signal_connect(entry, "activate", G_CALLBACK(on_search_entry_activate), sctx);
+
+    gtk_window_present(GTK_WINDOW(win));
+}
+
+// Import button callback
+static void on_import_button_clicked(GtkButton *button, gpointer user_data) {
+    struct ImportCtx { ScryfallCard *card; GtkWindow *main_window; };
+    ImportCtx *ctx = (ImportCtx*)user_data;
+    if (!ctx) return;
+    ScryfallCard *c = ctx->card;
+    GtkWindow *mainw = ctx->main_window;
+    AppState *state = nullptr;
+    if (mainw) state = (AppState*)g_object_get_data(G_OBJECT(mainw), "app_state");
+    if (!state || !state->db) {
+        g_print("No DB open to import card\n");
+        if (c) delete c;
+        delete ctx;
+        return;
+    }
+    int deck_id = -1;
+    int quantity = 1;
+    bool ok = state->db->insert_card(c->english_name, c->localized_name, c->type, c->localized_type, c->colors, c->set_name, c->mana_cost, c->rarity, quantity, c->image_url, c->price_usd, deck_id);
+    if (ok) {
+        g_print("Imported: %s\n", c->english_name.c_str());
+        refresh_card_list(state);
+    } else {
+        g_print("Failed to import %s\n", c->english_name.c_str());
+    }
+    if (c) delete c;
+    delete ctx;
+}
+
+// Entry activate handler
+static void on_search_entry_activate(GtkEntry *entry, gpointer user_data) {
+    SearchCtx *sctx = (SearchCtx*)user_data;
+    if (!sctx) return;
+    GtkListBox *results = sctx->results_box;
+    // Clear previous
+    GtkWidget *child = gtk_widget_get_first_child(GTK_WIDGET(results));
+    while (child) {
+        GtkWidget *next = gtk_widget_get_next_sibling(child);
+        gtk_widget_unparent(child);
+        if (G_IS_OBJECT(child)) g_object_unref(child);
+        child = next;
+    }
+    const char *q = gtk_entry_get_text(entry);
+    if (!q || strlen(q) == 0) return;
+    std::string query = std::string(q);
+    auto cards = search_cards_from_scryfall(query);
+    for (auto &card : cards) {
+        GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+        gtk_widget_set_margin_top(row, 6);
+        gtk_widget_set_margin_bottom(row, 6);
+        GtkWidget *lbl_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+        GtkWidget *title = gtk_label_new(card.english_name.c_str());
+        gtk_label_set_xalign(GTK_LABEL(title), 0.0);
+        gtk_widget_add_css_class(title, "accent");
+        GtkWidget *meta = gtk_label_new((card.set_name + " — " + card.type).c_str());
+        gtk_label_set_xalign(GTK_LABEL(meta), 0.0);
+        gtk_widget_add_css_class(meta, "muted");
+        gtk_box_append(GTK_BOX(lbl_box), title);
+        gtk_box_append(GTK_BOX(lbl_box), meta);
+        gtk_box_append(GTK_BOX(row), lbl_box);
+
+        // Spacer
+        GtkWidget *sp = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+        gtk_widget_set_hexpand(sp, TRUE);
+        gtk_box_append(GTK_BOX(row), sp);
+
+        // Import button
+        GtkWidget *imp = gtk_button_new_with_label("Importa");
+        gtk_widget_add_css_class(imp, "primary");
+        struct ImportCtx { ScryfallCard *card; GtkWindow *main_window; };
+        ImportCtx *ictx = new ImportCtx{ new ScryfallCard(card), sctx->main_win };
+        g_signal_connect(imp, "clicked", G_CALLBACK(on_import_button_clicked), ictx);
+        gtk_box_append(GTK_BOX(row), imp);
+
+        gtk_list_box_append(results, row);
+    }
+    gtk_widget_show(GTK_WIDGET(results));
+}
+
+static void on_search_card_action(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
+    GtkWindow *parent = GTK_WINDOW(user_data);
+    show_card_search_window(parent);
+}
+
 static GMenu* create_context_menu(CardRow *row, AppState *state) {
     GMenu *menu = g_menu_new();
+    // If we're currently filtering by a deck, offer a quick way to return to main DB
+    if (state && state->selected_deck_id != -1) {
+    GMenuItem *back_item = g_menu_item_new("Torna al Database Principale", "app.clear_deck");
+        g_menu_append_item(menu, back_item);
+        g_object_unref(back_item);
+    }
+    // Add to deck option (before delete)
     GMenuItem *add_item = g_menu_item_new("Aggiungi a Deck", NULL);
     g_menu_item_set_action_and_target_value(add_item, "app.add_to_deck", g_variant_new_int32(row->id));
     g_menu_append_item(menu, add_item);
