@@ -130,6 +130,10 @@ static void card_row_init(CardRow *self) {
     self->foil = 0;
 }
 
+// Special sentinel ids used for visual-only rows (not real card data)
+static const int ROW_ID_SEPARATOR_TITLE = -1000; // visual title row "Sideboard"
+static const int ROW_ID_HEADER = -1001; // visual header row that repeats column titles
+
 static std::string translate_colors(const std::string& colors_str) {
     std::string display_colors;
     if (!colors_str.empty()) {
@@ -290,9 +294,11 @@ static void ensure_separator_css_provider() {
     separator_css_provider = gtk_css_provider_new();
     const char *css = 
         ".separator-row { background-color: rgba(255,165,0,1.0); padding: 6px 8px; }\n"
-        ".separator-row { color: #ffffff; }\n";
+    ".separator-row { color: #ffffff; }\n"
+    ".header-row { background-color: rgba(245,245,245,1.0); padding: 4px 6px; color: #000000; font-weight: bold; border-bottom: 1px solid rgba(0,0,0,0.06); border-radius: 0px; }\n";
     gtk_css_provider_load_from_data(separator_css_provider, css, -1);
 }
+
 // Add translation for the "Add Cards" button
 static void __add_more_translations() {
     translations["Aggiungi Carte"] = {{"it", "Aggiungi Carte"}, {"en", "Add Cards"}};
@@ -1223,8 +1229,8 @@ void refresh_card_list(AppState* state) {
         // If sideboard rows exist, append a separator and then side rows
         if (!side_rows.empty()) {
             std::string sep_label = translate("Sideboard");
-            // Separator visual row (id = 0)
-            CardRow* sep = card_row_new(0, sep_label.c_str(), "", "", "", "", "", 0, "", "", "", 0);
+            // Separator visual row (visual-only title row)
+            CardRow* sep = card_row_new(ROW_ID_SEPARATOR_TITLE, sep_label.c_str(), "", "", "", "", "", 0, "", "", "", 0);
             g_list_store_append(state->card_store, sep);
             // Also add separator style to the list item widget when rendered via factories
             g_object_unref(sep);
@@ -1238,7 +1244,7 @@ void refresh_card_list(AppState* state) {
             header_line += translate("Rarità"); header_line += " | ";
             header_line += translate("Data di aggiunta"); header_line += " | ";
             header_line += translate("Quantità");
-            CardRow* hdr = card_row_new(-1, header_line.c_str(), "", "", "", "", "", 0, "", "", "", 0);
+            CardRow* hdr = card_row_new(ROW_ID_HEADER, header_line.c_str(), "", "", "", "", "", 0, "", "", "", 0);
             g_list_store_append(state->card_store, hdr);
             g_object_unref(hdr);
             for (const auto& row : side_rows) {
@@ -3048,8 +3054,13 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     g_signal_connect(color_factory, "bind", G_CALLBACK(+[](GtkListItemFactory *, GtkListItem *item, gpointer) {
         CardRow *row = (CardRow*)gtk_list_item_get_item(item);
         GtkWidget *box = gtk_list_item_get_child(item);
-        if (!row || row->id == 0) {
-            // Separator row: hide the color box and make item non-selectable
+        if (!row) {
+            gtk_widget_set_visible(box, FALSE);
+            gtk_list_item_set_selectable(item, FALSE);
+            return;
+        }
+        if (row->id == ROW_ID_SEPARATOR_TITLE || row->id == ROW_ID_HEADER) {
+            // Visual-only rows: hide the color box and make item non-selectable
             gtk_widget_set_visible(box, FALSE);
             gtk_list_item_set_selectable(item, FALSE);
             return;
@@ -3090,8 +3101,13 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     g_signal_connect(name_factory, "bind", G_CALLBACK(+[](GtkListItemFactory *, GtkListItem *item, gpointer) {
         CardRow *row = (CardRow*)gtk_list_item_get_item(item);
         GtkWidget *label = gtk_list_item_get_child(item);
-        if (!row || row->id == 0) {
-            // Separator row: centered bold text, non-selectable
+        if (!row) {
+            gtk_label_set_text(GTK_LABEL(label), "");
+            gtk_list_item_set_selectable(item, FALSE);
+            return;
+        }
+        if (row->id == ROW_ID_SEPARATOR_TITLE) {
+            // Separator title: centered bold text, non-selectable and styled
             std::string sep = translate("Sideboard");
             std::string markup = "<span weight='bold'>" + sep + "</span>";
             gtk_label_set_markup(GTK_LABEL(label), markup.c_str());
@@ -3104,21 +3120,28 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
             if (separator_css_provider) {
                 gtk_style_context_add_provider(gtk_widget_get_style_context(GTK_WIDGET(item)), GTK_STYLE_PROVIDER(separator_css_provider), GTK_STYLE_PROVIDER_PRIORITY_USER);
             }
-            // Remove any foil styling just in case
             gtk_widget_remove_css_class(label, "foil");
             return;
         }
-        // If this is a header-row (id == -1), render the column title for this column
-        if (row->id == -1) {
+        if (row->id == ROW_ID_HEADER) {
             std::string hdr = translate("Nome");
             std::string markup = "<span weight='bold'>" + hdr + "</span>";
             gtk_label_set_markup(GTK_LABEL(label), markup.c_str());
             gtk_label_set_xalign(GTK_LABEL(label), 0.0);
             gtk_list_item_set_selectable(item, FALSE);
+            /* Apply header-row class so the repeated header visually matches the main header */
+            gtk_widget_add_css_class(GTK_WIDGET(item), "header-row");
+            ensure_separator_css_provider();
+            if (separator_css_provider) {
+                gtk_style_context_add_provider(gtk_widget_get_style_context(GTK_WIDGET(item)), GTK_STYLE_PROVIDER(separator_css_provider), GTK_STYLE_PROVIDER_PRIORITY_USER);
+            }
             return;
         }
         // Normal row
         gtk_label_set_text(GTK_LABEL(label), row->name ? row->name : "");
+        /* Remove any visual-only classes that may have been applied when this ListItem was reused */
+        gtk_widget_remove_css_class(GTK_WIDGET(item), "separator-row");
+        gtk_widget_remove_css_class(GTK_WIDGET(item), "header-row");
         // Apply foil styling
         if (row->foil) gtk_widget_add_css_class(label, "foil"); else gtk_widget_remove_css_class(label, "foil");
         // Aggiungi gesture per click destro
@@ -3145,12 +3168,17 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     g_signal_connect(type_factory, "bind", G_CALLBACK(+[](GtkListItemFactory *, GtkListItem *item, gpointer) {
         CardRow *row = (CardRow*)gtk_list_item_get_item(item);
         GtkWidget *label = gtk_list_item_get_child(item);
-        if (!row || row->id == 0) {
+        if (!row) {
             gtk_label_set_text(GTK_LABEL(label), "");
             gtk_list_item_set_selectable(item, FALSE);
             return;
         }
-        if (row->id == -1) {
+        if (row->id == ROW_ID_SEPARATOR_TITLE) {
+            gtk_label_set_text(GTK_LABEL(label), "");
+            gtk_list_item_set_selectable(item, FALSE);
+            return;
+        }
+        if (row->id == ROW_ID_HEADER) {
             std::string hdr = translate("Tipo");
             std::string markup = "<span weight='bold'>" + hdr + "</span>";
             gtk_label_set_markup(GTK_LABEL(label), markup.c_str());
@@ -3184,12 +3212,17 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     g_signal_connect(colors_factory, "bind", G_CALLBACK(+[](GtkListItemFactory *, GtkListItem *item, gpointer) {
         CardRow *row = (CardRow*)gtk_list_item_get_item(item);
         GtkWidget *label = gtk_list_item_get_child(item);
-        if (!row || row->id == 0) {
+        if (!row) {
             gtk_label_set_text(GTK_LABEL(label), "");
             gtk_list_item_set_selectable(item, FALSE);
             return;
         }
-        if (row->id == -1) {
+        if (row->id == ROW_ID_SEPARATOR_TITLE) {
+            gtk_label_set_text(GTK_LABEL(label), "");
+            gtk_list_item_set_selectable(item, FALSE);
+            return;
+        }
+        if (row->id == ROW_ID_HEADER) {
             std::string hdr = translate("Colori");
             std::string markup = "<span weight='bold'>" + hdr + "</span>";
             gtk_label_set_markup(GTK_LABEL(label), markup.c_str());
@@ -3224,12 +3257,17 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         CardRow *row = (CardRow*)gtk_list_item_get_item(item);
         GtkWidget *label = gtk_list_item_get_child(item);
         char cost_str[16];
-        if (!row || row->id == 0) {
+        if (!row) {
             gtk_label_set_text(GTK_LABEL(label), "");
             gtk_list_item_set_selectable(item, FALSE);
             return;
         }
-        if (row->id == -1) {
+        if (row->id == ROW_ID_SEPARATOR_TITLE) {
+            gtk_label_set_text(GTK_LABEL(label), "");
+            gtk_list_item_set_selectable(item, FALSE);
+            return;
+        }
+        if (row->id == ROW_ID_HEADER) {
             std::string hdr = translate("Costo Mana");
             std::string markup = "<span weight='bold'>" + hdr + "</span>";
             gtk_label_set_markup(GTK_LABEL(label), markup.c_str());
@@ -3268,12 +3306,17 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     g_signal_connect(rarity_factory, "bind", G_CALLBACK(+[](GtkListItemFactory *, GtkListItem *item, gpointer) {
         CardRow *row = (CardRow*)gtk_list_item_get_item(item);
         GtkWidget *label = gtk_list_item_get_child(item);
-        if (!row || row->id == 0) {
+        if (!row) {
             gtk_label_set_text(GTK_LABEL(label), "");
             gtk_list_item_set_selectable(item, FALSE);
             return;
         }
-        if (row->id == -1) {
+        if (row->id == ROW_ID_SEPARATOR_TITLE) {
+            gtk_label_set_text(GTK_LABEL(label), "");
+            gtk_list_item_set_selectable(item, FALSE);
+            return;
+        }
+        if (row->id == ROW_ID_HEADER) {
             std::string hdr = translate("Rarità");
             std::string markup = "<span weight='bold'>" + hdr + "</span>";
             gtk_label_set_markup(GTK_LABEL(label), markup.c_str());
@@ -3307,12 +3350,17 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     g_signal_connect(date_factory, "bind", G_CALLBACK(+[](GtkListItemFactory *, GtkListItem *item, gpointer) {
         CardRow *row = (CardRow*)gtk_list_item_get_item(item);
         GtkWidget *label = gtk_list_item_get_child(item);
-        if (!row || row->id == 0) {
+        if (!row) {
             gtk_label_set_text(GTK_LABEL(label), "");
             gtk_list_item_set_selectable(item, FALSE);
             return;
         }
-        if (row->id == -1) {
+        if (row->id == ROW_ID_SEPARATOR_TITLE) {
+            gtk_label_set_text(GTK_LABEL(label), "");
+            gtk_list_item_set_selectable(item, FALSE);
+            return;
+        }
+        if (row->id == ROW_ID_HEADER) {
             std::string hdr = translate("Data di aggiunta");
             std::string markup = "<span weight='bold'>" + hdr + "</span>";
             gtk_label_set_markup(GTK_LABEL(label), markup.c_str());
@@ -3345,6 +3393,23 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     g_signal_connect(qty_factory, "bind", G_CALLBACK(+[](GtkListItemFactory *, GtkListItem *item, gpointer) {
         CardRow *row = (CardRow*)gtk_list_item_get_item(item);
         GtkWidget *label = gtk_list_item_get_child(item);
+        if (!row) {
+            gtk_label_set_text(GTK_LABEL(label), "");
+            gtk_list_item_set_selectable(item, FALSE);
+            return;
+        }
+        if (row->id == ROW_ID_SEPARATOR_TITLE) {
+            gtk_label_set_text(GTK_LABEL(label), "");
+            gtk_list_item_set_selectable(item, FALSE);
+            return;
+        }
+        if (row->id == ROW_ID_HEADER) {
+            std::string hdr = translate("Quantità");
+            std::string markup = "<span weight='bold'>" + hdr + "</span>";
+            gtk_label_set_markup(GTK_LABEL(label), markup.c_str());
+            gtk_list_item_set_selectable(item, FALSE);
+            return;
+        }
         char qty[16];
         snprintf(qty, sizeof(qty), "%d", row->quantity);
         gtk_label_set_text(GTK_LABEL(label), qty);
