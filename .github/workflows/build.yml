@@ -1,0 +1,28 @@
+name: CI Build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential pkg-config git \
+            libgtk-4-dev libsqlite3-dev libcurl4-openssl-dev nlohmann-json3-dev
+
+      - name: Build
+        run: |
+          make
+
+      - name: Run basic smoke (print version)
+        run: |
+          if [ -x ./magicdb ]; then echo "Executable built: ./magicdb"; ls -l ./magicdb; else echo "No binary produced"; fi

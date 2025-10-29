@@ -11,7 +11,8 @@ public:
     Database(const std::string& db_path);
     ~Database();
     bool execute(const std::string& sql);
-    bool insert_card(const std::string& english_name, const std::string& localized_name, const std::string& type, const std::string& localized_type, const std::string& colors, const std::string& set_code, const std::string& mana_cost, const std::string& rarity, int quantity, const std::string& image_url = "", const std::string& price_usd = "", int deck_id = -1);
+    // foil: 0 = non-foil, 1 = foil
+    bool insert_card(const std::string& english_name, const std::string& localized_name, const std::string& type, const std::string& localized_type, const std::string& colors, const std::string& set_code, const std::string& mana_cost, const std::string& rarity, int quantity, const std::string& image_url = "", const std::string& price_usd = "", int deck_id = -1, int foil = 0);
     bool create_deck(const std::string& name);
     bool query_decks(const std::function<void(const std::map<std::string, std::string>&)>& callback);
     bool delete_card(int id);

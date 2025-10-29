@@ -90,8 +90,8 @@ static std::vector<ScryfallCard> perform_search(const std::string& query, bool r
                             result.oracle_text = card.value("oracle_text", "");
                         }
                         
-                        // Colors
-                        auto colors_json = card["colors"];
+                        // Colors (use value() to avoid operator[] on const json which asserts if key missing)
+                        auto colors_json = card.value("colors", json::array());
                         if (colors_json.is_null()) {
                             result.colors = "[]";
                         } else {
