@@ -4,6 +4,9 @@
 #include <iostream>
 #include <gtk/gtk.h>
 #include <gdk/gdk.h>
+#include <gdk-pixbuf/gdk-pixbuf.h>
+#include <cairo/cairo.h>
+#include <cairo/cairo-pdf.h>
 #include <cctype>
 #include <string>
 #include <ctime>
@@ -849,11 +852,29 @@ static void populate_deck_menu(AppState *state) {
     state->db->query_decks([&](const std::map<std::string, std::string>& row) {
         const std::string id = row.at("id");
         const std::string name = row.at("name");
-        // use action app.select_deck_id with int param
-        GMenuItem *item = g_menu_item_new(name.c_str(), NULL);
-        g_menu_item_set_action_and_target_value(item, "app.select_deck_id", g_variant_new_int32(std::stoi(id)));
-        g_menu_append_item(state->deck_menu, item);
-        g_object_unref(item);
+    // Create a submenu for this deck with actions: Apri deck, Curva Mana, Elimina Deck
+    GMenu *deck_sub = g_menu_new();
+    // Select/open deck (with deck id parameter)
+    GMenuItem *sel_item = g_menu_item_new(translate("Apri").c_str(), NULL);
+    g_menu_item_set_action_and_target_value(sel_item, "app.select_deck_id", g_variant_new_int32(std::stoi(id)));
+    g_menu_append_item(deck_sub, sel_item);
+    g_object_unref(sel_item);
+    // Mana curve for this specific deck
+    GMenuItem *curve_item = g_menu_item_new("Curva Mana", NULL);
+    g_menu_item_set_action_and_target_value(curve_item, "app.mana_curve", g_variant_new_int32(std::stoi(id)));
+    g_menu_append_item(deck_sub, curve_item);
+    g_object_unref(curve_item);
+    // Delete deck (calls app.delete_deck with deck id)
+    GMenuItem *del_item = g_menu_item_new(translate("Elimina Deck").c_str(), NULL);
+    g_menu_item_set_action_and_target_value(del_item, "app.delete_deck", g_variant_new_int32(std::stoi(id)));
+    g_menu_append_item(deck_sub, del_item);
+    g_object_unref(del_item);
+    // Wrap submenu in a top-level item named after the deck
+    GMenuItem *parent_item = g_menu_item_new(name.c_str(), NULL);
+    g_menu_item_set_submenu(parent_item, G_MENU_MODEL(deck_sub));
+    g_menu_append_item(state->deck_menu, parent_item);
+    g_object_unref(parent_item);
+    g_object_unref(deck_sub);
     });
 }
 
@@ -1001,6 +1022,305 @@ static void sort_card_list(AppState* state, const char* column, bool asc) {
         g_list_store_append(state->card_store, row);
         g_object_unref(row);
     }
+}
+
+// Draw mana histogram onto a cairo surface
+static void draw_mana_on_cairo(cairo_t* cr, int width, int height, const std::map<int,int>& counts, int total_cards, int cap_bucket) {
+    // background
+    cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
+    cairo_paint(cr);
+    // margins
+    const int margin = 40;
+    int w = width - margin*2;
+    int h = height - margin*2;
+    int buckets = cap_bucket + 1;
+    int bar_w = buckets > 0 ? (w / buckets) : w;
+    // find max count
+    int maxc = 1;
+    for (auto &p : counts) if (p.second > maxc) maxc = p.second;
+    // draw axes
+    cairo_set_source_rgb(cr, 0,0,0);
+    cairo_set_line_width(cr, 1.0);
+    cairo_move_to(cr, margin, margin);
+    cairo_line_to(cr, margin, margin + h);
+    cairo_line_to(cr, margin + w, margin + h);
+    cairo_stroke(cr);
+    // draw bars
+    for (int b=0;b<buckets;++b) {
+        int cx = margin + b*bar_w;
+        int cnt = 0;
+        auto it = counts.find(b);
+        if (it != counts.end()) cnt = it->second;
+        double height_frac = maxc > 0 ? (double)cnt / (double)maxc : 0.0;
+        int bh = (int)(height_frac * (h - 20));
+        // color gradient
+        double t = buckets>1 ? (double)b / (double)(buckets-1) : 0.0;
+        cairo_set_source_rgb(cr, 0.2 + 0.6 * t, 0.4, 0.2 + 0.4*(1.0-t));
+        cairo_rectangle(cr, cx + 4, margin + h - bh, bar_w - 8, bh);
+        cairo_fill(cr);
+        // label
+        char lbl[32];
+        if (b < cap_bucket) snprintf(lbl, sizeof(lbl), "%d", b);
+        else snprintf(lbl, sizeof(lbl), ">=%d", cap_bucket);
+        cairo_set_source_rgb(cr, 0,0,0);
+        cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+        cairo_set_font_size(cr, 12.0);
+        cairo_text_extents_t ext;
+        cairo_text_extents(cr, lbl, &ext);
+        double lx = cx + (bar_w - ext.width) / 2.0 - ext.x_bearing;
+        double ly = margin + h + 16;
+        cairo_move_to(cr, lx, ly);
+        cairo_show_text(cr, lbl);
+    }
+    // title
+    cairo_set_source_rgb(cr, 0,0,0);
+    cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+    cairo_set_font_size(cr, 16.0);
+    cairo_move_to(cr, margin, 18);
+    cairo_show_text(cr, "Curva Mana");
+}
+
+// Create a cairo image surface containing the mana curve for the given counts
+static cairo_surface_t* create_mana_surface(const std::map<int,int>& counts, int total_cards, int cap_bucket, int width=800, int height=400) {
+    cairo_surface_t* surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, width, height);
+    cairo_t* cr = cairo_create(surface);
+    draw_mana_on_cairo(cr, width, height, counts, total_cards, cap_bucket);
+    cairo_destroy(cr);
+    cairo_surface_flush(surface);
+    return surface;
+}
+
+// Action handler: show mana curve for deck (parameter int deck id) or current selected deck
+static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
+    (void)action;
+    GtkWindow* parent = GTK_WINDOW(user_data);
+    AppState* state = (AppState*)g_object_get_data(G_OBJECT(parent), "app_state");
+    if (!state || !state->db) return;
+    int deck_id = -1;
+    if (parameter && g_variant_is_of_type(parameter, G_VARIANT_TYPE_INT32)) deck_id = g_variant_get_int32(parameter);
+    if (deck_id == -1) deck_id = state->selected_deck_id;
+    if (deck_id == -1) {
+        GtkAlertDialog *a = gtk_alert_dialog_new("%s", "Seleziona un deck prima di visualizzare la curva mana");
+        gtk_alert_dialog_show(a, parent);
+        g_object_unref(a);
+        return;
+    }
+    // Query DB for mana_cost, name, quantity and colors in this deck
+    std::map<int,int> counts;
+    int total_cards = 0;
+    // detailed info per bucket: cost -> list of (name, qty)
+    std::map<int, std::vector<std::pair<std::string,int>>> bucket_details;
+    std::map<std::string,int> color_counts;
+    state->db->query("SELECT english_name, localized_name, name, mana_cost, quantity, colors FROM cards WHERE deck_id = ?", [&](const std::map<std::string,std::string>& row){
+        std::string mana = row.count("mana_cost") ? row.at("mana_cost") : "";
+        int qty = 1;
+        try { if (row.count("quantity") && !row.at("quantity").empty()) qty = std::stoi(row.at("quantity")); } catch(...) { qty = 1; }
+        int cost = calculate_total_mana_cost(mana);
+        if (cost < 0) cost = 0;
+        counts[cost] += qty;
+        total_cards += qty;
+        // name preference: localized, english, raw name
+        std::string cname = "";
+        if (row.count("localized_name") && !row.at("localized_name").empty()) cname = row.at("localized_name");
+        else if (row.count("english_name") && !row.at("english_name").empty()) cname = row.at("english_name");
+        else if (row.count("name")) cname = row.at("name");
+        bucket_details[cost].push_back({cname, qty});
+        // colors parsing: either JSON array or compact codes
+        std::string cols = row.count("colors") ? row.at("colors") : "";
+        if (!cols.empty()) {
+            try {
+                auto j = nlohmann::json::parse(cols);
+                if (j.is_array()) {
+                    for (auto &c : j) {
+                        std::string cc = c.get<std::string>();
+                        color_counts[cc] += qty;
+                    }
+                }
+            } catch(...) {
+                // fallback: treat as sequence of letters (e.g., WUBRG or "WU")
+                for (char ch : cols) {
+                    if (std::isalpha((unsigned char)ch)) {
+                        std::string s(1, ch);
+                        color_counts[s] += qty;
+                    }
+                }
+            }
+        }
+    }, std::vector<std::string>{std::to_string(deck_id)});
+    // cap bucket at 10
+    int cap = 10;
+    // Normalize counts into capped buckets and merge detailed lists accordingly
+    std::map<int,int> buckets;
+    std::map<int, std::vector<std::pair<std::string,int>>> buckets_details_capped;
+    for (auto &p : counts) {
+        int b = p.first;
+        if (b >= cap) b = cap;
+        buckets[b] += p.second;
+    }
+    // fold bucket_details into capped buckets
+    for (auto &p : bucket_details) {
+        int orig = p.first;
+        int b = orig >= cap ? cap : orig;
+        for (auto &it : p.second) buckets_details_capped[b].push_back(it);
+    }
+    // Query deck name for nicer filenames
+    std::string deck_name = "";
+    if (state->db) {
+        state->db->query("SELECT name FROM decks WHERE id = ?", [&](const std::map<std::string,std::string>& r){
+            deck_name = r.at("name");
+        }, std::vector<std::string>{std::to_string(deck_id)});
+    }
+    // create surface
+    int w = 800, h = 400;
+    cairo_surface_t* surf = create_mana_surface(buckets, total_cards, cap, w, h);
+    // create pixbuf from surface and show in dialog with export buttons and stats
+    GdkPixbuf* pb = gdk_pixbuf_get_from_surface(surf, 0, 0, w, h);
+    GtkWidget* dialog = create_styled_dialog(parent, w+360, h+120);
+    gtk_window_set_title(GTK_WINDOW(dialog), "Curva Mana");
+    GtkWidget* hmain = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    gtk_window_set_child(GTK_WINDOW(dialog), hmain);
+    // Left: image preview
+    GtkWidget* img = gtk_image_new_from_pixbuf(pb);
+    gtk_box_append(GTK_BOX(hmain), img);
+    // Right: stats and controls
+    GtkWidget* right = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_box_append(GTK_BOX(hmain), right);
+    // Stats computation
+    double avg = 0.0;
+    int max_cost = 0;
+    int mode_bucket = 0; int mode_count = 0;
+    for (auto &p : buckets) {
+        int cost = p.first; int cnt = p.second;
+        avg += cost * (double)cnt;
+        if (cost > max_cost) max_cost = cost;
+        if (cnt > mode_count) { mode_count = cnt; mode_bucket = cost; }
+    }
+    if (total_cards > 0) avg /= (double)total_cards;
+    // median calculation
+    int median = 0;
+    if (total_cards > 0) {
+        int half = (total_cards + 1) / 2;
+        int acc = 0;
+        for (auto &p : buckets) {
+            acc += p.second;
+            if (acc >= half) { median = p.first; break; }
+        }
+    }
+    // Summary labels
+    char buf[256];
+    snprintf(buf, sizeof(buf), "Totale carte: %d", total_cards);
+    GtkWidget* lbl_total = gtk_label_new(buf);
+    snprintf(buf, sizeof(buf), "Costo medio: %.2f", avg);
+    GtkWidget* lbl_avg = gtk_label_new(buf);
+    snprintf(buf, sizeof(buf), "Mediana: %d", median);
+    GtkWidget* lbl_median = gtk_label_new(buf);
+    snprintf(buf, sizeof(buf), "Bucket più comune: %d (%d carte)", mode_bucket, mode_count);
+    GtkWidget* lbl_mode = gtk_label_new(buf);
+    snprintf(buf, sizeof(buf), "Massimo costo bucket: %d", max_cost);
+    GtkWidget* lbl_max = gtk_label_new(buf);
+    gtk_box_append(GTK_BOX(right), lbl_total);
+    gtk_box_append(GTK_BOX(right), lbl_avg);
+    gtk_box_append(GTK_BOX(right), lbl_median);
+    gtk_box_append(GTK_BOX(right), lbl_mode);
+    gtk_box_append(GTK_BOX(right), lbl_max);
+    // Distribution list (compact)
+    GtkWidget* dist_label = gtk_label_new(NULL);
+    std::string dists = "Distribuzione: ";
+    for (auto &p : buckets) {
+        double pct = total_cards>0 ? (100.0 * p.second / total_cards) : 0.0;
+        char t[64]; snprintf(t, sizeof(t), "%d:%d(%.0f%%) ", p.first, p.second, pct);
+        dists += t;
+    }
+    gtk_label_set_text(GTK_LABEL(dist_label), dists.c_str());
+    gtk_label_set_xalign(GTK_LABEL(dist_label), 0.0);
+    gtk_label_set_xalign(GTK_LABEL(lbl_total), 0.0);
+    gtk_label_set_xalign(GTK_LABEL(lbl_avg), 0.0);
+    gtk_label_set_xalign(GTK_LABEL(lbl_median), 0.0);
+    gtk_label_set_xalign(GTK_LABEL(lbl_mode), 0.0);
+    gtk_label_set_xalign(GTK_LABEL(lbl_max), 0.0);
+    gtk_box_append(GTK_BOX(right), dist_label);
+    // Buttons: export png/pdf and export stats
+    GtkWidget* btns = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    GtkWidget* export_png = gtk_button_new_with_label("Export PNG");
+    GtkWidget* export_pdf = gtk_button_new_with_label("Export PDF");
+    GtkWidget* export_stats = gtk_button_new_with_label("Export stats");
+    GtkWidget* close = gtk_button_new_with_label("Close");
+    gtk_box_append(GTK_BOX(btns), export_png);
+    gtk_box_append(GTK_BOX(btns), export_pdf);
+    gtk_box_append(GTK_BOX(btns), export_stats);
+    gtk_box_append(GTK_BOX(btns), close);
+    gtk_box_append(GTK_BOX(right), btns);
+
+    // Handlers (avoid inline lambdas in macros)
+    struct ExportCtx { cairo_surface_t* surf; GtkWindow* parent; int w,h; std::map<int,int> buckets; int total; int cap; std::string deck_name; std::map<int, std::vector<std::pair<std::string,int>>> bucket_details; std::map<std::string,int> color_counts; double avg; int median; int mode_bucket; int mode_count; int max_cost; };
+    ExportCtx* ectx = new ExportCtx{surf, GTK_WINDOW(dialog), w, h, buckets, total_cards, cap, deck_name, buckets_details_capped, color_counts, avg, median, mode_bucket, mode_count, max_cost};
+    g_signal_connect(export_png, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data){
+    ExportCtx* c = (ExportCtx*)user_data;
+    if (!c || !c->surf) return;
+    ensure_data_dir_exists("data");
+    std::string base = c->deck_name.empty() ? (std::string("mana_curve_") + std::to_string(time(nullptr))) : (std::string("mana_curve_") + sanitize_filename(c->deck_name));
+    std::string fname = std::string("data/") + base + ".png";
+    cairo_surface_write_to_png(c->surf, fname.c_str());
+    std::cout << "Exported PNG to " << fname << std::endl;
+    }), ectx);
+    g_signal_connect(export_pdf, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data){
+    ExportCtx* c = (ExportCtx*)user_data;
+    if (!c) return;
+    ensure_data_dir_exists("data");
+    std::string base = c->deck_name.empty() ? (std::string("mana_curve_") + std::to_string(time(nullptr))) : (std::string("mana_curve_") + sanitize_filename(c->deck_name));
+    std::string fname = std::string("data/") + base + ".pdf";
+    cairo_surface_t* pdf = cairo_pdf_surface_create(fname.c_str(), c->w, c->h);
+    cairo_t* cr = cairo_create(pdf);
+    // Redraw vectorially on the PDF surface for better quality
+    draw_mana_on_cairo(cr, c->w, c->h, c->buckets, c->total, c->cap);
+    cairo_destroy(cr);
+    cairo_surface_flush(pdf);
+    cairo_surface_destroy(pdf);
+    std::cout << "Exported PDF to " << fname << std::endl;
+    }), ectx);
+    g_signal_connect(export_stats, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data){
+    ExportCtx* c = (ExportCtx*)user_data;
+    if (!c) return;
+    ensure_data_dir_exists("data");
+    std::string base = c->deck_name.empty() ? (std::string("mana_stats_") + std::to_string(time(nullptr))) : (std::string("mana_stats_") + sanitize_filename(c->deck_name));
+    std::string fname = std::string("data/") + base + ".txt";
+    std::ofstream out(fname);
+    if (!out) return;
+    out << "Deck: " << c->deck_name << "\n";
+    out << "Total cards: " << c->total << "\n";
+    out << "Average mana cost: " << c->avg << "\n";
+    out << "Median cost: " << c->median << "\n";
+    out << "Mode bucket: " << c->mode_bucket << " (" << c->mode_count << ")\n";
+    out << "Max bucket: " << c->max_cost << "\n\n";
+    out << "Distribution:\n";
+    for (auto &p : c->buckets) out << "  " << p.first << ": " << p.second << "\n";
+    out << "\nPer-bucket card lists:\n";
+    for (auto &p : c->bucket_details) {
+        out << "Bucket " << p.first << ":\n";
+        for (auto &it : p.second) {
+            out << "    " << it.first << " x" << it.second << "\n";
+        }
+    }
+    out << "\nColor breakdown:\n";
+    for (auto &p : c->color_counts) out << "  " << p.first << ": " << p.second << "\n";
+    out.close();
+    std::cout << "Exported stats to " << fname << std::endl;
+    }), ectx);
+    g_signal_connect(close, "clicked", G_CALLBACK(+[](GtkButton* btn, gpointer user_data){
+        GtkWidget* dlg = GTK_WIDGET(user_data);
+        if (dlg) gtk_window_destroy(GTK_WINDOW(dlg));
+    }), dialog);
+
+    gtk_widget_show(dialog);
+    // cleanup when dialog is destroyed
+    g_signal_connect(dialog, "destroy", G_CALLBACK(+[](GtkWidget* w, gpointer user_data){
+        ExportCtx* c = (ExportCtx*)user_data;
+        if (c) {
+            if (c->surf) cairo_surface_destroy(c->surf);
+            delete c;
+        }
+    }), ectx);
+    if (pb) g_object_unref(pb);
 }
 
 // Dialog per ricerca carta Scryfall
@@ -2872,6 +3192,8 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     g_menu_append_submenu(view_menu, "Lingua", G_MENU_MODEL(lang_menu));
     // Filter entry
     g_menu_append(view_menu, "Filtri...", "app.filters");
+    // Mana curve for selected deck
+    g_menu_append(view_menu, "Curva Mana", "app.mana_curve");
     g_object_unref(lang_menu);
 
     GtkWidget *view_button = gtk_menu_button_new();
@@ -3555,6 +3877,27 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         g_object_unref(dialog);
     }), window);
     g_action_map_add_action(G_ACTION_MAP(app), G_ACTION(opendb_action));
+
+    // Mana curve action (deck-aware). Parameter: optional int (deck_id)
+    GSimpleAction *mana_curve_action = g_simple_action_new("mana_curve", G_VARIANT_TYPE_INT32);
+    g_signal_connect(mana_curve_action, "activate", G_CALLBACK(on_mana_curve_action), window);
+    g_action_map_add_action(G_ACTION_MAP(app), G_ACTION(mana_curve_action));
+
+    // Delete deck action (accepts int deck_id)
+    GSimpleAction *delete_deck_action = g_simple_action_new("delete_deck", G_VARIANT_TYPE_INT32);
+    g_signal_connect(delete_deck_action, "activate", G_CALLBACK(+[](GSimpleAction *action, GVariant *parameter, gpointer user_data){
+        // action wrapper: set selected_deck_id in state and trigger existing delete dialog
+        GtkWindow* parent = GTK_WINDOW(user_data);
+        AppState* state = (AppState*)g_object_get_data(G_OBJECT(parent), "app_state");
+        if (!state) return;
+        if (parameter && g_variant_is_of_type(parameter, G_VARIANT_TYPE_INT32)) {
+            int did = g_variant_get_int32(parameter);
+            state->selected_deck_id = did;
+        }
+        // call existing on_deck_delete_clicked to show confirmation dialog
+        on_deck_delete_clicked(NULL, parent);
+    }), window);
+    g_action_map_add_action(G_ACTION_MAP(app), G_ACTION(delete_deck_action));
 
     // Azione per creare un deck (menu File)
     GSimpleAction *create_deck_action = g_simple_action_new("create_deck", NULL);
