@@ -1,0 +1,162 @@
+name: CI Build and Release
+
+on:
+  push:
+    branches: [ main ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main ]
+
+env:
+  BUILD_NAME: magicdb
+
+jobs:
+  build-linux:
+    name: Build (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential pkg-config git \
+            libgtk-4-dev libsqlite3-dev libcurl4-openssl-dev nlohmann-json3-dev gzip tar sha256sum gpg
+
+      - name: Build
+        run: |
+          make
+
+      - name: Smoke test
+        run: |
+          if [ -x ./${{ env.BUILD_NAME }} ]; then echo "Built: ./${{ env.BUILD_NAME }}"; ls -l ./${{ env.BUILD_NAME }}; else echo "No binary produced"; exit 1; fi
+
+      - name: Package artifacts and create checksums
+        id: package_linux
+        run: |
+          set -e
+          TARNAME="${{ env.BUILD_NAME }}-${{ github.run_number }}.tar.gz"
+          tar -czf "$TARNAME" ./${{ env.BUILD_NAME }}
+          sha256sum "$TARNAME" > "$TARNAME.sha256"
+          sha256sum ./${{ env.BUILD_NAME }} > ${GITHUB_WORKSPACE}/${{ env.BUILD_NAME }}.sha256
+          echo "tar=$TARNAME" >> "$GITHUB_OUTPUT"
+          echo "tar_checksum=$TARNAME.sha256" >> "$GITHUB_OUTPUT"
+          echo "raw_checksum=${{ env.BUILD_NAME }}.sha256" >> "$GITHUB_OUTPUT"
+          ls -l "$TARNAME" "$TARNAME.sha256" ./${{ env.BUILD_NAME }} ${{ env.BUILD_NAME }}.sha256
+
+      - name: Optional GPG sign artifacts
+        run: |
+          set -e
+          # Read secrets into local variables (safe expansion happens on the runner)
+          GPG_PRIVATE_KEY="${{ secrets.GPG_PRIVATE_KEY }}"
+          GPG_PASS="${{ secrets.GPG_PASSPHRASE }}"
+          if [ -z "$GPG_PRIVATE_KEY" ]; then
+            echo "No GPG key provided; skipping signing"
+            exit 0
+          fi
+          # Import private key
+          echo "$GPG_PRIVATE_KEY" > private.key || true
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          # Sign tar and raw binary (if present)
+          if [ -f "$TARNAME" ]; then
+            gpg --batch --yes --passphrase "$GPG_PASS" --output "$TARNAME.sig" --detach-sign "$TARNAME"
+          fi
+          if [ -f "${{ env.BUILD_NAME }}.sha256" ]; then
+            gpg --batch --yes --passphrase "$GPG_PASS" --output "${{ env.BUILD_NAME }}.sha256.sig" --detach-sign "${{ env.BUILD_NAME }}.sha256"
+          fi
+          ls -l || true
+
+      - name: Upload linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ github.run_number }}
+          path: |
+            ${{ steps.package_linux.outputs.tar }}
+            ${{ steps.package_linux.outputs.tar }}.sha256
+            ${{ env.BUILD_NAME }}
+            ${{ env.BUILD_NAME }}.sha256
+
+  build-windows:
+    name: Build (Windows)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+
+      - name: Install dependencies (MSYS2)
+        shell: bash
+        run: |
+          pacman -S --noconfirm mingw-w64-x86_64-toolchain mingw-w64-x86_64-gtk4 mingw-w64-x86_64-sqlite mingw-w64-x86_64-curl mingw-w64-x86_64-nlohmann-json
+
+      - name: Build (MSYS)
+        shell: bash
+        run: |
+          make
+
+      - name: Package Windows artifacts
+        id: package_win
+        run: |
+          set -e
+          if [ -f ./magicdb.exe ]; then
+            ZIPNAME="magicdb-${{ github.run_number }}-windows.zip"
+            powershell -Command "Compress-Archive -Path magicdb.exe -DestinationPath $ZIPNAME"
+            certutil -hashfile $ZIPNAME SHA256 > ${ZIPNAME}.sha256.txt || true
+            echo "zip=$ZIPNAME" >> "$GITHUB_OUTPUT"
+            echo "zip_checksum=${ZIPNAME}.sha256.txt" >> "$GITHUB_OUTPUT"
+            ls -l "$ZIPNAME" ${ZIPNAME}.sha256.txt
+          else
+            echo "No windows binary produced"; exit 1
+          fi
+
+      - name: Upload windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ github.run_number }}
+          path: |
+            ${{ steps.package_win.outputs.zip }}
+            ${{ steps.package_win.outputs.zip_checksum }}
+
+  create-release:
+    name: Create GitHub Release (on tag)
+    runs-on: ubuntu-latest
+    needs: [build-linux, build-windows]
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download linux artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-${{ github.run_number }}
+
+      - name: Download windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-${{ github.run_number }}
+
+      - name: Create release
+        id: create_release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.ref_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            magicdb-*.tar.gz
+            magicdb-*.tar.gz.sha256
+            magicdb
+            magicdb.sha256
+            magicdb-*.zip
+            magicdb-*.zip.sha256.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

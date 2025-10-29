@@ -26,3 +26,39 @@ jobs:
       - name: Run basic smoke (print version)
         run: |
           if [ -x ./magicdb ]; then echo "Executable built: ./magicdb"; ls -l ./magicdb; else echo "No binary produced"; fi
+
+      - name: Package artifact
+        id: package
+        run: |
+          if [ -x ./magicdb ]; then
+            TARNAME="magicdb-${{ github.run_number }}.tar.gz"
+            tar -czf "$TARNAME" ./magicdb
+            # Create checksums for integrity verification
+            sha256sum "$TARNAME" > "$TARNAME.sha256"
+            sha256sum ./magicdb > magicdb.sha256
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "tar=$TARNAME" >> "$GITHUB_OUTPUT"
+            echo "tar_checksum=$TARNAME.sha256" >> "$GITHUB_OUTPUT"
+            echo "raw_checksum=magicdb.sha256" >> "$GITHUB_OUTPUT"
+            ls -l "$TARNAME" "$TARNAME.sha256" magicdb magicdb.sha256
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload artifact
+        if: steps.package.outputs.found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: magicdb-${{ github.run_number }}
+          path: |
+            ${{ steps.package.outputs.tar }}
+            ${{ steps.package.outputs.tar }}.sha256
+
+      - name: Upload raw binary artifact
+        if: steps.package.outputs.found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: magicdb-raw-${{ github.run_number }}
+          path: |
+            ./magicdb
+            ./magicdb.sha256

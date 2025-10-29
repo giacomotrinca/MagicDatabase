@@ -7,6 +7,74 @@
 
 A sleek, fast, and slightly obsessive GTK4 desktop app to manage your Magic: The Gathering collection — built in C++17, powered by Scryfall, and tuned for people who want their collection neat, searchable, and styled with gold foil rows.
 
+This repo is one of many projects I use to build my presence in the community — expect iterative polish, pragmatic features, and a little personality. :P
+
+---
+
+![MagicDatabase screenshot](screenshot/screenshot.png)
+
+---
+---
+
+## ✨ Highlights
+
+- Scryfall integration for accurate card data and images
+- Bilingual UI (Italian / English) with instant switching
+- Foil-aware database (foil is a separate row; foil rows render in gold)
+- Powerful filtering (colors, rarities, foil) and sorting
+- Local SQLite storage with simple TXT export
+---
+
+## 🚀 Quickstart — Build & Run
+
+Clone, build and run in three commands:
+
+```bash
+git clone https://github.com/giacomotrinca/MagicDatabase.git
+cd MagicDatabase
+make
+./magicdb
+```
+
+If `./magicdb` starts, you're ready. If not, read the platform-specific install steps below to ensure dependencies are present.
+
+---
+
+## 🛠️ Dependencies
+
+- C++17 toolchain (g++/clang)
+- GTK4 development headers (gtk4)
+- sqlite3 development headers
+- libcurl development headers
+- nlohmann/json (header-only; distro packages available)
+- make
+
+Below are concrete install commands for common platforms.
+
+### Ubuntu / Debian
+
+```bash
+sudo apt update
+sudo apt install -y build-essential pkg-config git \
+  libgtk-4-dev libsqlite3-dev libcurl4-openssl-dev nlohmann-json3-dev
+
+make
+./magicdb
+```
+
+Notes: On older Ubuntu releases GTK4 packages may be missing or old. Consider upgrading to a newer release or using flatpak/MSYS if needed.
+
+### Fedora
+
+# 🎴 MagicDatabase
+
+[![Build Status](https://github.com/giacomotrinca/MagicDatabase/actions/workflows/build.yml/badge.svg)](https://github.com/giacomotrinca/MagicDatabase/actions/workflows/build.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![GTK4](https://img.shields.io/badge/GTK-4.0-blue)](https://gtk.org/)
+[![C++17](https://img.shields.io/badge/C%2B%2B-17-orange)](https://isocpp.org/)
+
+A sleek, fast, and slightly obsessive GTK4 desktop app to manage your Magic: The Gathering collection — built in C++17, powered by Scryfall, and tuned for people who want their collection neat, searchable, and styled with gold foil rows.
+
 This repo is one of many projects I'm using to build my presence in the community — expect iterative polish, pragmatic features, and a little personality. :P
 
 ---
@@ -20,6 +88,7 @@ This repo is one of many projects I'm using to build my presence in the communit
 - Local SQLite storage with simple TXT export
 
 ---
+
 
 ## 🚀 Quickstart — Build & Run
 
@@ -118,6 +187,8 @@ Alternative: use WSL (Ubuntu) and follow the Ubuntu instructions if you prefer a
 
 If you prefer, I can add a containerized/flatpak build to make distribution easier — tell me which you prefer.
 
+CI artifacts: the GitHub Actions workflow builds the binary on Ubuntu and uploads both a tar.gz and the raw `magicdb` binary as artifacts, along with SHA-256 checksum files for integrity verification. You can download them from the Actions run page (Artifacts section).
+
 ---
 
 ## 📖 How to Use (Short)
@@ -167,71 +238,6 @@ MIT — see the `LICENSE` file.
 ---
 
 May your draws be legendary. Keep shipping and building your name. ✨
-# 🎴 MagicDatabase
-
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/giacomotrinca/MagicDatabase)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![GTK4](https://img.shields.io/badge/GTK-4.0-blue)](https://gtk.org/)
-[![C++17](https://img.shields.io/badge/C%2B%2B-17-orange)](https://isocpp.org/)
-
-A sleek, modern GTK4-based desktop application for managing your Magic: The Gathering card collection. Seamlessly search, add, and organize cards with real-time data from Scryfall, featuring dynamic localization in English and Italian.
-
-![MagicDatabase Screenshot](https://via.placeholder.com/800x600?text=MagicDatabase+Screenshot) <!-- Replace with actual screenshot -->
-
-## ✨ Features
-
-- **🔍 Scryfall Integration**: Search and fetch card data directly from Scryfall's comprehensive API.
-- **🌍 Dynamic Localization**: Switch between English and Italian instantly – names, types, colors, and rarity update on the fly!
-- **🔄 Smart Refresh**: Update existing cards' information without duplicates, with fallback for cards missing English names.
-- **📊 SQLite Database**: Robust local storage with localized fields for offline access.
-- **🎨 Modern UI**: Dark-themed GTK4 interface with smooth animations and responsive design.
-- **📋 Advanced Sorting & Filtering**: Sort by name, type, colors, mana cost, rarity, or date. Filter by name.
-- **🖼️ Image Hover**: Hover over cards to preview high-quality images.
-- **📈 Collection Stats**: View total cards and estimated value.
-- **🗂️ Database Management**: Create, open, and manage multiple collections.
-
-## 🚀 Installation
-
-### Prerequisites
-
-- **GTK4**: Install GTK4 development libraries.
-  - Ubuntu/Debian: `sudo apt install libgtk-4-dev`
-  - Fedora: `sudo dnf install gtk4-devel`
-  - macOS: `brew install gtk4`
-  - Windows: Use MSYS2 or vcpkg.
-
-- **SQLite3**: `sudo apt install libsqlite3-dev` (or equivalent).
-- **libcurl**: `sudo apt install libcurl4-openssl-dev`.
-- **nlohmann/json**: Header-only library, included via `-I/usr/include/nlohmann`.
-- **C++17 Compiler**: GCC 7+ or Clang 5+.
-
-### Build Instructions
-
-1. **Clone the Repository**:
-   ```bash
-   git clone https://github.com/giacomotrinca/MagicDatabase.git
-   cd MagicDatabase
-   ```
-
-2. **Compile**:
-   ```bash
-   make
-   ```
-
-3. **Run**:
-   ```bash
-   ./magicdb
-   ```
-
-## 📖 Usage
-
-1. **Launch the App**: Run `./magicdb` to start the application.
-2. **Create/Open Database**: Use "File" > "New Database" or "Open Database" to manage your collection.
-3. **Add Cards**: Click "Nuova Carta" (New Card), search by name, and select from results.
-4. **Switch Language**: Go to "Visualizza" > "Lingua" to toggle between Italian and English.
-5. **Refresh Data**: Hit the "Refresh" button to update all cards from Scryfall.
-6. **Sort & Filter**: Use column headers for sorting, and the search bar for filtering.
-
 ### Keyboard Shortcuts
 
 - `Ctrl+N`: Add new card
