@@ -1,84 +1,14 @@
-# 🎴 MagicDatabase
+## 🎴 MagicDatabase
 
-[![Build Status](https://github.com/giacomotrinca/MagicDatabase/actions/workflows/build.yml/badge.svg)](https://github.com/giacomotrinca/MagicDatabase/actions/workflows/build.yml)
+[![Build Status](https://github.com/giacomotrinca/MagicDatabase/actions/workflows/ci.yml/badge.svg)](https://github.com/giacomotrinca/MagicDatabase/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![GTK4](https://img.shields.io/badge/GTK-4.0-blue)](https://gtk.org/)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-orange)](https://isocpp.org/)
 
-A sleek, fast, and slightly obsessive GTK4 desktop app to manage your Magic: The Gathering collection — built in C++17, powered by Scryfall, and tuned for people who want their collection neat, searchable, and styled with gold foil rows.
-
-This repo is one of many projects I use to build my presence in the community — expect iterative polish, pragmatic features, and a little personality. :P
-
----
+A compact GTK4 desktop app to manage your Magic: The Gathering collection. Built in C++17, it uses Scryfall for card data, stores collections in a local SQLite database, and supports features like foil tracking, bilingual UI, and flexible filtering.
 
 ![MagicDatabase screenshot](screenshot/screenshot.png)
 
----
----
-
-## ✨ Highlights
-
-- Scryfall integration for accurate card data and images
-- Bilingual UI (Italian / English) with instant switching
-- Foil-aware database (foil is a separate row; foil rows render in gold)
-- Powerful filtering (colors, rarities, foil) and sorting
-- Local SQLite storage with simple TXT export
----
-
-## 🚀 Quickstart — Build & Run
-
-Clone, build and run in three commands:
-
-```bash
-git clone https://github.com/giacomotrinca/MagicDatabase.git
-cd MagicDatabase
-make
-./magicdb
-```
-
-If `./magicdb` starts, you're ready. If not, read the platform-specific install steps below to ensure dependencies are present.
-
----
-
-## 🛠️ Dependencies
-
-- C++17 toolchain (g++/clang)
-- GTK4 development headers (gtk4)
-- sqlite3 development headers
-- libcurl development headers
-- nlohmann/json (header-only; distro packages available)
-- make
-
-Below are concrete install commands for common platforms.
-
-### Ubuntu / Debian
-
-```bash
-sudo apt update
-sudo apt install -y build-essential pkg-config git \
-  libgtk-4-dev libsqlite3-dev libcurl4-openssl-dev nlohmann-json3-dev
-
-make
-./magicdb
-```
-
-Notes: On older Ubuntu releases GTK4 packages may be missing or old. Consider upgrading to a newer release or using flatpak/MSYS if needed.
-
-### Fedora
-
-# 🎴 MagicDatabase
-
-[![Build Status](https://github.com/giacomotrinca/MagicDatabase/actions/workflows/build.yml/badge.svg)](https://github.com/giacomotrinca/MagicDatabase/actions/workflows/build.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![GTK4](https://img.shields.io/badge/GTK-4.0-blue)](https://gtk.org/)
-[![C++17](https://img.shields.io/badge/C%2B%2B-17-orange)](https://isocpp.org/)
-
-A sleek, fast, and slightly obsessive GTK4 desktop app to manage your Magic: The Gathering collection — built in C++17, powered by Scryfall, and tuned for people who want their collection neat, searchable, and styled with gold foil rows.
-
-This repo is one of many projects I'm using to build my presence in the community — expect iterative polish, pragmatic features, and a little personality. :P
-
----
-
 ## ✨ Highlights
 
 - Scryfall integration for accurate card data and images
@@ -87,202 +17,138 @@ This repo is one of many projects I'm using to build my presence in the communit
 - Powerful filtering (colors, rarities, foil) and sorting
 - Local SQLite storage with simple TXT export
 
----
-
-
 ## 🚀 Quickstart — Build & Run
 
-Clone, build and run in three commands:
+Clone, build and run:
 
-```bash
+```fish
 git clone https://github.com/giacomotrinca/MagicDatabase.git
 cd MagicDatabase
 make
 ./magicdb
 ```
 
-If `./magicdb` starts, you're ready. If not, read the platform-specific install steps below to ensure dependencies are present.
+If the binary starts, you're ready. If not, see the platform-specific steps below for installing dependencies.
 
----
-
-## 🛠️ Dependencies
+## 🛠️ Dependencies (examples)
 
 - C++17 toolchain (g++/clang)
-- GTK4 development headers (gtk4)
+- GTK4 development headers
 - sqlite3 development headers
 - libcurl development headers
 - nlohmann/json (header-only; distro packages available)
 - make
 
-Below are concrete install commands for common platforms.
-
 ### Ubuntu / Debian
 
-```bash
+```fish
 sudo apt update
 sudo apt install -y build-essential pkg-config git \
   libgtk-4-dev libsqlite3-dev libcurl4-openssl-dev nlohmann-json3-dev
-
 make
 ./magicdb
 ```
 
-Notes: On older Ubuntu releases GTK4 packages may be missing or old. Consider upgrading to a newer release or using flatpak/MSYS if needed.
-
 ### Fedora
 
-```bash
+```fish
 sudo dnf install -y @development-tools pkgconfig git \
   gtk4-devel sqlite-devel libcurl-devel nlohmann-json-devel
-
 make
 ./magicdb
 ```
 
 ### Arch Linux
 
-```bash
+```fish
 sudo pacman -Syu --needed base-devel git gtk4 sqlite curl nlohmann-json
-
 make
 ./magicdb
 ```
 
 ### macOS (Homebrew)
 
-```bash
+```fish
 brew update
 brew install gtk4 sqlite curl nlohmann-json pkg-config
-
 make
 ./magicdb
 ```
 
-Homebrew may install GTK under `/usr/local` or `/opt/homebrew`; pkg-config usually finds it.
-
-### Windows (MSYS2) — recommended for native builds
+### Windows (MSYS2)
 
 1. Install MSYS2: https://www.msys2.org/
-2. Open the "MSYS2 MinGW 64-bit" shell and run:
+2. Open "MSYS2 MinGW 64-bit" and run:
 
-```bash
+```fish
 pacman -Syu
 pacman -S --needed mingw-w64-x86_64-toolchain mingw-w64-x86_64-gtk4 \
   mingw-w64-x86_64-sqlite mingw-w64-x86_64-curl mingw-w64-x86_64-nlohmann-json git
-
 cd /c/path/to/MagicDatabase
 make
 ./magicdb.exe
 ```
 
-Alternative: use WSL (Ubuntu) and follow the Ubuntu instructions if you prefer a Linux environment.
-
----
-
-## 🔧 Build Tips & Troubleshooting
-
-- If pkg-config can't find GTK4, check `PKG_CONFIG_PATH` to include Homebrew/MSYS2 pkgconfig paths.
-- If you get missing `nlohmann/json`, either install the distro package or add include path via `-I` in the Makefile.
-- Run `./magicdb` from a terminal to see console logs — they help diagnose runtime issues.
-
-If you prefer, I can add a containerized/flatpak build to make distribution easier — tell me which you prefer.
-
-CI artifacts: the GitHub Actions workflow builds the binary on Ubuntu and uploads both a tar.gz and the raw `magicdb` binary as artifacts, along with SHA-256 checksum files for integrity verification. You can download them from the Actions run page (Artifacts section).
-
----
-
-## 📖 How to Use (Short)
+##  How to Use (short)
 
 1. Start the app (`./magicdb`).
 2. File → New Database to create a collection (saved under `data/`).
-3. Click "Nuova Carta" / "New Card" and search by name; pick the correct result and optionally mark it as foil.
-4. Use Visualizza → Lingua to switch UI language; dates and labels update instantly.
-5. Use the search box, sorting headers and View → Filters to refine what you see.
+3. Add cards using "New Card" and mark foil when needed.
+4. Use View → Language to switch UI language; dates and labels update instantly.
+5. Use the search box and View → Filters to refine the list.
 
-Foil cards are stored as distinct rows in the DB and appear with gold-colored text in the UI.
-
----
+Foil cards are stored as distinct rows and show with gold-colored text in the UI.
 
 ## 🧭 Developer Notes
 
 - Card colors are stored as a JSON array in the `colors` column.
-- The `foil` column is an integer (0/1) and is included in uniqueness checks so foil/non-foil rows remain separate.
+- The `foil` column is an integer (0/1) and is included in uniqueness checks so foil/non-foil are separate rows.
 - UI filtering is currently client-side; for very large DBs we can convert filters to SQL queries.
 
----
+## 🏗️ Architecture
 
-## 🤝 Contributing & Getting Noticed
+- Frontend: GTK4 (C++)
+- Backend: C++17 with SQLite
+- Network: libcurl + nlohmann/json
+- Localization: in-memory translation maps with dynamic UI updates
 
-If you're reading this and want to help me build a presence in the community, contributions are massively appreciated.
+## 🧪 CI & Releases
 
-1. Fork the repo
-2. Create a branch: `git checkout -b feature/your-awesome-thing`
-3. Implement, test, and push
-4. Open a PR and describe the value
+The repository includes a GitHub Actions workflow that builds on Ubuntu and Windows, packages artifacts (tar.gz / zip), and uploads checksums. When you push a tag like `v1.2.3` the workflow will create a GitHub Release and attach the artifacts.
 
-Good first tasks: translations, unit tests for the Database wrapper, SQL-filtering performance improvements.
+## 🤝 Contributing
 
----
+Contributions are welcome!
+
+1. Fork the repository
+2. Create a branch: `git checkout -b feature/your-thing`
+3. Implement and test
+4. Push and open a Pull Request
+
+Good first tasks: translations, unit tests for the database wrapper, SQL-filtering improvements.
 
 ## 📄 License
 
 MIT — see the `LICENSE` file.
 
----
+## 👋 Author / Contact
 
-## 👋 Contact
-
-- Author: Giacomo Trinca — https://github.com/giacomotrinca
+- Giacomo Trinca — https://github.com/giacomotrinca
 - Issues: https://github.com/giacomotrinca/MagicDatabase/issues
 
 ---
 
-May your draws be legendary. Keep shipping and building your name. ✨
+May your draws be legendary. ✨
+
 ### Keyboard Shortcuts
 
 - `Ctrl+N`: Add new card
 - `Delete`: Delete selected card
 
-## 🏗️ Architecture
+### Acknowledgments
 
-- **Frontend**: GTK4 for UI components (buttons, lists, menus).
-- **Backend**: C++17 with SQLite for data persistence.
-- **API**: libcurl for Scryfall HTTP requests, nlohmann/json for parsing.
-- **Localization**: In-memory translation maps with dynamic UI updates.
+- [Scryfall](https://scryfall.com/)
+- [GTK](https://gtk.org/)
+- [nlohmann/json](https://github.com/nlohmann/json)
 
-## 🤝 Contributing
-
-Contributions are welcome! Please:
-
-1. Fork the repository.
-2. Create a feature branch: `git checkout -b feature/amazing-feature`.
-3. Commit changes: `git commit -m 'Add amazing feature'`.
-4. Push to branch: `git push origin feature/amazing-feature`.
-5. Open a Pull Request.
-
-### Development Setup
-
-- Ensure all dependencies are installed.
-- Use `make` for building.
-- Test localization by switching languages and verifying translations.
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🙏 Acknowledgments
-
-- [Scryfall](https://scryfall.com/) for the amazing card database API.
-- [GTK](https://gtk.org/) for the powerful UI toolkit.
-- [nlohmann/json](https://github.com/nlohmann/json) for JSON parsing.
-
-## 📞 Contact
-
-- **Author**: Giacomo Trinca
-- **GitHub**: [@giacomotrinca](https://github.com/giacomotrinca)
-- **Issues**: [Report Bugs](https://github.com/giacomotrinca/MagicDatabase/issues)
-
----
-
-*May your draws be legendary! 🧙‍♂️*</content>
 <parameter name="filePath">/mnt/01D9269698DA8D30/gitrepos/MagicDatabase/README.md

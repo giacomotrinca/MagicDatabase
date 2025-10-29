@@ -23,7 +23,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential pkg-config git \
-            libgtk-4-dev libsqlite3-dev libcurl4-openssl-dev nlohmann-json3-dev gzip tar sha256sum gpg
+            libgtk-4-dev libsqlite3-dev libcurl4-openssl-dev nlohmann-json3-dev gpg
 
       - name: Build
         run: |
@@ -103,12 +103,14 @@ jobs:
 
       - name: Package Windows artifacts
         id: package_win
+        shell: bash
         run: |
           set -e
           if [ -f ./magicdb.exe ]; then
             ZIPNAME="magicdb-${{ github.run_number }}-windows.zip"
-            powershell -Command "Compress-Archive -Path magicdb.exe -DestinationPath $ZIPNAME"
-            certutil -hashfile $ZIPNAME SHA256 > ${ZIPNAME}.sha256.txt || true
+            # Use zip from MSYS2 instead of PowerShell to be robust in MSYS shell
+            zip -j "$ZIPNAME" ./magicdb.exe
+            sha256sum "$ZIPNAME" > "${ZIPNAME}.sha256.txt"
             echo "zip=$ZIPNAME" >> "$GITHUB_OUTPUT"
             echo "zip_checksum=${ZIPNAME}.sha256.txt" >> "$GITHUB_OUTPUT"
             ls -l "$ZIPNAME" ${ZIPNAME}.sha256.txt

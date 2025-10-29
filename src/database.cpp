@@ -206,6 +206,29 @@ Database::Database(const std::string& db_path) : db(nullptr) {
                         std::cout << "Aggiunta colonna 'foil' alla tabella cards." << std::endl;
                     }
                 }
+                // Check for sideboard column
+                bool has_sideboard = false;
+                pi = nullptr;
+                if (sqlite3_prepare_v2(db, pragma, -1, &pi, nullptr) == SQLITE_OK) {
+                    while (sqlite3_step(pi) == SQLITE_ROW) {
+                        const unsigned char* colname = sqlite3_column_text(pi, 1);
+                        if (colname && strcmp((const char*)colname, "sideboard") == 0) {
+                            has_sideboard = true;
+                            break;
+                        }
+                    }
+                    sqlite3_finalize(pi);
+                }
+                if (!has_sideboard) {
+                    char* err = nullptr;
+                    const char* alter = "ALTER TABLE cards ADD COLUMN sideboard INTEGER DEFAULT 0";
+                    if (sqlite3_exec(db, alter, nullptr, nullptr, &err) != SQLITE_OK) {
+                        std::cerr << "Errore alter table aggiunta sideboard: " << (err ? err : (char*)"unknown") << std::endl;
+                        if (err) sqlite3_free(err);
+                    } else {
+                        std::cout << "Aggiunta colonna 'sideboard' alla tabella cards." << std::endl;
+                    }
+                }
             } else {
                 sqlite3_finalize(stmt);
             }
@@ -230,28 +253,66 @@ bool Database::execute(const std::string& sql) {
     return true;
 }
 
-bool Database::insert_card(const std::string& english_name, const std::string& localized_name, const std::string& type, const std::string& localized_type, const std::string& colors, const std::string& set_code, const std::string& mana_cost, const std::string& rarity, int quantity, const std::string& image_url, const std::string& price_usd, int deck_id, int foil) {
-    // Prima controlla se la carta esiste già (stesso english_name, set_code, foil e nello stesso deck se specificato)
+bool Database::insert_card(const std::string& english_name, const std::string& localized_name, const std::string& type, const std::string& localized_type, const std::string& colors, const std::string& set_code, const std::string& mana_cost, const std::string& rarity, int quantity, const std::string& image_url, const std::string& price_usd, int deck_id, int foil, int sideboard) {
+    // Normalize deck_id: callers may pass 0 for "no deck"; internally we treat <=0 as -1 (NULL)
+    if (deck_id <= 0) deck_id = -1;
+    if (sideboard <= 0) sideboard = 0; // normalize any non-positive to 0
+    // Prima controlla se la carta esiste già (stesso english_name o localized_name, stesso foil, e nello stesso deck se specificato)
     sqlite3_stmt* check_stmt;
+    // Uniqueness check: consider that some rows may have english_name empty and use localized_name instead.
+    // Match if either english_name OR localized_name equals the provided value, same foil, and same deck (or NULL).
+    // NOTE: we intentionally do NOT use set_code for uniqueness so cards from different sets with the same name
+    // are merged into the same row (as requested).
     if (deck_id != -1) {
-        const char* check_sql = "SELECT id, quantity FROM cards WHERE english_name = ? AND set_code = ? AND foil = ? AND deck_id = ?";
+        // Use trimmed, case-insensitive comparisons so 'Anello Solare' == 'anello solare' and
+        // leading/trailing spaces don't cause duplicates. Compare both input names against stored
+        // columns english_name, localized_name and the legacy name column so older rows match.
+        const char* check_sql =
+            "SELECT id, quantity FROM cards WHERE ("
+            " LOWER(TRIM(COALESCE(english_name,''))) = LOWER(TRIM(?))"
+            " OR LOWER(TRIM(COALESCE(localized_name,''))) = LOWER(TRIM(?))"
+            " OR LOWER(TRIM(COALESCE(name,''))) = LOWER(TRIM(?))"
+            " OR LOWER(TRIM(COALESCE(english_name,''))) = LOWER(TRIM(?))"
+            " OR LOWER(TRIM(COALESCE(localized_name,''))) = LOWER(TRIM(?))"
+            " OR LOWER(TRIM(COALESCE(name,''))) = LOWER(TRIM(?)) )"
+            " AND foil = ? AND sideboard = ? AND deck_id = ?";
         if (sqlite3_prepare_v2(db, check_sql, -1, &check_stmt, nullptr) != SQLITE_OK) {
             std::cerr << "Errore prepare check: " << sqlite3_errmsg(db) << std::endl;
             return false;
         }
-        sqlite3_bind_text(check_stmt, 1, english_name.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(check_stmt, 2, set_code.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_int(check_stmt, 3, foil);
-        sqlite3_bind_int(check_stmt, 4, deck_id);
+        // Bind: first three compare stored cols to the provided english_name,
+        // next three compare stored cols to the provided localized_name.
+        sqlite3_bind_text(check_stmt, 1, english_name.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(check_stmt, 2, english_name.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(check_stmt, 3, english_name.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(check_stmt, 4, localized_name.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(check_stmt, 5, localized_name.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(check_stmt, 6, localized_name.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(check_stmt, 7, foil);
+        sqlite3_bind_int(check_stmt, 8, sideboard);
+        sqlite3_bind_int(check_stmt, 9, deck_id);
     } else {
-        const char* check_sql = "SELECT id, quantity FROM cards WHERE english_name = ? AND set_code = ? AND foil = ? AND deck_id IS NULL";
+        const char* check_sql =
+            "SELECT id, quantity FROM cards WHERE ("
+            " LOWER(TRIM(COALESCE(english_name,''))) = LOWER(TRIM(?))"
+            " OR LOWER(TRIM(COALESCE(localized_name,''))) = LOWER(TRIM(?))"
+            " OR LOWER(TRIM(COALESCE(name,''))) = LOWER(TRIM(?))"
+            " OR LOWER(TRIM(COALESCE(english_name,''))) = LOWER(TRIM(?))"
+            " OR LOWER(TRIM(COALESCE(localized_name,''))) = LOWER(TRIM(?))"
+            " OR LOWER(TRIM(COALESCE(name,''))) = LOWER(TRIM(?)) )"
+            " AND foil = ? AND sideboard = ? AND deck_id IS NULL";
         if (sqlite3_prepare_v2(db, check_sql, -1, &check_stmt, nullptr) != SQLITE_OK) {
             std::cerr << "Errore prepare check: " << sqlite3_errmsg(db) << std::endl;
             return false;
         }
-        sqlite3_bind_text(check_stmt, 1, english_name.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(check_stmt, 2, set_code.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_int(check_stmt, 3, foil);
+        sqlite3_bind_text(check_stmt, 1, english_name.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(check_stmt, 2, english_name.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(check_stmt, 3, english_name.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(check_stmt, 4, localized_name.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(check_stmt, 5, localized_name.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(check_stmt, 6, localized_name.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(check_stmt, 7, foil);
+        sqlite3_bind_int(check_stmt, 8, sideboard);
     }
     int rc = sqlite3_step(check_stmt);
     if (rc == SQLITE_ROW) {
@@ -279,23 +340,23 @@ bool Database::insert_card(const std::string& english_name, const std::string& l
     } else {
         sqlite3_finalize(check_stmt);
         // Non esiste, inserisci nuova (imposta added_date alla data/ora corrente in formato ISO)
-        const char* insert_sql = "INSERT INTO cards (english_name, localized_name, name, type, localized_type, colors, set_code, mana_cost, rarity, quantity, image_url, added_date, price_usd, foil, deck_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        const char* insert_sql = "INSERT INTO cards (english_name, localized_name, name, type, localized_type, colors, set_code, mana_cost, rarity, quantity, image_url, added_date, price_usd, foil, sideboard, deck_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
         sqlite3_stmt* insert_stmt;
         if (sqlite3_prepare_v2(db, insert_sql, -1, &insert_stmt, nullptr) != SQLITE_OK) {
             std::cerr << "Errore prepare insert: " << sqlite3_errmsg(db) << std::endl;
             return false;
         }
-        sqlite3_bind_text(insert_stmt, 1, english_name.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(insert_stmt, 2, localized_name.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(insert_stmt, 3, localized_name.c_str(), -1, SQLITE_STATIC); // name = localized for backward
-        sqlite3_bind_text(insert_stmt, 4, type.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(insert_stmt, 5, localized_type.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(insert_stmt, 6, colors.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(insert_stmt, 7, set_code.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(insert_stmt, 8, mana_cost.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(insert_stmt, 9, rarity.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_text(insert_stmt, 1, english_name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(insert_stmt, 2, localized_name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(insert_stmt, 3, localized_name.c_str(), -1, SQLITE_TRANSIENT); // name = localized for backward
+    sqlite3_bind_text(insert_stmt, 4, type.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(insert_stmt, 5, localized_type.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(insert_stmt, 6, colors.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(insert_stmt, 7, set_code.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(insert_stmt, 8, mana_cost.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(insert_stmt, 9, rarity.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(insert_stmt, 10, quantity);
-        sqlite3_bind_text(insert_stmt, 11, image_url.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_text(insert_stmt, 11, image_url.c_str(), -1, SQLITE_TRANSIENT);
         // Calcola timestamp ISO locale: YYYY-MM-DDTHH:MM:SS
         char timebuf[32] = {0};
         time_t now = time(nullptr);
@@ -307,13 +368,15 @@ bool Database::insert_card(const std::string& english_name, const std::string& l
 #endif
         strftime(timebuf, sizeof(timebuf), "%Y-%m-%dT%H:%M:%S", &local_tm);
         sqlite3_bind_text(insert_stmt, 12, timebuf, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(insert_stmt, 13, price_usd.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_text(insert_stmt, 13, price_usd.c_str(), -1, SQLITE_TRANSIENT);
         // bind foil
         sqlite3_bind_int(insert_stmt, 14, foil);
+        // bind sideboard
+        sqlite3_bind_int(insert_stmt, 15, sideboard);
         if (deck_id != -1) {
-            sqlite3_bind_int(insert_stmt, 15, deck_id);
+            sqlite3_bind_int(insert_stmt, 16, deck_id);
         } else {
-            sqlite3_bind_null(insert_stmt, 15);
+            sqlite3_bind_null(insert_stmt, 16);
         }
         rc = sqlite3_step(insert_stmt);
         sqlite3_finalize(insert_stmt);
@@ -430,8 +493,8 @@ bool Database::query_decks(const std::function<void(const std::map<std::string, 
     return query("SELECT id, name FROM decks", callback);
 }
 
-bool Database::set_card_deck(int card_id, int deck_id) {
-    const char* sql = "UPDATE cards SET deck_id = ? WHERE id = ?";
+bool Database::set_card_deck(int card_id, int deck_id, int sideboard) {
+    const char* sql = "UPDATE cards SET deck_id = ?, sideboard = ? WHERE id = ?";
     sqlite3_stmt* stmt;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
         std::cerr << "Errore prepare set_card_deck: " << sqlite3_errmsg(db) << std::endl;
@@ -444,7 +507,9 @@ bool Database::set_card_deck(int card_id, int deck_id) {
         sqlite3_bind_null(stmt, 1);
         std::cout << "DEBUG: set_card_deck binding deck_id=NULL for card_id=" << card_id << std::endl;
     }
-    sqlite3_bind_int(stmt, 2, card_id);
+    // bind sideboard flag
+    sqlite3_bind_int(stmt, 2, sideboard);
+    sqlite3_bind_int(stmt, 3, card_id);
     int rc = sqlite3_step(stmt);
     if (rc != SQLITE_DONE) {
         std::cerr << "Errore set_card_deck: " << sqlite3_errmsg(db) << " (rc=" << rc << ")" << std::endl;
@@ -452,7 +517,7 @@ bool Database::set_card_deck(int card_id, int deck_id) {
         return false;
     }
     sqlite3_finalize(stmt);
-    std::cout << "DEBUG: set_card_deck succeeded for card_id=" << card_id << " deck_id=" << (deck_id == -1 ? -1 : deck_id) << std::endl;
+    std::cout << "DEBUG: set_card_deck succeeded for card_id=" << card_id << " deck_id=" << (deck_id == -1 ? -1 : deck_id) << " sideboard=" << sideboard << std::endl;
     return true;
 }
 
