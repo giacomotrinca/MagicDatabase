@@ -475,6 +475,33 @@ static std::string translate_rarity(const char* rarity) {
     }
 }
 
+// Helper to grab focus on a widget from an idle callback (used to ensure focus
+// is applied after transient dialogs close).
+static gboolean grab_focus_idle(gpointer data) {
+    GtkWidget* w = GTK_WIDGET(data);
+    // Diagnostic: print which widget currently has focus in the top-level window
+    auto debug_print_focus = [](GtkWidget* ref) {
+        if (!ref) { std::cout << "DEBUG: debug_print_focus called with NULL ref\n"; return; }
+        GtkWindow* win = GTK_WINDOW(gtk_widget_get_ancestor(GTK_WIDGET(ref), GTK_TYPE_WINDOW));
+        if (!win) { std::cout << "DEBUG: no ancestor window for ref=" << ref << "\n"; return; }
+        GtkWidget* f = gtk_window_get_focus(win);
+        if (!f) std::cout << "DEBUG: window " << win << " has NO focus widget\n";
+        else std::cout << "DEBUG: window " << win << " focus=" << f << " type=" << G_OBJECT_TYPE_NAME(f) << "\n";
+    };
+    if (w && GTK_IS_WIDGET(w)) {
+        std::cout << "DEBUG: grab_focus_idle trying to focus entry=" << w << " type=" << G_OBJECT_TYPE_NAME(w) << "\n";
+        // Print current focus before attempting
+        debug_print_focus(w);
+        // Try to grab focus
+        gtk_widget_grab_focus(w);
+        // Re-check focus
+        debug_print_focus(w);
+    } else {
+        std::cout << "DEBUG: grab_focus_idle called with invalid widget pointer=" << w << "\n";
+    }
+    return G_SOURCE_REMOVE;
+}
+
 struct AppState {
     std::string db_path;
     Database* db;
@@ -1838,6 +1865,8 @@ static void on_add_card_ok_clicked(GtkButton *button, gpointer user_data) {
             // Select current text so typing replaces it immediately
             gtk_widget_grab_focus(entry);
             gtk_editable_select_region(GTK_EDITABLE(entry), 0, -1);
+            // Also schedule an idle grab to reapply focus after transient dialogs are dismissed
+            g_idle_add(grab_focus_idle, entry);
         }
         return;
     }
@@ -1875,13 +1904,47 @@ static void on_add_card_ok_clicked(GtkButton *button, gpointer user_data) {
             msg += "\n\n[ERRORE: Nessun database aperto]";
         }
 
-        GtkAlertDialog *alert = gtk_alert_dialog_new("%s", msg.c_str());
-        gtk_alert_dialog_show(alert, ctx->parent);
-        g_object_unref(alert);
+        // Use a simple transient details dialog instead of GtkAlertDialog so we can
+        // reliably connect to its "destroy" signal and restore focus afterwards.
+        GtkWindow* add_win = GTK_WINDOW(gtk_widget_get_ancestor(GTK_WIDGET(entry), GTK_TYPE_WINDOW));
+        GtkWidget* det = create_styled_dialog(add_win ? add_win : ctx->parent, 480, 320);
+        gtk_window_set_title(GTK_WINDOW(det), "Dettagli Carta");
+        GtkWidget* dv = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+        gtk_window_set_child(GTK_WINDOW(det), dv);
+        GtkWidget* lab = gtk_label_new(msg.c_str());
+        gtk_label_set_wrap(GTK_LABEL(lab), TRUE);
+        gtk_widget_set_hexpand(lab, TRUE);
+        gtk_box_append(GTK_BOX(dv), lab);
+        GtkWidget* btn_close = gtk_button_new_with_label("Chiudi");
+        gtk_box_append(GTK_BOX(dv), btn_close);
+        // When closed, restore focus to the entry via idle
+        g_signal_connect(det, "destroy", G_CALLBACK(+[](GtkWidget*, gpointer user_data){
+            g_idle_add(grab_focus_idle, user_data);
+        }), entry);
+        g_signal_connect(btn_close, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data){
+            std::cout << "DEBUG: details dialog close button clicked, destroying window=" << user_data << "\n";
+            gtk_window_destroy(GTK_WINDOW(user_data));
+        }), det);
+        // Allow Enter to close the details dialog (GTK4-style using GtkEventControllerKey)
+        {
+            GtkEventController *key = gtk_event_controller_key_new();
+            g_signal_connect(key, "key-pressed", G_CALLBACK(+[](GtkEventControllerKey* ctrl, guint keyval, guint keycode, GdkModifierType mods, gpointer user_data) -> gboolean {
+                if (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter) {
+                    std::cout << "DEBUG: details dialog key-pressed Enter, destroying window=" << user_data << "\n";
+                    gtk_window_destroy(GTK_WINDOW(user_data));
+                    return TRUE;
+                }
+                return FALSE;
+            }), det);
+            gtk_widget_add_controller(det, key);
+        }
+        gtk_window_set_default_widget(GTK_WINDOW(det), btn_close);
+        gtk_window_present(GTK_WINDOW(det));
 
         // Reset inputs so user can add another card quickly
         gtk_editable_set_text(GTK_EDITABLE(entry), "");
         gtk_spin_button_set_value(GTK_SPIN_BUTTON(spin), 1);
+        // Also try to grab focus now (in case no modal dialog steals it)
         gtk_widget_grab_focus(entry);
         return;
     }
@@ -1981,20 +2044,55 @@ static void on_add_card_ok_clicked(GtkButton *button, gpointer user_data) {
                 msg += "\n\n[ERRORE: Nessun database aperto]";
             }
 
-            GtkAlertDialog *alert = gtk_alert_dialog_new("%s", msg.c_str());
-            gtk_alert_dialog_show(alert, sctx->parent);
-            g_object_unref(alert);
+            // Show a transient details dialog so we can reconnect focus when it closes
+            GtkWindow* orig_win = NULL;
+            if (sctx->original_ctx && sctx->original_ctx->entry) orig_win = GTK_WINDOW(gtk_widget_get_ancestor(GTK_WIDGET(sctx->original_ctx->entry), GTK_TYPE_WINDOW));
+            GtkWidget* det = create_styled_dialog(orig_win ? orig_win : sctx->parent, 480, 320);
+            gtk_window_set_title(GTK_WINDOW(det), "Dettagli Carta");
+            GtkWidget* dv = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+            gtk_window_set_child(GTK_WINDOW(det), dv);
+            GtkWidget* lab = gtk_label_new(msg.c_str());
+            gtk_label_set_wrap(GTK_LABEL(lab), TRUE);
+            gtk_box_append(GTK_BOX(dv), lab);
+            GtkWidget* btn_close = gtk_button_new_with_label("Chiudi");
+            gtk_box_append(GTK_BOX(dv), btn_close);
+            if (sctx->original_ctx) {
+                g_signal_connect(det, "destroy", G_CALLBACK(+[](GtkWidget*, gpointer user_data){
+                    g_idle_add(grab_focus_idle, user_data);
+                }), sctx->original_ctx->entry);
+            }
+            g_signal_connect(btn_close, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data){
+                std::cout << "DEBUG: details dialog close button clicked, destroying window=" << user_data << "\n";
+                gtk_window_destroy(GTK_WINDOW(user_data));
+            }), det);
+            // Allow Enter to close the details dialog (GTK4-style using GtkEventControllerKey)
+            {
+                GtkEventController *key = gtk_event_controller_key_new();
+                g_signal_connect(key, "key-pressed", G_CALLBACK(+[](GtkEventControllerKey* ctrl, guint keyval, guint keycode, GdkModifierType mods, gpointer user_data) -> gboolean {
+                    if (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter) {
+                        std::cout << "DEBUG: details dialog key-pressed Enter, destroying window=" << user_data << "\n";
+                        gtk_window_destroy(GTK_WINDOW(user_data));
+                        return TRUE;
+                    }
+                    return FALSE;
+                }), det);
+                gtk_widget_add_controller(det, key);
+            }
+            gtk_window_set_default_widget(GTK_WINDOW(det), btn_close);
+            gtk_window_present(GTK_WINDOW(det));
 
             GtkWidget* select_dialog = gtk_widget_get_ancestor(sctx->list_box, GTK_TYPE_WINDOW);
             if (select_dialog && GTK_IS_WIDGET(select_dialog)) {
                 gtk_window_destroy(GTK_WINDOW(select_dialog));
             }
 
-            if (sctx->original_ctx) {
-                gtk_editable_set_text(GTK_EDITABLE(sctx->original_ctx->entry), "");
-                gtk_spin_button_set_value(GTK_SPIN_BUTTON(sctx->original_ctx->spin), 1);
-                gtk_widget_grab_focus(sctx->original_ctx->entry);
-            }
+                if (sctx->original_ctx) {
+                    gtk_editable_set_text(GTK_EDITABLE(sctx->original_ctx->entry), "");
+                    gtk_spin_button_set_value(GTK_SPIN_BUTTON(sctx->original_ctx->spin), 1);
+                    // Grab focus immediately and schedule idle-grab to be safe
+                    gtk_widget_grab_focus(sctx->original_ctx->entry);
+                    g_idle_add(grab_focus_idle, sctx->original_ctx->entry);
+                }
         }
         delete sctx->cards;
         delete sctx;
@@ -2195,7 +2293,7 @@ static void on_add_card_clicked(GtkButton *button, gpointer user_data) {
     gtk_window_set_child(GTK_WINDOW(dialog), box);
 
     GtkWidget *entry = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(entry), "Nome carta (italiano o inglese, ricerca parziale supportata)");
+    gtk_entry_set_placeholder_text(GTK_ENTRY(entry), "Nome carta");
     gtk_box_append(GTK_BOX(box), entry);
 
     GtkWidget *spin = gtk_spin_button_new_with_range(1, 100, 1);
