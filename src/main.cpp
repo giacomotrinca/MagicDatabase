@@ -130,165 +130,134 @@ static void card_row_init(CardRow *self) {
     self->image_url = NULL;
     self->added_date = NULL;
     self->price_usd = NULL;
-    self->foil = 0;
 }
 
-// Special sentinel ids used for visual-only rows (not real card data)
-static const int ROW_ID_SEPARATOR_TITLE = -1000; // visual title row "Sideboard"
-static const int ROW_ID_HEADER = -1001; // visual header row that repeats column titles
+// Helper constants for special row ids (separator/header rows shown in lists)
+#define ROW_ID_SEPARATOR_TITLE    -1001
+#define ROW_ID_HEADER             -1002
 
-static std::string translate_colors(const std::string& colors_str) {
-    std::string display_colors;
-    if (!colors_str.empty()) {
-        try {
-            auto colors = nlohmann::json::parse(colors_str);
-            std::vector<std::string> translated;
-            for (const auto& c : colors) {
-                std::string code = c;
-                if (code == "W") translated.push_back("Bianco");
-                else if (code == "U") translated.push_back("Blu");
-                else if (code == "B") translated.push_back("Nero");
-                else if (code == "R") translated.push_back("Rosso");
-                else if (code == "G") translated.push_back("Verde");
-                else translated.push_back(code);
+// Calculate a simple total mana cost from a mana cost string.
+// This is a best-effort parser: it treats numeric symbols as their value
+// and each color symbol or generic symbol as +1. Returns 0 for empty.
+static int calculate_total_mana_cost(const std::string &mana) {
+    if (mana.empty()) return 0;
+    int total = 0;
+    std::string num;
+    for (size_t i = 0; i < mana.size(); ++i) {
+        char c = mana[i];
+        if (std::isdigit((unsigned char)c)) {
+            // accumulate contiguous digits
+            num.push_back(c);
+            // if next is non-digit, flush
+            if (i + 1 >= mana.size() || !std::isdigit((unsigned char)mana[i+1])) {
+                try { total += std::stoi(num); } catch(...) { }
+                num.clear();
             }
-            if (translated.empty()) {
-                display_colors = "Incolore";
-            } else {
-                for (size_t i = 0; i < translated.size(); ++i) {
-                    if (i > 0) display_colors += "-";
-                    display_colors += translated[i];
-                }
-            }
-        } catch (...) {
-            display_colors = colors_str;
+        } else if (std::isalpha((unsigned char)c)) {
+            // letters like R G W count as 1
+            total += 1;
         }
-    } else {
-        display_colors = "Incolore";
+        // ignore braces, slashes, punctuation
     }
-    return display_colors;
+    return total;
 }
 
-static std::string current_language = "it";
+// Forward-declare accessor for current language so formatters located earlier can use it
+static const std::string& get_current_language();
 
-static std::string translate_rarity(const std::string& rarity) {
-    if (current_language == "en") return rarity;
-    static std::map<std::string, std::string> translations = {
-        {"common", "Comune"},
-        {"uncommon", "Non Comune"},
-        {"rare", "Rara"},
-        {"mythic", "Mitica"}
-    };
-    auto it = translations.find(rarity);
-    if (it != translations.end()) return it->second;
-    return rarity; // fallback
-}
-
-static int calculate_total_mana_cost(const std::string& mana_cost) {
-    int total_cost = 0;
-    if (!mana_cost.empty()) {
-        size_t pos = 0;
-        while ((pos = mana_cost.find('{', pos)) != std::string::npos) {
-            size_t end = mana_cost.find('}', pos);
-            if (end != std::string::npos) {
-                std::string symbol = mana_cost.substr(pos + 1, end - pos - 1);
-                try {
-                    int num = std::stoi(symbol);
-                    total_cost += num;
-                } catch (...) {
-                    total_cost += 1;
-                }
-                pos = end + 1;
-            } else {
-                break;
-            }
+// Very small datetime formatter — returns the input or a simplified human form.
+static std::string format_datetime(const char* iso) {
+    if (!iso) return std::string();
+    std::string s = iso;
+    if (s.empty()) return s;
+    // Parse ISO-like timestamp: accept YYYY-MM-DDTHH:MM:SS or YYYY-MM-DD HH:MM:SS
+    int year = 0, mon = 0, day = 0, hour = 0, minute = 0, second = 0;
+    bool parsed = false;
+    try {
+        if (s.size() >= 19 && s[4] == '-' && s[7] == '-' && (s[10] == 'T' || s[10] == ' ')) {
+            year = std::stoi(s.substr(0,4));
+            mon = std::stoi(s.substr(5,2));
+            day = std::stoi(s.substr(8,2));
+            hour = std::stoi(s.substr(11,2));
+            minute = std::stoi(s.substr(14,2));
+            second = std::stoi(s.substr(17,2));
+            parsed = true;
+        } else if (s.size() >= 16 && s[4] == '-' && s[7] == '-' && (s[10] == 'T' || s[10] == ' ')) {
+            // YYYY-MM-DDTHH:MM (no seconds)
+            year = std::stoi(s.substr(0,4));
+            mon = std::stoi(s.substr(5,2));
+            day = std::stoi(s.substr(8,2));
+            hour = std::stoi(s.substr(11,2));
+            minute = std::stoi(s.substr(14,2));
+            second = 0;
+            parsed = true;
         }
-    }
-    return total_cost;
-}
+    } catch(...) { parsed = false; }
 
-static std::string format_datetime(const std::string& iso) {
-    if (iso.empty()) return "";
+    if (!parsed) {
+        // fallback: return original string
+        return s;
+    }
+
     struct tm tm{};
-    // Parse ISO YYYY-MM-DDTHH:MM:SS
-    if (strptime(iso.c_str(), "%Y-%m-%dT%H:%M:%S", &tm) == nullptr) {
-        return iso;
+    tm.tm_year = year - 1900;
+    tm.tm_mon = mon - 1;
+    tm.tm_mday = day;
+    tm.tm_hour = hour;
+    tm.tm_min = minute;
+    tm.tm_sec = second;
+    tm.tm_isdst = -1;
+    time_t t = mktime(&tm);
+    if (t == (time_t)-1) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d", year, mon, day, hour, minute, second);
+        return std::string(buf);
     }
-    // Normalize to time_t to get weekday
-    time_t tt = mktime(&tm);
-    if (tt == (time_t)-1) return iso;
-    struct tm local_tm{};
-#if defined(_MSC_VER)
-    localtime_s(&local_tm, &tt);
-#else
-    localtime_r(&tt, &local_tm);
-#endif
-    char buf[256];
-    if (current_language == "en") {
-        const char* weekdays_en[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
-        const char* months_en[] = {"January","February","March","April","May","June","July","August","September","October","November","December"};
-        snprintf(buf, sizeof(buf), "%s %02d %s %d %02d:%02d:%02d",
-                 weekdays_en[local_tm.tm_wday], local_tm.tm_mday, months_en[local_tm.tm_mon], 1900 + local_tm.tm_year,
-                 local_tm.tm_hour, local_tm.tm_min, local_tm.tm_sec);
+
+    struct tm *lt = localtime(&t);
+    if (!lt) return s;
+
+    const char* days_it[] = {"Dom","Lun","Mar","Mer","Gio","Ven","Sab"};
+    const char* months_it[] = {"Gen","Feb","Mar","Apr","Mag","Giu","Lug","Ago","Set","Ott","Nov","Dic"};
+    const char* days_en[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+    const char* months_en[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+
+    char out[128];
+    int wday = lt->tm_wday; // 0=Sun
+    int monidx = lt->tm_mon; // 0-based
+    if (get_current_language() == "it") {
+        snprintf(out, sizeof(out), "%s %02d %s %04d %02d:%02d:%02d",
+                 days_it[wday], lt->tm_mday, months_it[monidx], lt->tm_year + 1900, lt->tm_hour, lt->tm_min, lt->tm_sec);
     } else {
-        const char* weekdays_it[] = {"dom","lun","mar","mer","gio","ven","sab"};
-        const char* months_it[] = {"gennaio","febbraio","marzo","aprile","maggio","giugno","luglio","agosto","settembre","ottobre","novembre","dicembre"};
-        snprintf(buf, sizeof(buf), "%s %02d %s %d %02d:%02d:%02d",
-                 weekdays_it[local_tm.tm_wday], local_tm.tm_mday, months_it[local_tm.tm_mon], 1900 + local_tm.tm_year,
-                 local_tm.tm_hour, local_tm.tm_min, local_tm.tm_sec);
+        snprintf(out, sizeof(out), "%s %02d %s %04d %02d:%02d:%02d",
+                 days_en[wday], lt->tm_mday, months_en[monidx], lt->tm_year + 1900, lt->tm_hour, lt->tm_min, lt->tm_sec);
     }
-    return std::string(buf);
+    return std::string(out);
 }
 
-CardRow* card_row_new(int id, const char* name, const char* type, const char* colors, const char* set_code, const char* mana_cost, const char* rarity, int quantity, const char* image_url, const char* added_date, const char* price_usd, int foil) {
-    CardRow* row = (CardRow*)g_object_new(card_row_get_type(), NULL);
-    row->id = id;
-    row->name = g_strdup(name);
-    row->type = g_strdup(type);
-    row->colors = g_strdup(colors);
-    row->set_code = g_strdup(set_code);
-    row->mana_cost = g_strdup(mana_cost);
-    std::string trans_rarity = translate_rarity(rarity ? rarity : "");
-    row->rarity = g_strdup(trans_rarity.c_str());
-    row->quantity = quantity;
-    std::string trans = translate_colors(colors ? colors : "");
-    row->translated_colors = g_strdup(trans.c_str());
-    row->total_mana_cost = calculate_total_mana_cost(mana_cost ? mana_cost : "");
-    row->image_url = g_strdup(image_url);
-    row->added_date = g_strdup(added_date ? added_date : "");
-    row->price_usd = g_strdup(price_usd ? price_usd : "");
-    row->foil = foil;
-    return row;
-}
+// Forward-declare translate_colors (defined later) so helpers above can call it
+static std::string translate_colors(const char* colors);
 
-static std::map<std::string, std::map<std::string, std::string>> translations = {
-    {"Nome", {{"it", "Nome"}, {"en", "Name"}}},
-    {"Tipo", {{"it", "Tipo"}, {"en", "Type"}}},
-    {"Colori", {{"it", "Colori"}, {"en", "Colors"}}},
-    {"Costo Mana", {{"it", "Costo Mana"}, {"en", "Mana Cost"}}},
-    {"Rarità", {{"it", "Rarità"}, {"en", "Rarity"}}},
-    {"Data di aggiunta", {{"it", "Data di aggiunta"}, {"en", "Added Date"}}},
-    {"Quantità", {{"it", "Quantità"}, {"en", "Quantity"}}},
-    {"Nuova Carta", {{"it", "Nuova Carta"}, {"en", "New Card"}}},
-    {"Cerca per nome...", {{"it", "Cerca per nome..."}, {"en", "Search by name..."}}},
-    {"File", {{"it", "File"}, {"en", "File"}}},
-    {"Visualizza", {{"it", "Visualizza"}, {"en", "View"}}},
-    {"Lingua", {{"it", "Lingua"}, {"en", "Language"}}},
-    {"Nuovo Database", {{"it", "Nuovo Database"}, {"en", "New Database"}}},
-    {"Apri Database", {{"it", "Apri Database"}, {"en", "Open Database"}}},
-    {"Crea Deck", {{"it", "Crea Deck"}, {"en", "Create Deck"}}},
-    {"Esporta Database", {{"it", "Esporta Database"}, {"en", "Export Database"}}},
-    {"Esporta Deck", {{"it", "Esporta Deck"}, {"en", "Export Deck"}}},
-    {"Seleziona Deck", {{"it", "Seleziona Deck"}, {"en", "Select Deck"}}},
-    {"Filtri...", {{"it", "Filtri..."}, {"en", "Filters..."}}},
-    {"Elimina Deck", {{"it", "Elimina Deck"}, {"en", "Delete Deck"}}},
-    {"Torna al Database Principale", {{"it", "Torna al Database Principale"}, {"en", "Back to Main Database"}}},
-    {"Ordina Crescente", {{"it", "Ordina Crescente"}, {"en", "Sort Ascending"}}},
-    {"Ordina Decrescente", {{"it", "Ordina Decrescente"}, {"en", "Sort Descending"}}},
-    {"Elimina", {{"it", "Elimina"}, {"en", "Delete"}}},
-    {"Totale carte", {{"it", "Totale carte"}, {"en", "Total cards"}}},
-    {"Valore totale", {{"it", "Valore totale"}, {"en", "Total Value"}}}
-};
+// Factory helper to create and initialize a CardRow instance
+static CardRow* card_row_new(int id, const char* name, const char* type, const char* colors, const char* set_code, const char* mana_cost, const char* rarity, int quantity, const char* image_url, const char* added_date, const char* price_usd, int foil) {
+    CardRow* r = (CardRow*)g_object_new(card_row_get_type(), NULL);
+    r->id = id;
+    r->name = g_strdup(name ? name : "");
+    r->type = g_strdup(type ? type : "");
+    r->colors = g_strdup(colors ? colors : "");
+    r->set_code = g_strdup(set_code ? set_code : "");
+    r->mana_cost = g_strdup(mana_cost ? mana_cost : "");
+    r->rarity = g_strdup(rarity ? rarity : "");
+    r->quantity = quantity;
+    r->image_url = g_strdup(image_url ? image_url : "");
+    r->added_date = g_strdup(added_date ? added_date : "");
+    r->price_usd = g_strdup(price_usd ? price_usd : "");
+    r->foil = foil;
+    r->total_mana_cost = calculate_total_mana_cost(r->mana_cost ? r->mana_cost : std::string());
+    // translated_colors uses the helper defined later; store an English/Italian translation
+    r->translated_colors = g_strdup(translate_colors(r->colors).c_str());
+    return r;
+}
 // CSS provider used for separator styling (initialized on demand)
 static GtkCssProvider* separator_css_provider = NULL;
 
@@ -301,6 +270,41 @@ static void ensure_separator_css_provider() {
     ".header-row { background-color: rgba(245,245,245,1.0); padding: 4px 6px; color: #000000; font-weight: bold; border-bottom: 1px solid rgba(0,0,0,0.06); border-radius: 0px; }\n";
     gtk_css_provider_load_from_data(separator_css_provider, css, -1);
 }
+
+// Translation table: key -> { lang -> translation }
+static std::map<std::string, std::map<std::string, std::string>> translations = {
+    {"Nome", {{"it","Nome"}, {"en","Name"}}},
+    {"Tipo", {{"it","Tipo"}, {"en","Type"}}},
+    {"Colori", {{"it","Colori"}, {"en","Colors"}}},
+    {"Costo Mana", {{"it","Costo Mana"}, {"en","Mana Cost"}}},
+    {"Rarità", {{"it","Rarità"}, {"en","Rarity"}}},
+    {"Data di aggiunta", {{"it","Data di aggiunta"}, {"en","Added Date"}}},
+    {"Quantità", {{"it","Quantità"}, {"en","Quantity"}}},
+    {"Nuova Carta", {{"it","Nuova Carta"}, {"en","New Card"}}},
+    {"Cerca per nome...", {{"it","Cerca per nome..."}, {"en","Search by name..."}}},
+    {"File", {{"it","File"}, {"en","File"}}},
+    {"Visualizza", {{"it","Visualizza"}, {"en","View"}}},
+    {"Lingua", {{"it","Lingua"}, {"en","Language"}}},
+    {"Nuovo Database", {{"it","Nuovo Database"}, {"en","New Database"}}},
+    {"Apri Database", {{"it","Apri Database"}, {"en","Open Database"}}},
+    {"Crea Deck", {{"it","Crea Deck"}, {"en","Create Deck"}}},
+    {"Esporta Database", {{"it","Esporta Database"}, {"en","Export Database"}}},
+    {"Esporta Deck", {{"it","Esporta Deck"}, {"en","Export Deck"}}},
+    {"Seleziona Deck", {{"it","Seleziona Deck"}, {"en","Select Deck"}}},
+    {"Filtri...", {{"it","Filtri..."}, {"en","Filters..."}}},
+    {"Elimina Deck", {{"it","Elimina Deck"}, {"en","Delete Deck"}}},
+    {"Torna al Database Principale", {{"it","Torna al Database Principale"}, {"en","Back to Main Database"}}},
+    {"Ordina Crescente", {{"it","Ordina Crescente"}, {"en","Sort Ascending"}}},
+    {"Ordina Decrescente", {{"it","Ordina Decrescente"}, {"en","Sort Descending"}}},
+    {"Elimina", {{"it","Elimina"}, {"en","Delete"}}},
+    {"Totale carte", {{"it","Totale carte"}, {"en","Total cards"}}},
+    {"Valore totale", {{"it","Valore totale"}, {"en","Total Value"}}}
+};
+
+static std::string current_language = "it";
+
+// Provide accessor for earlier functions
+static const std::string& get_current_language() { return current_language; }
 
 // Add translation for the "Add Cards" button
 static void __add_more_translations() {
@@ -327,44 +331,148 @@ std::string translate(const std::string& key) {
 }
 
 static std::string translate_colors(const char* colors) {
-    if (!colors) return "";
+    // Robust color formatter: accepts several formats stored in the DB:
+    // - JSON array (e.g. ["W","R"] or ["Bianco","Rosso"]) -> join with ", "
+    // - Compact codes string (e.g. "WUR" or "WU") -> map each letter to localized name
+    // - Comma/space separated names -> normalize and return
+    // If no colors or empty -> return localized "Incolore" / "Colorless".
+    if (!colors) {
+        return (current_language == "it") ? std::string("Incolore") : std::string("Colorless");
+    }
     std::string c = colors;
+    // Trim whitespace
+    auto trim = [](std::string s) {
+        size_t a = 0, b = s.size();
+        while (a < b && isspace((unsigned char)s[a])) ++a;
+        while (b > a && isspace((unsigned char)s[b-1])) --b;
+        return s.substr(a, b-a);
+    };
+    c = trim(c);
+    if (c.empty() || c == "[]" || c == "null") {
+        return (current_language == "it") ? std::string("Incolore") : std::string("Colorless");
+    }
+
+    // Color name translations for single-letter codes
     std::map<std::string, std::string> color_trans;
     if (current_language == "it") {
-        color_trans = {
-            {"W", "Bianco"},
-            {"U", "Blu"},
-            {"B", "Nero"},
-            {"R", "Rosso"},
-            {"G", "Verde"}
-        };
-    } else if (current_language == "en") {
-        color_trans = {
-            {"W", "White"},
-            {"U", "Blue"},
-            {"B", "Black"},
-            {"R", "Red"},
-            {"G", "Green"}
-        };
+        color_trans = {{"W", "Bianco"}, {"U", "Blu"}, {"B", "Nero"}, {"R", "Rosso"}, {"G", "Verde"}};
     } else {
-        // Default to original
-        std::string result;
-        for (char ch : c) {
-            result += ch;
-            result += " ";
+        color_trans = {{"W", "White"}, {"U", "Blue"}, {"B", "Black"}, {"R", "Red"}, {"G", "Green"}};
+    }
+
+    // If it looks like JSON array, try to parse
+    if (!c.empty() && c.front() == '[') {
+        try {
+            auto j = nlohmann::json::parse(c);
+            if (j.is_array()) {
+                std::vector<std::string> parts;
+                for (auto &el : j) {
+                    if (el.is_string()) {
+                        std::string v = el.get<std::string>();
+                        // If element is a single-letter code, translate it
+                        if (v.size() == 1) {
+                            std::string key(1, v[0]);
+                            auto it = color_trans.find(key);
+                            if (it != color_trans.end()) parts.push_back(it->second);
+                            else parts.push_back(v);
+                        } else {
+                            // element looks like a full name; accept as-is
+                            parts.push_back(v);
+                        }
+                    }
+                }
+                if (parts.empty()) return (current_language == "it") ? std::string("Incolore") : std::string("Colorless");
+                std::string out;
+                for (size_t i = 0; i < parts.size(); ++i) {
+                    if (i) out += ", ";
+                    out += parts[i];
+                }
+                return out;
+            }
+        } catch(...) {
+            // fallthrough to other heuristics
         }
-        if (!result.empty()) result.pop_back();
-        return result;
     }
-    std::string result;
-    for (char ch : c) {
-        std::string s(1, ch);
-        auto it = color_trans.find(s);
-        if (it != color_trans.end()) result += it->second + " ";
-        else result += s + " ";
+
+    // If string is short and contains only letters (like "WUR"), treat as codes
+    bool all_letters = !c.empty();
+    for (char ch : c) if (!std::isalpha((unsigned char)ch)) { all_letters = false; break; }
+    if (all_letters && c.size() <= 6) {
+        std::string out;
+        for (size_t i = 0; i < c.size(); ++i) {
+            std::string key(1, c[i]);
+            auto it = color_trans.find(key);
+            if (it != color_trans.end()) {
+                if (!out.empty()) out += ", ";
+                out += it->second;
+            }
+        }
+        if (out.empty()) return (current_language == "it") ? std::string("Incolore") : std::string("Colorless");
+        return out;
     }
-    if (!result.empty()) result.pop_back();
-    return result;
+
+    // Otherwise, try to remove surrounding quotes/brackets and commas then normalize separators
+    // Remove leading/trailing brackets and quotes
+    std::string s = c;
+    if (!s.empty() && s.front() == '"' && s.back() == '"') {
+        s = s.substr(1, s.size()-2);
+    }
+    // Replace '"', '[', ']' characters
+    std::string cleaned;
+    for (char ch : s) {
+        if (ch == '"' || ch == '[' || ch == ']') continue;
+        cleaned.push_back(ch);
+    }
+    // Split on commas
+    std::vector<std::string> parts;
+    size_t pos = 0;
+    while (pos < cleaned.size()) {
+        size_t comma = cleaned.find(',', pos);
+        std::string tok;
+        if (comma == std::string::npos) { tok = cleaned.substr(pos); pos = cleaned.size(); }
+        else { tok = cleaned.substr(pos, comma - pos); pos = comma + 1; }
+        tok = trim(tok);
+        if (!tok.empty()) parts.push_back(tok);
+    }
+    if (parts.empty()) return (current_language == "it") ? std::string("Incolore") : std::string("Colorless");
+    std::string out;
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (i) out += ", ";
+        out += parts[i];
+    }
+    return out;
+}
+
+// Translate internal rarity codes/strings to localized, nicely-capitalized labels.
+// Accepts values like "common", "uncommon", "rare", "mythic" (any case) and
+// returns "Comune"/"Common", etc. If input is empty or null, returns an empty string.
+static std::string translate_rarity(const char* rarity) {
+    if (!rarity) return std::string();
+    std::string r = rarity;
+    // lowercase for matching
+    std::string low;
+    low.reserve(r.size());
+    for (char ch : r) low.push_back(std::tolower((unsigned char)ch));
+    if (low.empty()) return std::string();
+    if (current_language == "it") {
+        if (low == "common") return std::string("Comune");
+        if (low == "uncommon") return std::string("Non Comune");
+        if (low == "rare") return std::string("Rara");
+        if (low == "mythic") return std::string("Mitica");
+        // fallback: capitalize first letter
+        std::string out = r;
+        out[0] = std::toupper((unsigned char)out[0]);
+        return out;
+    } else {
+        // English (default): capitalize first letter
+        if (low == "common") return std::string("Common");
+        if (low == "uncommon") return std::string("Uncommon");
+        if (low == "rare") return std::string("Rare");
+        if (low == "mythic") return std::string("Mythic");
+        std::string out = r;
+        out[0] = std::toupper((unsigned char)out[0]);
+        return out;
+    }
 }
 
 struct AppState {
@@ -1717,19 +1825,26 @@ static void on_add_card_ok_clicked(GtkButton *button, gpointer user_data) {
     
     auto cards = search_cards_from_scryfall(card_name);
     
+    // If no matches, just show an alert and keep the dialog open so the user can refine the query
     if (cards.empty()) {
-    GtkWindow* parent = ctx->parent;
-    GtkWidget *anc = gtk_widget_get_ancestor(ctx->entry, GTK_TYPE_WINDOW);
-    if (anc && GTK_IS_WIDGET(anc)) gtk_window_destroy(GTK_WINDOW(anc));
-    delete ctx;
+        GtkWindow* parent = ctx->parent;
         std::string msg = "Nessuna carta trovata per: " + std::string(card_name);
         GtkAlertDialog *alert = gtk_alert_dialog_new("%s", msg.c_str());
         gtk_alert_dialog_show(alert, parent);
         g_object_unref(alert);
-    } else if (cards.size() == 1 && cards[0].is_exact_match) {
-        // Carta singola trovata esattamente
+        // keep dialog open, do not delete ctx
+        // Put keyboard focus back on the search entry so the user can type a new query quickly
+        if (entry && GTK_IS_WIDGET(entry)) {
+            // Select current text so typing replaces it immediately
+            gtk_widget_grab_focus(entry);
+            gtk_editable_select_region(GTK_EDITABLE(entry), 0, -1);
+        }
+        return;
+    }
+
+    // Single exact match: insert and keep dialog open (reset inputs)
+    if (cards.size() == 1 && cards[0].is_exact_match) {
         auto& card = cards[0];
-        
         std::cout << "Single card: " << card.name << ", price_usd: '" << card.price_usd << "'" << std::endl;
         std::string msg = "Nome: " + card.name + "\n";
         msg += "Tipo: " + card.type + "\n";
@@ -1739,7 +1854,7 @@ static void on_add_card_ok_clicked(GtkButton *button, gpointer user_data) {
         msg += "Rarità: " + card.rarity + "\n";
         msg += "Prezzo USD: " + (card.price_usd.empty() ? "N/A" : card.price_usd) + "\n";
         msg += "Testo: " + card.oracle_text;
-        
+
         if (state && state->db) {
             int foil = 0;
             if (ctx->foil_checkbox) {
@@ -1759,141 +1874,133 @@ static void on_add_card_ok_clicked(GtkButton *button, gpointer user_data) {
         } else {
             msg += "\n\n[ERRORE: Nessun database aperto]";
         }
-        
-    GtkWindow* parent = ctx->parent;
-    GtkWidget *anc = gtk_widget_get_ancestor(ctx->entry, GTK_TYPE_WINDOW);
-    if (anc && GTK_IS_WIDGET(anc)) gtk_window_destroy(GTK_WINDOW(anc));
-    delete ctx;
+
         GtkAlertDialog *alert = gtk_alert_dialog_new("%s", msg.c_str());
-        gtk_alert_dialog_show(alert, parent);
+        gtk_alert_dialog_show(alert, ctx->parent);
         g_object_unref(alert);
-    } else {
-    // Multiple corrispondenze - mostra finestra di dialogo per scegliere
+
+        // Reset inputs so user can add another card quickly
+        gtk_editable_set_text(GTK_EDITABLE(entry), "");
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(spin), 1);
+        gtk_widget_grab_focus(entry);
+        return;
+    }
+
+    // Multiple matches - show selection dialog; keep original search dialog open
     GtkWidget *dialog = create_styled_dialog(GTK_WINDOW(ctx->parent), 400, 300);
     gtk_window_set_title(GTK_WINDOW(dialog), "Seleziona Carta");
 
-        GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
-        gtk_window_set_child(GTK_WINDOW(dialog), box);
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_window_set_child(GTK_WINDOW(dialog), box);
 
-        GtkWidget *label = gtk_label_new("Seleziona la carta desiderata:");
-        gtk_box_append(GTK_BOX(box), label);
+    GtkWidget *label = gtk_label_new("Seleziona la carta desiderata:");
+    gtk_box_append(GTK_BOX(box), label);
 
-        GtkWidget *scrolled = gtk_scrolled_window_new();
-        gtk_widget_set_vexpand(scrolled, TRUE);
-        gtk_box_append(GTK_BOX(box), scrolled);
+    GtkWidget *scrolled = gtk_scrolled_window_new();
+    gtk_widget_set_vexpand(scrolled, TRUE);
+    gtk_box_append(GTK_BOX(box), scrolled);
 
-        GtkWidget *list_box = gtk_list_box_new();
-        gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scrolled), list_box);
+    GtkWidget *list_box = gtk_list_box_new();
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scrolled), list_box);
 
-        // Aggiungi ogni carta alla lista
-        for (size_t i = 0; i < cards.size(); ++i) {
-            const auto& card = cards[i];
-            std::string display_text = card.name + " (" + card.set_name + ") - " + card.type;
-            GtkWidget *row = gtk_list_box_row_new();
-            GtkWidget *label = gtk_label_new(display_text.c_str());
-            gtk_label_set_xalign(GTK_LABEL(label), 0.0);
-            gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row), label);
-            gtk_list_box_append(GTK_LIST_BOX(list_box), row);
-            
-            // Salva l'indice della carta nei dati del row
-            g_object_set_data(G_OBJECT(row), "card_index", (gpointer)i);
+    for (size_t i = 0; i < cards.size(); ++i) {
+        const auto& card = cards[i];
+        std::string display_text = card.name + " (" + card.set_name + ") - " + card.type;
+        GtkWidget *row = gtk_list_box_row_new();
+        GtkWidget *lbl = gtk_label_new(display_text.c_str());
+        gtk_label_set_xalign(GTK_LABEL(lbl), 0.0);
+        gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row), lbl);
+        gtk_list_box_append(GTK_LIST_BOX(list_box), row);
+        g_object_set_data(G_OBJECT(row), "card_index", (gpointer)i);
+    }
+
+    GtkWidget *button_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    gtk_box_append(GTK_BOX(box), button_box);
+
+    GtkWidget *cancel_button = gtk_button_new_with_label("Annulla");
+    gtk_box_append(GTK_BOX(button_box), cancel_button);
+
+    struct SelectCardContext {
+        GtkWidget* list_box;
+        std::vector<ScryfallCard>* cards;
+        AppState* state;
+        int quantity;
+        GtkWindow* parent;
+        AddCardContext* original_ctx;
+    };
+
+    SelectCardContext* select_ctx = new SelectCardContext{
+        list_box,
+        new std::vector<ScryfallCard>(cards),
+        state,
+        quantity,
+        ctx->parent,
+        ctx
+    };
+
+    g_signal_connect(cancel_button, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data) {
+        SelectCardContext* sctx = (SelectCardContext*)user_data;
+        GtkWidget* select_dialog = gtk_widget_get_ancestor(GTK_WIDGET(sctx->list_box), GTK_TYPE_WINDOW);
+        if (select_dialog && GTK_IS_WIDGET(select_dialog)) {
+            gtk_window_destroy(GTK_WINDOW(select_dialog));
         }
+        delete sctx->cards;
+        delete sctx;
+    }), select_ctx);
 
-        GtkWidget *button_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
-        gtk_box_append(GTK_BOX(box), button_box);
+    g_signal_connect(list_box, "row-activated", G_CALLBACK(+[](GtkWidget* list_box, GtkListBoxRow* row, gpointer user_data) {
+        SelectCardContext* sctx = (SelectCardContext*)user_data;
+        size_t index = (size_t)g_object_get_data(G_OBJECT(row), "card_index");
+        if (index < sctx->cards->size()) {
+            auto& card = (*sctx->cards)[index];
+            std::string msg = "Nome: " + card.name + "\n";
+            msg += "Tipo: " + card.type + "\n";
+            msg += "Colori: " + card.colors + "\n";
+            msg += "Set: " + card.set_name + "\n";
+            msg += "Costo Mana: " + card.mana_cost + "\n";
+            msg += "Rarità: " + card.rarity + "\n";
+            msg += "Testo: " + card.oracle_text;
 
-        GtkWidget *cancel_button = gtk_button_new_with_label("Annulla");
-        gtk_box_append(GTK_BOX(button_box), cancel_button);
+            if (sctx->state && sctx->state->db) {
+                int foil = 0;
+                if (sctx->original_ctx && sctx->original_ctx->foil_checkbox) {
+                    gboolean f = FALSE;
+                    g_object_get(G_OBJECT(sctx->original_ctx->foil_checkbox), "active", &f, NULL);
+                    foil = f ? 1 : 0;
+                }
+                bool success = sctx->state->db->insert_card(card.english_name, card.localized_name, card.type, card.localized_type, card.colors, card.set_name, card.mana_cost, card.rarity, sctx->quantity, card.image_url, card.price_usd, -1, foil);
+                std::cout << "Inserted card: " << card.english_name << " in set " << card.set_name << " qty " << sctx->quantity << " success: " << success << std::endl;
+                if (success) {
+                    refresh_card_list(sctx->state);
+                    g_main_context_iteration(NULL, FALSE);
+                    msg += "\n\n[Salvata nel database]";
+                } else {
+                    msg += "\n\n[Errore nel salvare]";
+                }
+            } else {
+                msg += "\n\n[ERRORE: Nessun database aperto]";
+            }
 
-        // Crea un contesto per il dialogo di selezione
-        struct SelectCardContext {
-            GtkWidget* list_box;
-            std::vector<ScryfallCard>* cards;
-            AppState* state;
-            int quantity;
-            GtkWindow* parent;
-            AddCardContext* original_ctx;
-        };
-        
-        SelectCardContext* select_ctx = new SelectCardContext{
-            list_box, 
-            new std::vector<ScryfallCard>(cards), 
-            state, 
-            quantity, 
-            ctx->parent,
-            ctx
-        };
+            GtkAlertDialog *alert = gtk_alert_dialog_new("%s", msg.c_str());
+            gtk_alert_dialog_show(alert, sctx->parent);
+            g_object_unref(alert);
 
-        g_signal_connect(cancel_button, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data) {
-            SelectCardContext* ctx = (SelectCardContext*)user_data;
-            // Chiudi la finestra di selezione
-            GtkWidget* select_dialog = gtk_widget_get_ancestor(GTK_WIDGET(ctx->list_box), GTK_TYPE_WINDOW);
+            GtkWidget* select_dialog = gtk_widget_get_ancestor(sctx->list_box, GTK_TYPE_WINDOW);
             if (select_dialog && GTK_IS_WIDGET(select_dialog)) {
                 gtk_window_destroy(GTK_WINDOW(select_dialog));
             }
-            // Riapri la finestra di ricerca originale (non chiuderla)
-            delete ctx->cards;
-            delete ctx;
-        }), select_ctx);
 
-        // Gestisci doppio click sulla riga
-        g_signal_connect(list_box, "row-activated", G_CALLBACK(+[](GtkWidget* list_box, GtkListBoxRow* row, gpointer user_data) {
-            SelectCardContext* ctx = (SelectCardContext*)user_data;
-            size_t index = (size_t)g_object_get_data(G_OBJECT(row), "card_index");
-            
-            if (index < ctx->cards->size()) {
-                auto& card = (*ctx->cards)[index];
-                
-                std::string msg = "Nome: " + card.name + "\n";
-                msg += "Tipo: " + card.type + "\n";
-                msg += "Colori: " + card.colors + "\n";
-                msg += "Set: " + card.set_name + "\n";
-                msg += "Costo Mana: " + card.mana_cost + "\n";
-                msg += "Rarità: " + card.rarity + "\n";
-                msg += "Testo: " + card.oracle_text;
-                
-                if (ctx->state && ctx->state->db) {
-                    int foil = 0;
-                    if (ctx->original_ctx && ctx->original_ctx->foil_checkbox) {
-                        gboolean f = FALSE;
-                        g_object_get(G_OBJECT(ctx->original_ctx->foil_checkbox), "active", &f, NULL);
-                        foil = f ? 1 : 0;
-                    }
-                    bool success = ctx->state->db->insert_card(card.english_name, card.localized_name, card.type, card.localized_type, card.colors, card.set_name, card.mana_cost, card.rarity, ctx->quantity, card.image_url, card.price_usd, -1, foil);
-                    std::cout << "Inserted card: " << card.english_name << " in set " << card.set_name << " qty " << ctx->quantity << " success: " << success << std::endl;
-                    if (success) {
-                        refresh_card_list(ctx->state);
-                        g_main_context_iteration(NULL, FALSE);
-                        msg += "\n\n[Salvata nel database]";
-                    } else {
-                        msg += "\n\n[Errore nel salvare]";
-                    }
-                } else {
-                    msg += "\n\n[ERRORE: Nessun database aperto]";
-                }
-                
-                GtkAlertDialog *alert = gtk_alert_dialog_new("%s", msg.c_str());
-                gtk_alert_dialog_show(alert, ctx->parent);
-                g_object_unref(alert);
-                
-                // Chiudi entrambe le finestre
-                GtkWidget* search_dialog = gtk_widget_get_ancestor(ctx->original_ctx->entry, GTK_TYPE_WINDOW);
-                GtkWidget* select_dialog = gtk_widget_get_ancestor(ctx->list_box, GTK_TYPE_WINDOW);
-                if (search_dialog && GTK_IS_WIDGET(search_dialog)) {
-                    gtk_window_destroy(GTK_WINDOW(search_dialog));
-                }
-                if (select_dialog && GTK_IS_WIDGET(select_dialog)) {
-                    gtk_window_destroy(GTK_WINDOW(select_dialog));
-                }
-                delete ctx->original_ctx;
+            if (sctx->original_ctx) {
+                gtk_editable_set_text(GTK_EDITABLE(sctx->original_ctx->entry), "");
+                gtk_spin_button_set_value(GTK_SPIN_BUTTON(sctx->original_ctx->spin), 1);
+                gtk_widget_grab_focus(sctx->original_ctx->entry);
             }
-            
-            delete ctx->cards;
-            delete ctx;
-        }), select_ctx);
+        }
+        delete sctx->cards;
+        delete sctx;
+    }), select_ctx);
 
-        gtk_window_present(GTK_WINDOW(dialog));
-    }
+    gtk_window_present(GTK_WINDOW(dialog));
 }
 
 static void on_add_card_clicked(GtkButton *button, gpointer user_data) {
@@ -2115,6 +2222,12 @@ static void on_add_card_clicked(GtkButton *button, gpointer user_data) {
 
     // Collega activate dell'entry al click su OK
     g_signal_connect(entry, "activate", G_CALLBACK(on_add_card_ok_clicked), ctx);
+
+    // Ensure the AddCardContext is deleted when the dialog is destroyed
+    g_signal_connect(dialog, "destroy", G_CALLBACK(+[](GtkWidget*, gpointer user_data) {
+        AddCardContext* c = (AddCardContext*)user_data;
+        delete c;
+    }), ctx);
 
     gtk_window_present(GTK_WINDOW(dialog));
     std::cout << "DEBUG: Cerca carta su Scryfall dialog presented" << std::endl;
@@ -3646,7 +3759,10 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
             gtk_list_item_set_selectable(item, FALSE);
             return;
         }
-        gtk_label_set_text(GTK_LABEL(label), row->rarity ? row->rarity : "");
+    // Show localized, nicely-capitalized rarity (e.g. "Comune" / "Common")
+    const char* raw_rarity = row->rarity ? row->rarity : "";
+    std::string localized_rarity = translate_rarity(raw_rarity);
+    gtk_label_set_text(GTK_LABEL(label), localized_rarity.c_str());
         if (row->foil) gtk_widget_add_css_class(label, "foil"); else gtk_widget_remove_css_class(label, "foil");
         // Aggiungi gesture per click destro
         GtkGesture *gesture = gtk_gesture_click_new();
