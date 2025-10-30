@@ -18,6 +18,15 @@
 #include "database.h"
 #include "scryfall.h"
 #include "utils.h"
+#include <thread>
+#include <chrono>
+
+// Forward declarations to allow scheduling helpers to be referenced before their definitions.
+struct AppState;
+static void schedule_focus_retries(GtkWidget* entry, AppState* state);
+static void schedule_focus_retries_custom(GtkWidget* entry, int tries, int interval_ms);
+// Forward-declare thumbnail prefetcher (defined later) so callers earlier in the file can use it
+static void prefetch_thumbnails_async(const std::vector<std::map<std::string,std::string>>& rows);
 
 // Struct per dialog widgets
 typedef struct {
@@ -34,6 +43,7 @@ typedef struct _CardRow {
     gchar *mana_cost;
     gchar *rarity;
     int quantity;
+    gchar *quantity_display;
     gchar *translated_colors;
     int total_mana_cost;
     gchar *image_url;
@@ -71,8 +81,11 @@ static void card_row_finalize(GObject *object) {
     g_free(self->image_url);
     g_free(self->added_date);
     g_free(self->price_usd);
+    g_free(self->quantity_display);
     G_OBJECT_CLASS(card_row_parent_class)->finalize(object);
 }
+
+// (Focus scheduling helpers defined later)
 
 static void card_row_get_property(GObject *object, guint property_id, GValue *value, GParamSpec *pspec) {
     CardRow *self = (CardRow*)object;
@@ -237,9 +250,11 @@ static std::string format_datetime(const char* iso) {
 
 // Forward-declare translate_colors (defined later) so helpers above can call it
 static std::string translate_colors(const char* colors);
+// Forward-declare translate_type (defined later) so UI code earlier can use it
+static std::string translate_type(const char* type);
 
 // Factory helper to create and initialize a CardRow instance
-static CardRow* card_row_new(int id, const char* name, const char* type, const char* colors, const char* set_code, const char* mana_cost, const char* rarity, int quantity, const char* image_url, const char* added_date, const char* price_usd, int foil) {
+static CardRow* card_row_new(int id, const char* name, const char* type, const char* colors, const char* set_code, const char* mana_cost, const char* rarity, int quantity, const char* image_url, const char* added_date, const char* price_usd, int foil, const char* quantity_display = NULL) {
     CardRow* r = (CardRow*)g_object_new(card_row_get_type(), NULL);
     r->id = id;
     r->name = g_strdup(name ? name : "");
@@ -256,6 +271,10 @@ static CardRow* card_row_new(int id, const char* name, const char* type, const c
     r->total_mana_cost = calculate_total_mana_cost(r->mana_cost ? r->mana_cost : std::string());
     // translated_colors uses the helper defined later; store an English/Italian translation
     r->translated_colors = g_strdup(translate_colors(r->colors).c_str());
+    if (quantity_display && *quantity_display) r->quantity_display = g_strdup(quantity_display); else {
+        char buf[64]; snprintf(buf, sizeof(buf), "%d", quantity);
+        r->quantity_display = g_strdup(buf);
+    }
     return r;
 }
 // CSS provider used for separator styling (initialized on demand)
@@ -301,7 +320,44 @@ static std::map<std::string, std::map<std::string, std::string>> translations = 
     {"Valore totale", {{"it","Valore totale"}, {"en","Total Value"}}}
 };
 
+// Add translations for new settings labels
+__attribute__((unused)) static void __add_settings_translations() {
+    translations["Notifiche"] = {{"it","Notifiche"}, {"en","Notifications"}};
+    translations["Preferenze"] = {{"it","Preferenze"}, {"en","Preferences"}};
+}
+
 static std::string current_language = "it";
+
+// Type translations (English -> localized string)
+static std::map<std::string, std::string> type_translations = {
+    {"Creature", "Creatura"},
+    {"Instant", "Istantaneo"},
+    {"Sorcery", "Stregoneria"},
+    {"Artifact", "Artefatto"},
+    {"Enchantment", "Incantesimo"},
+    {"Land", "Terra"},
+    {"Planeswalker", "Planeswalker"},
+    {"Legendary Creature", "Creatura Leggendaria"},
+    {"Legendary Artifact", "Artefatto Leggendario"},
+    {"Basic Land", "Terra Base"},
+    {"Snow Land", "Terra Neve"},
+    {"Token", "Token"},
+    {"Emblem", "Emblema"}
+};
+
+// Reverse lookup: given a localized type string, try to find its English key.
+static std::string english_for_localized_type(const std::string &loc) {
+    if (loc.empty()) return "";
+    std::string lower_loc = loc;
+    std::transform(lower_loc.begin(), lower_loc.end(), lower_loc.begin(), ::tolower);
+    for (const auto &p : type_translations) {
+        std::string v = p.second;
+        std::string lowv = v;
+        std::transform(lowv.begin(), lowv.end(), lowv.begin(), ::tolower);
+        if (lowv == lower_loc) return p.first;
+    }
+    return "";
+}
 
 // Provide accessor for earlier functions
 static const std::string& get_current_language() { return current_language; }
@@ -509,7 +565,12 @@ static gboolean grab_focus_idle(gpointer data) {
 struct FocusTarget {
     GtkWidget* entry;
     int tries;
+    int interval_ms; // current interval between retries (ms)
+    int attempt; // how many attempts done
 };
+
+// Forward declaration for send_notification (defined later)
+static void send_notification(const std::string& title, const std::string& body);
 
 // Try to grab focus multiple times (short retries) to overcome races where the
 // window manager or other widgets steal focus when dialogs close.
@@ -517,46 +578,124 @@ static gboolean grab_focus_to_entry(gpointer data) {
     FocusTarget* ft = (FocusTarget*)data;
     if (!ft) return G_SOURCE_REMOVE;
     GtkWidget* entry = ft->entry;
-    if (entry && GTK_IS_WIDGET(entry)) {
-        // Ensure parent window is presented (helps when WM focus policy is odd)
-        GtkWindow* win = GTK_WINDOW(gtk_widget_get_ancestor(entry, GTK_TYPE_WINDOW));
-        if (win && GTK_IS_WINDOW(win)) {
-            gtk_window_present(win);
-        }
-        std::cout << "DEBUG: grab_focus_to_entry attempt=" << ft->tries << " focusing entry=" << entry << " type=" << G_OBJECT_TYPE_NAME(entry) << "\n";
-        // If already focused, we're done
-        if (win && GTK_IS_WINDOW(win)) {
-            GtkWidget* cur = gtk_window_get_focus(win);
-            if (cur == entry) {
-                if (GTK_IS_EDITABLE(entry)) gtk_editable_select_region(GTK_EDITABLE(entry), 0, -1);
-                delete ft;
-                return G_SOURCE_REMOVE;
-            }
-        }
-        // Try to grab focus now
-        gtk_widget_grab_focus(entry);
-        if (GTK_IS_EDITABLE(entry)) gtk_editable_select_region(GTK_EDITABLE(entry), 0, -1);
-        // Diagnostics: print which widget holds focus after the grab attempt
-        GtkWidget* cur_after = NULL;
-        if (win && GTK_IS_WINDOW(win)) cur_after = gtk_window_get_focus(win);
-        std::cout << "DEBUG: grab_focus_to_entry after grab: current_focus=" << cur_after << " type=" << (cur_after ? G_OBJECT_TYPE_NAME(cur_after) : "NULL") << " window=" << win << "\n";
-    } else {
+    if (!entry || !GTK_IS_WIDGET(entry)) {
         std::cout << "DEBUG: grab_focus_to_entry called with invalid entry pointer=" << entry << "\n";
         delete ft;
         return G_SOURCE_REMOVE;
     }
+    // Ensure parent window is presented (helps when WM focus policy is odd)
+    GtkWindow* win = GTK_WINDOW(gtk_widget_get_ancestor(entry, GTK_TYPE_WINDOW));
+    if (win && GTK_IS_WINDOW(win)) gtk_window_present(win);
 
-    ft->tries -= 1;
-    if (ft->tries <= 0) {
+    if (ft->attempt == 0) {
+        const char* sess = getenv("XDG_SESSION_TYPE");
+        const char* disp = gdk_display_get_name(gdk_display_get_default());
+        std::cout << "DEBUG: grab_focus_to_entry initial attempt; XDG_SESSION_TYPE=" << (sess?sess:"(null)") << ", display=" << (disp?disp:"(null)") << "\n";
+    }
+
+    std::cout << "DEBUG: grab_focus_to_entry attempt=" << (ft->attempt+1) << " tries_left=" << ft->tries << " interval_ms=" << ft->interval_ms << " focusing entry=" << entry << " type=" << G_OBJECT_TYPE_NAME(entry) << "\n";
+
+    // If already focused, we're done
+    if (win && GTK_IS_WINDOW(win)) {
+        GtkWidget* cur = gtk_window_get_focus(win);
+        if (cur == entry) {
+            if (GTK_IS_EDITABLE(entry)) gtk_editable_select_region(GTK_EDITABLE(entry), 0, -1);
+            delete ft;
+            return G_SOURCE_REMOVE;
+        }
+    }
+
+    // Try to grab focus now
+    gtk_widget_grab_focus(entry);
+    if (GTK_IS_EDITABLE(entry)) gtk_editable_select_region(GTK_EDITABLE(entry), 0, -1);
+
+    // Diagnostics: print which widget holds focus after the grab attempt
+    GtkWidget* cur_after = NULL;
+    if (win && GTK_IS_WINDOW(win)) cur_after = gtk_window_get_focus(win);
+    std::cout << "DEBUG: grab_focus_to_entry after grab: current_focus=" << cur_after << " type=" << (cur_after ? G_OBJECT_TYPE_NAME(cur_after) : "NULL") << " window=" << win << "\n";
+
+    if (cur_after == entry) {
         delete ft;
         return G_SOURCE_REMOVE;
     }
-    return G_SOURCE_CONTINUE; // keep the timeout running
+
+    // Not focused yet; schedule another attempt using exponential/backoff
+    ft->tries -= 1;
+    ft->attempt += 1;
+    if (ft->tries <= 0) {
+        std::cout << "DEBUG: grab_focus_to_entry exhausted retries, will notify user and stop\n";
+        // Inform the user briefly and provide a hint to focus manually
+        send_notification("MagicDatabase", "Impossibile ripristinare il focus automatico. Premi Ctrl+N per focalizzare il campo di ricerca.");
+        delete ft;
+        return G_SOURCE_REMOVE;
+    }
+
+    // Increase interval by 1.5x up to a cap
+    int next_interval = ft->interval_ms + (ft->interval_ms / 2);
+    if (next_interval < 50) next_interval = 50;
+    if (next_interval > 2000) next_interval = 2000;
+    ft->interval_ms = next_interval;
+    // Reschedule this FocusTarget with the new interval
+    g_timeout_add(ft->interval_ms, grab_focus_to_entry, ft);
+    return G_SOURCE_REMOVE;
+}
+
+// (schedule helpers are defined later, after AppState)
+
+// Global toggle for desktop notifications. Defaults to enabled.
+static bool g_notifications_enabled = true;
+static int g_focus_retry_tries_default = 12;
+static int g_focus_retry_interval_ms_default = 100;
+// Default page size persisted in settings
+static int g_page_size_default = 50;
+
+// Persist settings to a simple INI-like file under data/settings.ini
+static void save_settings() {
+    ensure_data_dir_exists("data");
+    std::ofstream out("data/settings.ini");
+    if (!out) return;
+    out << "notifications=" << (g_notifications_enabled ? "1" : "0") << "\n";
+    out << "focus_retry_tries=" << g_focus_retry_tries_default << "\n";
+    out << "focus_retry_interval_ms=" << g_focus_retry_interval_ms_default << "\n";
+    out << "page_size=" << g_page_size_default << "\n";
+    out.close();
+}
+
+static void load_settings() {
+    ensure_data_dir_exists("data");
+    std::ifstream in("data/settings.ini");
+    if (!in) {
+        // use defaults and create file
+        g_notifications_enabled = true;
+        g_focus_retry_tries_default = 12;
+        g_focus_retry_interval_ms_default = 100;
+        g_page_size_default = 50;
+        save_settings();
+        return;
+    }
+    std::string line;
+    while (std::getline(in, line)) {
+        auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string key = line.substr(0, eq);
+        std::string val = line.substr(eq+1);
+        if (key == "notifications") {
+            g_notifications_enabled = (val == "1" || val == "true");
+        } else if (key == "focus_retry_tries") {
+            try { g_focus_retry_tries_default = std::stoi(val); } catch(...) { g_focus_retry_tries_default = 12; }
+        } else if (key == "focus_retry_interval_ms") {
+            try { g_focus_retry_interval_ms_default = std::stoi(val); } catch(...) { g_focus_retry_interval_ms_default = 100; }
+        } else if (key == "page_size") {
+            try { g_page_size_default = std::stoi(val); } catch(...) { g_page_size_default = 50; }
+        }
+    }
+    in.close();
 }
 
 // Send a desktop notification using notify-send. Uses g_shell_quote to safely
 // quote title/body and g_spawn_command_line_async to invoke the command.
 static void send_notification(const std::string& title, const std::string& body) {
+    if (!g_notifications_enabled) return;
     GError* error = NULL;
     gchar* qtitle = g_shell_quote(title.c_str());
     gchar* qbody = g_shell_quote(body.c_str());
@@ -597,9 +736,44 @@ struct AppState {
     // Filters
     std::set<std::string> filter_colors; // set of color codes, e.g. "W", "U"
     std::set<std::string> filter_rarities; // set of rarities: "common","uncommon","rare","mythic"
+    std::set<std::string> filter_types; // set of types (English keys like "Creature", "Instant")
     int filter_foil; // -1 = any, 0 = non-foil only, 1 = foil only
     bool filter_no_deck; // true = only show cards not in any deck
+    // Focus retry configuration for restoring focus after dialogs
+    int focus_retry_tries;
+    int focus_retry_interval_ms;
+    // Pagination state for large DBs
+    int page_size;       // rows per page
+    int current_page;    // zero-based
+    int total_rows;      // total rows matching current filters
+    // Pagination widgets (created during UI init)
+    GtkWidget* page_label;
+    GtkWidget* prev_page_button;
+    GtkWidget* next_page_button;
+    GtkWidget* page_size_combo;
+    GtkWidget* view_all_toggle;
 };
+
+// Schedule focus retries using the app-configured retries/interval.
+static void schedule_focus_retries(GtkWidget* entry, AppState* state) {
+    if (!entry) return;
+    FocusTarget* ft = new FocusTarget();
+    ft->entry = entry;
+    if (state && state->focus_retry_tries > 0) ft->tries = state->focus_retry_tries;
+    else ft->tries = 12;
+    int interval = (state && state->focus_retry_interval_ms > 0) ? state->focus_retry_interval_ms : 100;
+    g_timeout_add(interval, grab_focus_to_entry, ft);
+}
+
+// Schedule focus retries with explicit small values (used for short-lived dialogs)
+static void schedule_focus_retries_custom(GtkWidget* entry, int tries, int interval_ms) {
+    if (!entry) return;
+    FocusTarget* ft = new FocusTarget();
+    ft->entry = entry;
+    ft->tries = tries > 0 ? tries : 6;
+    int interval = interval_ms > 0 ? interval_ms : 50;
+    g_timeout_add(interval, grab_focus_to_entry, ft);
+}
 
 // Forward declaration for refresh used by deck helpers
 void refresh_card_list(AppState* state);
@@ -618,6 +792,8 @@ static void on_export_database_action(GSimpleAction *action, GVariant *parameter
 static void on_export_deck_action(GSimpleAction *action, GVariant *parameter, gpointer user_data);
 // Forward declaration for filters dialog
 static void on_filters_action(GSimpleAction *action, GVariant *parameter, gpointer user_data);
+// Forward declaration for preferences dialog
+static void on_preferences_action(GSimpleAction *action, GVariant *parameter, gpointer user_data);
 
 // Forward declaration for menu rebuild helper
 static void rebuild_menus_for_language(AppState* state);
@@ -652,7 +828,8 @@ static GtkWidget* create_styled_dialog(GtkWindow* parent, int width = -1, int he
 // this export helper (which appears earlier in the file) can call it.
 static std::vector<std::map<std::string, std::string>> load_cards_from_db(Database* db, const std::string& filter, int deck_filter, bool only_no_deck);
 
-static bool export_cards_to_txt(AppState* state, bool deck, int deck_id, const std::string& lang) {
+// format: "bilingual" (default formatted TXT + TSVs), "tsv_en", "tsv_it", "csv_en", "csv_it"
+static bool export_cards_to_txt(AppState* state, bool deck, int deck_id, const std::string& lang, const std::string& format = "bilingual") {
     if (!state || !state->db) return false;
     ensure_data_dir_exists("data");
     std::string filename;
@@ -727,8 +904,11 @@ static bool export_cards_to_txt(AppState* state, bool deck, int deck_id, const s
         filename = std::string("data/") + base + "_" + datebuf + "_data.txt";
     }
 
-    std::ofstream out(filename);
-    if (!out) return false;
+    std::ofstream out;
+    if (format == "bilingual") {
+        out.open(filename);
+        if (!out) return false;
+    }
     // Build SQL
     std::string sql = "SELECT id, english_name, localized_name, name, type, localized_type, colors, set_code, mana_cost, rarity, quantity, added_date, price_usd, sideboard, foil FROM cards";
     std::vector<std::string> params;
@@ -763,10 +943,27 @@ static bool export_cards_to_txt(AppState* state, bool deck, int deck_id, const s
         std::string header_type = (lang == "en") ? std::string("Type") : std::string("Tipo");
         if (header_name.size() > max_name) max_name = header_name.size();
         if (header_type.size() > max_type) max_type = header_type.size();
-        // Write header with padding
-        out << header_name;
-        out << std::string(max_name - header_name.size() + 2, ' ');
-        out << header_type << '\n';
+        if (format == "bilingual") {
+            // Write header with padding
+            out << header_name;
+            out << std::string(max_name - header_name.size() + 2, ' ');
+            out << header_type << '\n';
+            // Write main deck rows first (side == 0)
+            for (auto &p : rows) {
+                if (p.side != 0) continue;
+                out << p.name << std::string(max_name - p.name.size() + 2, ' ') << p.type << '\n';
+            }
+            // Then append sideboard rows under a localized separator if any
+            bool has_side = false;
+            for (auto &p : rows) { if (p.side != 0) { has_side = true; break; } }
+            if (has_side) {
+                out << '\n' << translate("Sideboard") << ":\n";
+                for (auto &p : rows) {
+                    if (p.side == 0) continue;
+                    out << p.name << std::string(max_name - p.name.size() + 2, ' ') << p.type << '\n';
+                }
+            }
+        }
         // Write main deck rows first (side == 0)
         for (auto &p : rows) {
             if (p.side != 0) continue;
@@ -887,6 +1084,142 @@ static bool export_cards_to_txt(AppState* state, bool deck, int deck_id, const s
 
     out.close();
     std::cout << "Exported to " << filename << std::endl;
+
+    // Also produce machine-friendly TSV/CSV files (monolingua EN and IT) for AI/automation.
+    // Build base filename without _data.txt suffix if present
+    std::string base = filename;
+    if (base.size() > 9 && base.substr(base.size()-9) == "_data.txt") {
+        base = base.substr(0, base.size()-9);
+    } else if (base.size() > 4 && base.substr(base.size()-4) == ".txt") {
+        base = base.substr(0, base.size()-4);
+    }
+    std::string tsv_en = base + "_en.tsv";
+    std::string tsv_it = base + "_it.tsv";
+
+    // For deck export, reuse earlier collected rows; for main export we reuse 'rows' from load_cards_from_db
+    // We'll build a simple TSV with header and one row per aggregated card.
+    std::ofstream out_en(tsv_en);
+    std::ofstream out_it(tsv_it);
+    if (out_en && out_it) {
+        // Header (monolingua): name, type, colors, set_code, mana_cost, rarity, quantity, price_usd, foil
+        auto write_tsv_header = [](std::ofstream &f){ f << "name\ttype\tcolors\tset_code\tmana_cost\trarity\tquantity\tprice_usd\tfoil\n"; };
+        auto write_csv_header = [](std::ofstream &f){ f << "name,type,colors,set_code,mana_cost,rarity,quantity,price_usd,foil\n"; };
+        if (format == "bilingual" || format == "tsv_en" || format == "tsv_it") {
+            out_en << "name\ttype\tcolors\tset_code\tmana_cost\trarity\tquantity\tprice_usd\tfoil\n";
+            out_it << "name\ttype\tcolors\tset_code\tmana_cost\trarity\tquantity\tprice_usd\tfoil\n";
+        }
+        if (format == "csv_en" || format == "csv_it") {
+            // we'll write CSVs down below as needed
+        }
+
+        // Use aggregated rows for main DB or deck rows for deck export
+        std::string export_filter = "";
+        if (!deck) {
+            if (state->search_entry) {
+                const char* tt = gtk_editable_get_text(GTK_EDITABLE(state->search_entry));
+                export_filter = tt ? tt : "";
+            }
+            auto trows = load_cards_from_db(state->db, export_filter, state->selected_deck_id, state->filter_no_deck);
+            for (const auto &row : trows) {
+                std::string name_en = row.count("english_name") && !row.at("english_name").empty() ? row.at("english_name") : row.at("name");
+                std::string name_it = row.count("localized_name") && !row.at("localized_name").empty() ? row.at("localized_name") : name_en;
+                std::string type_en = row.count("type") ? row.at("type") : "";
+                std::string type_it = row.count("localized_type") && !row.at("localized_type").empty() ? row.at("localized_type") : type_en;
+                std::string colors_raw = row.count("colors") ? row.at("colors") : "";
+                // English
+                {
+                    std::string prev = current_language;
+                    current_language = "en";
+                    std::string colors_en = translate_colors(colors_raw.c_str());
+                    std::string rarity_en = translate_rarity(row.count("rarity") ? row.at("rarity").c_str() : "");
+                    current_language = prev;
+                    // TSV EN
+                    if (format == "bilingual" || format == "tsv_en") {
+                        out_en << name_en << '\t' << type_en << '\t' << colors_en << '\t' << (row.count("set_code") ? row.at("set_code") : "") << '\t' << (row.count("mana_cost") ? row.at("mana_cost") : "") << '\t' << rarity_en << '\t' << (row.count("quantity") ? row.at("quantity") : "0") << '\t' << (row.count("price_usd") ? row.at("price_usd") : "") << '\t' << (row.count("foil") ? row.at("foil") : "0") << '\n';
+                    }
+                }
+                // Italian
+                {
+                    std::string prev = current_language;
+                    current_language = "it";
+                    std::string colors_it = translate_colors(colors_raw.c_str());
+                    std::string rarity_it = translate_rarity(row.count("rarity") ? row.at("rarity").c_str() : "");
+                    current_language = prev;
+                    if (format == "bilingual" || format == "tsv_it") {
+                        out_it << name_it << '\t' << type_it << '\t' << colors_it << '\t' << (row.count("set_code") ? row.at("set_code") : "") << '\t' << (row.count("mana_cost") ? row.at("mana_cost") : "") << '\t' << rarity_it << '\t' << (row.count("quantity") ? row.at("quantity") : "0") << '\t' << (row.count("price_usd") ? row.at("price_usd") : "") << '\t' << (row.count("foil") ? row.at("foil") : "0") << '\n';
+                    }
+                }
+            }
+        } else {
+            // Deck export: re-run the deck SQL to gather rows
+            state->db->query(sql, [&](const std::map<std::string,std::string>& row) {
+                std::string name = row.count("english_name") && !row.at("english_name").empty() ? row.at("english_name") : row.at("name");
+                std::string lname = row.count("localized_name") && !row.at("localized_name").empty() ? row.at("localized_name") : row.at("name");
+                std::string type_en = row.count("type") ? row.at("type") : "";
+                std::string type_local = row.count("localized_type") && !row.at("localized_type").empty() ? row.at("localized_type") : type_en;
+                // English
+                {
+                    std::string colors_en = row.count("colors") ? ( (current_language=="en") ? translate_colors(row.at("colors").c_str()) : translate_colors(row.at("colors").c_str()) ) : "";
+                    std::string rarity_en = row.count("rarity") ? translate_rarity(row.at("rarity").c_str()) : "";
+                    out_en << name << '\t' << type_en << '\t' << colors_en << '\t' << (row.count("set_code") ? row.at("set_code") : "") << '\t' << (row.count("mana_cost") ? row.at("mana_cost") : "") << '\t' << rarity_en << '\t' << (row.count("quantity") ? row.at("quantity") : "0") << '\t' << (row.count("price_usd") ? row.at("price_usd") : "") << '\t' << (row.count("foil") ? row.at("foil") : "0") << '\n';
+                }
+                // Italian
+                {
+                    std::string colors_it = row.count("colors") ? translate_colors(row.at("colors").c_str()) : "";
+                    std::string rarity_it = row.count("rarity") ? translate_rarity(row.at("rarity").c_str()) : "";
+                    out_it << lname << '\t' << type_local << '\t' << colors_it << '\t' << (row.count("set_code") ? row.at("set_code") : "") << '\t' << (row.count("mana_cost") ? row.at("mana_cost") : "") << '\t' << rarity_it << '\t' << (row.count("quantity") ? row.at("quantity") : "0") << '\t' << (row.count("price_usd") ? row.at("price_usd") : "") << '\t' << (row.count("foil") ? row.at("foil") : "0") << '\n';
+                }
+            }, params);
+        }
+            // If CSV requested, build CSV by converting TSV fields with quoting
+            auto quote_csv = [](const std::string &s) {
+                std::string out;
+                out.push_back('"');
+                for (char ch : s) {
+                    if (ch == '"') out += "\"\"";
+                    else out.push_back(ch);
+                }
+                out.push_back('"');
+                return out;
+            };
+            // Close TSV of appropriate types
+            if (format == "bilingual" || format == "tsv_en" || format == "tsv_it") {
+                out_en.close(); out_it.close();
+                std::cout << "Exported TSV files: " << tsv_en << " , " << tsv_it << std::endl;
+            }
+            // CSV generation for monolingua CSV formats
+            if (format == "csv_en" || format == "csv_it") {
+                // Re-run trows to write chosen CSV
+                std::string csvfile = (format == "csv_en") ? (base + "_en.csv") : (base + "_it.csv");
+                std::ofstream out_csv(csvfile);
+                if (out_csv) {
+                    write_csv_header(out_csv);
+                    auto trows2 = load_cards_from_db(state->db, export_filter, state->selected_deck_id, state->filter_no_deck);
+                    for (const auto &row : trows2) {
+                        std::string name_en = row.count("english_name") && !row.at("english_name").empty() ? row.at("english_name") : row.at("name");
+                        std::string name_it = row.count("localized_name") && !row.at("localized_name").empty() ? row.at("localized_name") : name_en;
+                        std::string type_en = row.count("type") ? row.at("type") : "";
+                        std::string type_it = row.count("localized_type") && !row.at("localized_type").empty() ? row.at("localized_type") : type_en;
+                        std::string colors_raw = row.count("colors") ? row.at("colors") : "";
+                        if (format == "csv_en") {
+                            std::string prev = current_language; current_language = "en";
+                            std::string colors_en = translate_colors(colors_raw.c_str());
+                            std::string rarity_en = translate_rarity(row.count("rarity") ? row.at("rarity").c_str() : "");
+                            current_language = prev;
+                            out_csv << quote_csv(name_en) << "," << quote_csv(type_en) << "," << quote_csv(colors_en) << "," << quote_csv(row.count("set_code") ? row.at("set_code") : "") << "," << quote_csv(row.count("mana_cost") ? row.at("mana_cost") : "") << "," << quote_csv(rarity_en) << "," << (row.count("quantity") ? row.at("quantity") : "0") << "," << quote_csv(row.count("price_usd") ? row.at("price_usd") : "") << "," << (row.count("foil") ? row.at("foil") : "0") << "\n";
+                        } else {
+                            std::string prev = current_language; current_language = "it";
+                            std::string colors_it2 = translate_colors(colors_raw.c_str());
+                            std::string rarity_it2 = translate_rarity(row.count("rarity") ? row.at("rarity").c_str() : "");
+                            current_language = prev;
+                            out_csv << quote_csv(name_it) << "," << quote_csv(type_it) << "," << quote_csv(colors_it2) << "," << quote_csv(row.count("set_code") ? row.at("set_code") : "") << "," << quote_csv(row.count("mana_cost") ? row.at("mana_cost") : "") << "," << quote_csv(rarity_it2) << "," << (row.count("quantity") ? row.at("quantity") : "0") << "," << quote_csv(row.count("price_usd") ? row.at("price_usd") : "") << "," << (row.count("foil") ? row.at("foil") : "0") << "\n";
+                        }
+                    }
+                    out_csv.close();
+                    std::cout << "Exported CSV file: " << csvfile << std::endl;
+                }
+            }
+    }
     return true;
 }
 
@@ -962,8 +1295,9 @@ static void on_deck_add_row_pressed(GtkGestureClick* gesture, gint n_press, gdou
         GtkWidget* ch = (GtkWidget*)g_object_get_data(G_OBJECT(r), "check");
         gpointer sp = g_object_get_data(G_OBJECT(r), "selected");
         gboolean want = sp ? (GPOINTER_TO_INT(sp) != 0) : FALSE;
-        if (ch && GTK_IS_TOGGLE_BUTTON(ch)) {
-            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ch), want);
+            if (ch && GTK_IS_WIDGET(ch)) {
+            // Use generic property set to avoid casting macros triggering runtime type checks
+            g_object_set(G_OBJECT(ch), "active", want ? TRUE : FALSE, NULL);
             std::cout << "DEBUG: idle sync set check active=" << (want ? "true" : "false") << " for row=" << r << std::endl;
         }
         return G_SOURCE_REMOVE;
@@ -1256,10 +1590,103 @@ static void rebuild_menus_for_language(AppState* state) {
     g_menu_append(lang_menu, "English", "app.lang.en");
     g_menu_append_submenu(new_view, translate("Lingua").c_str(), G_MENU_MODEL(lang_menu));
     g_object_unref(lang_menu);
+    // Notifications (checkable) and Preferences
+    g_menu_append(new_view, translate("Notifiche").c_str(), "app.notifications");
+    g_menu_append(new_view, translate("Preferenze").c_str(), "app.preferences");
     g_menu_append(new_view, translate("Filtri...").c_str(), "app.filters");
     if (state->view_button) gtk_menu_button_set_menu_model(GTK_MENU_BUTTON(state->view_button), G_MENU_MODEL(new_view));
     if (state->view_menu) g_object_unref(state->view_menu);
     state->view_menu = new_view;
+}
+
+// Preferences dialog: allows toggling notifications and adjusting focus-retry parameters
+static void on_preferences_action(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
+    (void)action; (void)parameter;
+    GtkWindow *parent = GTK_WINDOW(user_data);
+    AppState* state = (AppState*)g_object_get_data(G_OBJECT(parent), "app_state");
+    if (!parent || !state) return;
+    GtkWidget *dlg = create_styled_dialog(parent, 420, 220);
+    gtk_window_set_title(GTK_WINDOW(dlg), "Preferences");
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_window_set_child(GTK_WINDOW(dlg), vbox);
+
+    // Notifications checkbox
+    GtkWidget *notif_check = gtk_check_button_new_with_label("Notifiche");
+    // Avoid direct GTK cast macros; set property via GObject to be safe
+    g_object_set(G_OBJECT(notif_check), "active", g_notifications_enabled ? TRUE : FALSE, NULL);
+    gtk_box_append(GTK_BOX(vbox), notif_check);
+
+    // Focus retry spinbuttons
+    GtkWidget *h1 = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    GtkWidget *label1 = gtk_label_new("Focus retry attempts:");
+    gtk_label_set_xalign(GTK_LABEL(label1), 0.0);
+    gtk_box_append(GTK_BOX(h1), label1);
+    GtkWidget *spin_tries = gtk_spin_button_new_with_range(1, 100, 1);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(spin_tries), state->focus_retry_tries > 0 ? state->focus_retry_tries : g_focus_retry_tries_default);
+    gtk_widget_set_hexpand(spin_tries, FALSE);
+    gtk_box_append(GTK_BOX(h1), spin_tries);
+    gtk_box_append(GTK_BOX(vbox), h1);
+
+    GtkWidget *h2 = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    GtkWidget *label2 = gtk_label_new("Focus retry interval (ms):");
+    gtk_label_set_xalign(GTK_LABEL(label2), 0.0);
+    gtk_box_append(GTK_BOX(h2), label2);
+    GtkWidget *spin_interval = gtk_spin_button_new_with_range(10, 5000, 10);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(spin_interval), state->focus_retry_interval_ms > 0 ? state->focus_retry_interval_ms : g_focus_retry_interval_ms_default);
+    gtk_widget_set_hexpand(spin_interval, FALSE);
+    gtk_box_append(GTK_BOX(h2), spin_interval);
+    gtk_box_append(GTK_BOX(vbox), h2);
+
+    // Buttons
+    GtkWidget *btn_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    GtkWidget *save_btn = gtk_button_new_with_label("Save");
+    GtkWidget *cancel_btn = gtk_button_new_with_label("Cancel");
+    gtk_box_append(GTK_BOX(btn_box), save_btn);
+    gtk_box_append(GTK_BOX(btn_box), cancel_btn);
+    gtk_box_append(GTK_BOX(vbox), btn_box);
+
+    // Cancel handler
+    g_signal_connect(cancel_btn, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data){ GtkWindow* d = GTK_WINDOW(user_data); if (d) gtk_window_destroy(d); }), dlg);
+
+    // Save handler: allocate context and attach as user_data to the signal
+    struct PrefCtx { GtkWindow* dlg; AppState* state; GtkWidget* notif; GtkWidget* spin_tries; GtkWidget* spin_interval; };
+    PrefCtx* pref_ctx = new PrefCtx();
+    pref_ctx->dlg = GTK_WINDOW(dlg);
+    pref_ctx->state = state;
+    pref_ctx->notif = notif_check;
+    pref_ctx->spin_tries = spin_tries;
+    pref_ctx->spin_interval = spin_interval;
+    g_signal_connect(save_btn, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data){
+        PrefCtx* ctx = (PrefCtx*)user_data;
+        if (!ctx) return;
+    gboolean n = FALSE;
+    g_object_get(G_OBJECT(ctx->notif), "active", &n, NULL);
+        int tries = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(ctx->spin_tries));
+        int interval = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(ctx->spin_interval));
+        // Update globals and state
+        g_notifications_enabled = n ? true : false;
+        g_focus_retry_tries_default = tries > 0 ? tries : g_focus_retry_tries_default;
+        g_focus_retry_interval_ms_default = interval > 0 ? interval : g_focus_retry_interval_ms_default;
+        if (ctx->state) {
+            ctx->state->focus_retry_tries = g_focus_retry_tries_default;
+            ctx->state->focus_retry_interval_ms = g_focus_retry_interval_ms_default;
+        }
+        // Persist
+        save_settings();
+        // Update action state (if present) so menus show the correct check
+        GtkApplication* app = GTK_APPLICATION(gtk_window_get_application(ctx->dlg));
+        if (app) {
+            GSimpleAction* act = (GSimpleAction*)g_action_map_lookup_action(G_ACTION_MAP(app), "notifications");
+            if (act) g_simple_action_set_state(act, g_variant_new_boolean(g_notifications_enabled));
+        }
+        // Rebuild menus to reflect changed labels/state
+        if (ctx->state) rebuild_menus_for_language(ctx->state);
+        // Close dialog
+        if (ctx->dlg) gtk_window_destroy(GTK_WINDOW(ctx->dlg));
+        delete ctx;
+    }), pref_ctx);
+
+    gtk_window_present(GTK_WINDOW(dlg));
 }
 
 // Funzione per ordinare la lista carte
@@ -1312,54 +1739,135 @@ static void draw_mana_on_cairo(cairo_t* cr, int width, int height, const std::ma
     // background
     cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
     cairo_paint(cr);
-    // margins
-    const int margin = 40;
+
+    // layout
+    const int margin = 48;
     int w = width - margin*2;
     int h = height - margin*2;
     int buckets = cap_bucket + 1;
-    int bar_w = buckets > 0 ? (w / buckets) : w;
-    // find max count
+
+    // gather values for each bucket index 0..cap_bucket
+    std::vector<double> vals(buckets, 0.0);
     int maxc = 1;
-    for (auto &p : counts) if (p.second > maxc) maxc = p.second;
-    // draw axes
-    cairo_set_source_rgb(cr, 0,0,0);
+    int total = 0;
+    for (int i=0;i<buckets;++i) {
+        auto it = counts.find(i);
+        if (it != counts.end()) vals[i] = (double)it->second;
+        if ((int)vals[i] > maxc) maxc = (int)vals[i];
+        total += (int)vals[i];
+    }
+    if (total_cards > 0) total = total_cards; // prefer provided total when available
+
+    // margins for drawing area
+    double left = margin;
+    double top = margin;
+    double right = margin + w;
+    double bottom = margin + h;
+
+    // draw light horizontal grid
     cairo_set_line_width(cr, 1.0);
-    cairo_move_to(cr, margin, margin);
-    cairo_line_to(cr, margin, margin + h);
-    cairo_line_to(cr, margin + w, margin + h);
+    cairo_set_source_rgba(cr, 0.85, 0.85, 0.85, 1.0);
+    int y_steps = 4;
+    for (int s=0;s<=y_steps;++s) {
+        double yy = top + (h * (double)s / (double)y_steps);
+        cairo_move_to(cr, left, yy);
+        cairo_line_to(cr, right, yy);
+        cairo_stroke(cr);
+    }
+
+    // axes
+    cairo_set_source_rgb(cr, 0.1, 0.1, 0.1);
+    cairo_set_line_width(cr, 2.0);
+    cairo_move_to(cr, left, top);
+    cairo_line_to(cr, left, bottom);
+    cairo_line_to(cr, right, bottom);
     cairo_stroke(cr);
-    // draw bars
-    for (int b=0;b<buckets;++b) {
-        int cx = margin + b*bar_w;
-        int cnt = 0;
-        auto it = counts.find(b);
-        if (it != counts.end()) cnt = it->second;
-        double height_frac = maxc > 0 ? (double)cnt / (double)maxc : 0.0;
-        int bh = (int)(height_frac * (h - 20));
-        // color gradient
-        double t = buckets>1 ? (double)b / (double)(buckets-1) : 0.0;
-        cairo_set_source_rgb(cr, 0.2 + 0.6 * t, 0.4, 0.2 + 0.4*(1.0-t));
-        cairo_rectangle(cr, cx + 4, margin + h - bh, bar_w - 8, bh);
-        cairo_fill(cr);
-        // label
+
+    // compute x positions
+    std::vector<double> xs(buckets, 0.0), ys(buckets, 0.0);
+    for (int i=0;i<buckets;++i) {
+        double x = left + (w * ((i + 0.0) / (double)(buckets - 1 < 1 ? 1 : buckets - 1)));
+        xs[i] = x;
+        double v = vals[i];
+        double y = bottom;
+        if (maxc > 0) y = bottom - ( (h - 20) * (v / (double)maxc) );
+        ys[i] = y;
+    }
+
+    // filled area under curve (subtle)
+    cairo_move_to(cr, xs[0], bottom);
+    for (int i=0;i<buckets;++i) cairo_line_to(cr, xs[i], ys[i]);
+    cairo_line_to(cr, xs.back(), bottom);
+    cairo_close_path(cr);
+    cairo_set_source_rgba(cr, 0.2, 0.6, 0.9, 0.12);
+    cairo_fill(cr);
+
+    // polyline
+    cairo_set_source_rgb(cr, 0.08, 0.44, 0.85);
+    cairo_set_line_width(cr, 2.5);
+    cairo_move_to(cr, xs[0], ys[0]);
+    for (int i=1;i<buckets;++i) cairo_line_to(cr, xs[i], ys[i]);
+    cairo_stroke(cr);
+
+    // points
+    for (int i=0;i<buckets;++i) {
+        double x = xs[i];
+        double y = ys[i];
+        cairo_arc(cr, x, y, 5.0, 0, 2*M_PI);
+        cairo_set_source_rgb(cr, 1,1,1);
+        cairo_fill_preserve(cr);
+        cairo_set_source_rgb(cr, 0.08, 0.44, 0.85);
+        cairo_set_line_width(cr, 1.5);
+        cairo_stroke(cr);
+        // small label for value above point if non-zero
+        if (vals[i] > 0.5) {
+            char tb[32]; snprintf(tb, sizeof(tb), "%d", (int)vals[i]);
+            cairo_set_source_rgb(cr, 0.1,0.1,0.1);
+            cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+            cairo_set_font_size(cr, 11.0);
+            cairo_text_extents_t ext;
+            cairo_text_extents(cr, tb, &ext);
+            cairo_move_to(cr, x - ext.width/2.0, y - 8);
+            cairo_show_text(cr, tb);
+        }
+    }
+
+    // x labels
+    cairo_set_source_rgb(cr, 0.1,0.1,0.1);
+    cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_font_size(cr, 12.0);
+    for (int i=0;i<buckets;++i) {
         char lbl[32];
-        if (b < cap_bucket) snprintf(lbl, sizeof(lbl), "%d", b);
+        if (i < cap_bucket) snprintf(lbl, sizeof(lbl), "%d", i);
         else snprintf(lbl, sizeof(lbl), ">=%d", cap_bucket);
-        cairo_set_source_rgb(cr, 0,0,0);
-        cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-        cairo_set_font_size(cr, 12.0);
         cairo_text_extents_t ext;
         cairo_text_extents(cr, lbl, &ext);
-        double lx = cx + (bar_w - ext.width) / 2.0 - ext.x_bearing;
-        double ly = margin + h + 16;
+        double lx = xs[i] - ext.width/2.0 - ext.x_bearing;
+        double ly = bottom + 18;
         cairo_move_to(cr, lx, ly);
         cairo_show_text(cr, lbl);
     }
+
+    // y axis ticks and labels
+    cairo_set_font_size(cr, 11.0);
+    for (int s=0;s<=y_steps;++s) {
+        double frac = (double)(y_steps - s) / (double)y_steps;
+        int val = (int)round(frac * (double)maxc);
+        char lb[32]; snprintf(lb, sizeof(lb), "%d", val);
+        cairo_text_extents_t ext;
+        cairo_text_extents(cr, lb, &ext);
+        double yy = top + (h * (double)s / (double)y_steps);
+        double lx = left - 8 - ext.width;
+        double ly = yy + ext.height/2.0;
+        cairo_move_to(cr, lx, ly);
+        cairo_show_text(cr, lb);
+    }
+
     // title
-    cairo_set_source_rgb(cr, 0,0,0);
+    cairo_set_source_rgb(cr, 0.05, 0.05, 0.05);
     cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
-    cairo_set_font_size(cr, 16.0);
-    cairo_move_to(cr, margin, 18);
+    cairo_set_font_size(cr, 18.0);
+    cairo_move_to(cr, left, margin/2);
     cairo_show_text(cr, "Curva Mana");
 }
 
@@ -1373,6 +1881,186 @@ static cairo_surface_t* create_mana_surface(const std::map<int,int>& counts, int
     return surface;
 }
 
+// Draw multiple series (label -> bucket->count) onto cairo surface with legend
+static void draw_mana_multi_on_cairo(cairo_t* cr, int width, int height, const std::map<std::string, std::map<int,int>>& series, int cap_bucket) {
+    // background
+    cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
+    cairo_paint(cr);
+    const int margin = 48;
+    int w = width - margin*2;
+    int h = height - margin*2;
+    int buckets = cap_bucket + 1;
+    // compute global max
+    int maxc = 1;
+    for (auto &s : series) for (auto &p : s.second) if (p.second > maxc) maxc = p.second;
+    // layout
+    double left = margin, top = margin, right = margin + w, bottom = margin + h;
+    // grid
+    cairo_set_line_width(cr, 1.0);
+    cairo_set_source_rgba(cr, 0.92, 0.92, 0.92, 1.0);
+    int y_steps = 4;
+    for (int s=0;s<=y_steps;++s) {
+        double yy = top + (h * (double)s / (double)y_steps);
+        cairo_move_to(cr, left, yy);
+        cairo_line_to(cr, right, yy);
+        cairo_stroke(cr);
+    }
+    // axes
+    cairo_set_source_rgb(cr, 0.12,0.12,0.12);
+    cairo_set_line_width(cr, 2.0);
+    cairo_move_to(cr, left, top);
+    cairo_line_to(cr, left, bottom);
+    cairo_line_to(cr, right, bottom);
+    cairo_stroke(cr);
+
+    // predefined palette
+    std::vector<std::array<double,3>> palette = {
+        {0.08,0.44,0.85}, {0.9,0.33,0.23}, {0.2,0.7,0.2}, {0.65,0.2,0.7}, {0.95,0.7,0.2}, {0.2,0.7,0.8}, {0.6,0.6,0.6}
+    };
+
+    // for each series, compute xs, ys and draw
+    int si = 0;
+    double legend_x = right - 150;
+    double legend_y = top + 8;
+    for (auto &s : series) {
+        // compute points
+        std::vector<double> xs(buckets), ys(buckets);
+        for (int i=0;i<buckets;++i) {
+            double x = left + (w * ((i + 0.0) / (double)(buckets - 1 < 1 ? 1 : buckets - 1)));
+            xs[i] = x;
+            int v = 0;
+            auto it = s.second.find(i);
+            if (it != s.second.end()) v = it->second;
+            double y = bottom;
+            if (maxc > 0) y = bottom - ( (h - 20) * (v / (double)maxc) );
+            ys[i] = y;
+        }
+        // determine color for this series. For color plots prefer mana colors.
+        std::array<double,3> col = palette[si % palette.size()];
+        bool use_dash = false;
+        std::string key = s.first;
+        if (key == "W" || key == "White" || key == "Bianco") {
+            // white -> grey dashed
+            col = {0.65, 0.65, 0.65};
+            use_dash = true;
+        } else if (key == "U" || key == "Blue" || key == "Blu") {
+            col = {0.08,0.44,0.85};
+        } else if (key == "B" || key == "Black" || key == "Nero") {
+            col = {0.06,0.06,0.06};
+        } else if (key == "R" || key == "Red" || key == "Rosso") {
+            col = {0.9,0.33,0.23};
+        } else if (key == "G" || key == "Green" || key == "Verde") {
+            col = {0.2,0.7,0.2};
+        } else if (key == "C" || key == "Colorless" || key == "Incolore") {
+            // incolore (colorless) -> magenta
+            col = {0.9, 0.0, 0.6};
+        }
+        // polyline
+        cairo_set_source_rgb(cr, col[0], col[1], col[2]);
+        cairo_set_line_width(cr, 2.5);
+        if (use_dash) {
+            double dashes[] = {6.0,6.0};
+            cairo_set_dash(cr, dashes, 2, 0);
+        }
+        cairo_move_to(cr, xs[0], ys[0]);
+        for (int i=1;i<buckets;++i) cairo_line_to(cr, xs[i], ys[i]);
+        cairo_stroke(cr);
+        if (use_dash) cairo_set_dash(cr, NULL, 0, 0);
+        // points
+        for (int i=0;i<buckets;++i) {
+            cairo_arc(cr, xs[i], ys[i], 4.0, 0, 2*M_PI);
+            cairo_set_source_rgb(cr, 1,1,1);
+            cairo_fill_preserve(cr);
+            cairo_set_source_rgb(cr, col[0], col[1], col[2]);
+            cairo_set_line_width(cr, 1.5);
+            cairo_stroke(cr);
+        }
+        // legend
+        double lx = legend_x;
+        double ly = legend_y + si*20;
+        cairo_rectangle(cr, lx, ly-8, 12, 12);
+        cairo_set_source_rgb(cr, col[0], col[1], col[2]);
+        cairo_fill(cr);
+        cairo_set_source_rgb(cr, 0.05,0.05,0.05);
+        cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+        cairo_set_font_size(cr, 12.0);
+        cairo_move_to(cr, lx + 18, ly + 2);
+        cairo_show_text(cr, s.first.c_str());
+        si++;
+    }
+
+    // x labels
+    cairo_set_source_rgb(cr, 0.12,0.12,0.12);
+    cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_font_size(cr, 12.0);
+    for (int i=0;i<buckets;++i) {
+        char lbl[32];
+        if (i < cap_bucket) snprintf(lbl, sizeof(lbl), "%d", i);
+        else snprintf(lbl, sizeof(lbl), ">=%d", cap_bucket);
+        cairo_text_extents_t ext;
+        cairo_text_extents(cr, lbl, &ext);
+        double lx = left + (w * ((i + 0.0) / (double)(buckets - 1 < 1 ? 1 : buckets - 1))) - ext.width/2.0 - ext.x_bearing;
+        double ly = bottom + 18;
+        cairo_move_to(cr, lx, ly);
+        cairo_show_text(cr, lbl);
+    }
+
+    // y axis ticks and labels (match draw_mana_on_cairo behavior)
+    cairo_set_font_size(cr, 11.0);
+    for (int s=0;s<=y_steps;++s) {
+        double frac = (double)(y_steps - s) / (double)y_steps;
+        int val = (int)round(frac * (double)maxc);
+        char lb[32]; snprintf(lb, sizeof(lb), "%d", val);
+        cairo_text_extents_t ext;
+        cairo_text_extents(cr, lb, &ext);
+        double yy = top + (h * (double)s / (double)y_steps);
+        double lx = left - 8 - ext.width;
+        double ly = yy + ext.height/2.0;
+        cairo_move_to(cr, lx, ly);
+        cairo_show_text(cr, lb);
+    }
+
+    // title
+    cairo_set_source_rgb(cr, 0.05, 0.05, 0.05);
+    cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+    cairo_set_font_size(cr, 18.0);
+    cairo_move_to(cr, left, margin/2);
+    cairo_show_text(cr, "Curva Mana");
+}
+
+static cairo_surface_t* create_mana_surface_multi(const std::map<std::string, std::map<int,int>>& series, int cap_bucket, int width=800, int height=400) {
+    cairo_surface_t* surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, width, height);
+    cairo_t* cr = cairo_create(surface);
+    draw_mana_multi_on_cairo(cr, width, height, series, cap_bucket);
+    cairo_destroy(cr);
+    cairo_surface_flush(surface);
+    return surface;
+}
+
+// Draw function for GtkDrawingArea (GTK4). Paints the pre-rendered cairo surface.
+static void on_mana_area_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data) {
+    (void)user_data;
+    gpointer surf_ptr = g_object_get_data(G_OBJECT(area), "mana_surface");
+    if (!surf_ptr) {
+        std::cout << "DEBUG: on_mana_area_draw called but no surface stored on widget" << std::endl;
+        return;
+    }
+    cairo_surface_t* surf = (cairo_surface_t*)surf_ptr;
+    std::cout << "DEBUG: on_mana_area_draw surf=" << (void*)surf << std::endl;
+    int sw = cairo_image_surface_get_width(surf);
+    int sh = cairo_image_surface_get_height(surf);
+    // scale the surface to fit the allocation if needed
+    double sx = (double)width / (double)sw;
+    double sy = (double)height / (double)sh;
+    double s = sx < sy ? sx : sy;
+    if (s <= 0) s = 1.0;
+    cairo_save(cr);
+    cairo_scale(cr, s, s);
+    cairo_set_source_surface(cr, surf, 0, 0);
+    cairo_paint(cr);
+    cairo_restore(cr);
+}
+
 // Action handler: show mana curve for deck (parameter int deck id) or current selected deck
 static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
     (void)action;
@@ -1382,54 +2070,131 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
     int deck_id = -1;
     if (parameter && g_variant_is_of_type(parameter, G_VARIANT_TYPE_INT32)) deck_id = g_variant_get_int32(parameter);
     if (deck_id == -1) deck_id = state->selected_deck_id;
-    if (deck_id == -1) {
-        GtkAlertDialog *a = gtk_alert_dialog_new("%s", "Seleziona un deck prima di visualizzare la curva mana");
-        gtk_alert_dialog_show(a, parent);
-        g_object_unref(a);
-        return;
-    }
-    // Query DB for mana_cost, name, quantity and colors in this deck
     std::map<int,int> counts;
     int total_cards = 0;
     // detailed info per bucket: cost -> list of (name, qty)
     std::map<int, std::vector<std::pair<std::string,int>>> bucket_details;
     std::map<std::string,int> color_counts;
-    state->db->query("SELECT english_name, localized_name, name, mana_cost, quantity, colors FROM cards WHERE deck_id = ?", [&](const std::map<std::string,std::string>& row){
-        std::string mana = row.count("mana_cost") ? row.at("mana_cost") : "";
-        int qty = 1;
-        try { if (row.count("quantity") && !row.at("quantity").empty()) qty = std::stoi(row.at("quantity")); } catch(...) { qty = 1; }
-        int cost = calculate_total_mana_cost(mana);
-        if (cost < 0) cost = 0;
-        counts[cost] += qty;
-        total_cards += qty;
-        // name preference: localized, english, raw name
-        std::string cname = "";
-        if (row.count("localized_name") && !row.at("localized_name").empty()) cname = row.at("localized_name");
-        else if (row.count("english_name") && !row.at("english_name").empty()) cname = row.at("english_name");
-        else if (row.count("name")) cname = row.at("name");
-        bucket_details[cost].push_back({cname, qty});
-        // colors parsing: either JSON array or compact codes
-        std::string cols = row.count("colors") ? row.at("colors") : "";
-        if (!cols.empty()) {
-            try {
-                auto j = nlohmann::json::parse(cols);
-                if (j.is_array()) {
-                    for (auto &c : j) {
-                        std::string cc = c.get<std::string>();
-                        color_counts[cc] += qty;
+    if (deck_id == -1) {
+        // Build counts from the current filtered main view (use aggregated loader and apply UI filters)
+        std::string filter = "";
+        if (state->search_entry) {
+            const char* text = gtk_editable_get_text(GTK_EDITABLE(state->search_entry));
+            filter = text ? text : "";
+        }
+        auto rows = load_cards_from_db(state->db, filter, -1, state->filter_no_deck);
+        for (const auto &row : rows) {
+            // Apply UI filters the same way refresh_card_list does
+            if (!state->filter_colors.empty()) {
+                std::set<std::string> card_colors;
+                if (row.count("colors") && !row.at("colors").empty()) {
+                    try {
+                        auto j = nlohmann::json::parse(row.at("colors"));
+                        if (j.is_array()) for (auto &el : j) if (el.is_string()) card_colors.insert(el.get<std::string>());
+                    } catch (...) {
+                        std::string tmp = row.at("colors");
+                        for (char ch : tmp) if (!isspace((unsigned char)ch)) card_colors.insert(std::string(1,ch));
                     }
                 }
-            } catch(...) {
-                // fallback: treat as sequence of letters (e.g., WUBRG or "WU")
-                for (char ch : cols) {
-                    if (std::isalpha((unsigned char)ch)) {
-                        std::string s(1, ch);
-                        color_counts[s] += qty;
-                    }
+                if (card_colors != state->filter_colors) continue;
+            }
+            if (!state->filter_rarities.empty()) {
+                std::string card_rarity = row.count("rarity") ? row.at("rarity") : "";
+                std::transform(card_rarity.begin(), card_rarity.end(), card_rarity.begin(), ::tolower);
+                if (state->filter_rarities.count(card_rarity) == 0) continue;
+            }
+            if (!state->filter_types.empty()) {
+                std::string card_type_en = row.count("type") ? row.at("type") : "";
+                std::string card_type_local = row.count("localized_type") && !row.at("localized_type").empty() ? row.at("localized_type") : card_type_en;
+                auto lower = [](std::string s) { std::transform(s.begin(), s.end(), s.begin(), ::tolower); return s; };
+                std::string cte = lower(card_type_en);
+                std::string ctl = lower(card_type_local);
+                bool matched = false;
+                for (const auto &fk : state->filter_types) {
+                    std::string prev_lang = current_language;
+                    current_language = "it";
+                    std::string fk_it = translate_type(fk.c_str());
+                    current_language = prev_lang;
+                    std::string fk_en_l = lower(fk);
+                    std::string fk_it_l = lower(fk_it);
+                    if ((cte.find(fk_en_l) != std::string::npos) || (ctl.find(fk_en_l) != std::string::npos) || (cte.find(fk_it_l) != std::string::npos) || (ctl.find(fk_it_l) != std::string::npos)) { matched = true; break; }
+                }
+                if (!matched) continue;
+            }
+            if (state->filter_foil != -1) {
+                int foil = 0;
+                if (row.count("foil")) try { foil = std::stoi(row.at("foil")); } catch(...) { foil = 0; }
+                if (state->filter_foil != foil) continue;
+            }
+            // Quantity: use aggregated quantity fields if present
+            int qty = 0;
+            if (row.count("quantity_total")) {
+                try { qty = std::stoi(row.at("quantity_total")); } catch(...) { qty = 0; }
+            } else if (row.count("quantity")) {
+                try { qty = std::stoi(row.at("quantity")); } catch(...) { qty = 0; }
+            } else {
+                qty = 1;
+            }
+            std::string mana = row.count("mana_cost") ? row.at("mana_cost") : "";
+            int cost = calculate_total_mana_cost(mana);
+            if (cost < 0) cost = 0;
+            counts[cost] += qty;
+            total_cards += qty;
+            std::string cname = "";
+            if (row.count("localized_name") && !row.at("localized_name").empty()) cname = row.at("localized_name");
+            else if (row.count("english_name") && !row.at("english_name").empty()) cname = row.at("english_name");
+            else if (row.count("name")) cname = row.at("name");
+            bucket_details[cost].push_back({cname, qty});
+            // colors
+            std::string cols = row.count("colors") ? row.at("colors") : "";
+            if (!cols.empty()) {
+                try {
+                    auto j = nlohmann::json::parse(cols);
+                    if (j.is_array()) for (auto &c : j) color_counts[c.get<std::string>()] += qty;
+                } catch(...) {
+                    for (char ch : cols) if (std::isalpha((unsigned char)ch)) color_counts[std::string(1,ch)] += qty;
                 }
             }
         }
-    }, std::vector<std::string>{std::to_string(deck_id)});
+    } else {
+        // Query DB for mana_cost, name, quantity and colors in this deck
+        state->db->query("SELECT english_name, localized_name, name, mana_cost, quantity, colors FROM cards WHERE deck_id = ?", [&](const std::map<std::string,std::string>& row){
+            std::string mana = row.count("mana_cost") ? row.at("mana_cost") : "";
+            int qty = 1;
+            try { if (row.count("quantity") && !row.at("quantity").empty()) qty = std::stoi(row.at("quantity")); } catch(...) { qty = 1; }
+            int cost = calculate_total_mana_cost(mana);
+            if (cost < 0) cost = 0;
+            counts[cost] += qty;
+            total_cards += qty;
+            // name preference: localized, english, raw name
+            std::string cname = "";
+            if (row.count("localized_name") && !row.at("localized_name").empty()) cname = row.at("localized_name");
+            else if (row.count("english_name") && !row.at("english_name").empty()) cname = row.at("english_name");
+            else if (row.count("name")) cname = row.at("name");
+            bucket_details[cost].push_back({cname, qty});
+            // colors parsing: either JSON array or compact codes
+            std::string cols = row.count("colors") ? row.at("colors") : "";
+            if (!cols.empty()) {
+                try {
+                    auto j = nlohmann::json::parse(cols);
+                    if (j.is_array()) {
+                        for (auto &c : j) {
+                            std::string cc = c.get<std::string>();
+                            color_counts[cc] += qty;
+                        }
+                    }
+                } catch(...) {
+                    // fallback: treat as sequence of letters (e.g., WUBRG or "WU")
+                    for (char ch : cols) {
+                        if (std::isalpha((unsigned char)ch)) {
+                            std::string s(1, ch);
+                            color_counts[s] += qty;
+                        }
+                    }
+                }
+            }
+        }, std::vector<std::string>{std::to_string(deck_id)});
+    }
     // cap bucket at 10
     int cap = 10;
     // Normalize counts into capped buckets and merge detailed lists accordingly
@@ -1453,18 +2218,225 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
             deck_name = r.at("name");
         }, std::vector<std::string>{std::to_string(deck_id)});
     }
-    // create surface
+    // create multi-series: Total, By Type, By Color
     int w = 800, h = 400;
-    cairo_surface_t* surf = create_mana_surface(buckets, total_cards, cap, w, h);
+    std::map<std::string, std::map<int,int>> series_total;
+    series_total["Totale"] = buckets;
+
+    // by-type series (common MTG types)
+    // Note: 'Land' intentionally omitted per request
+    std::vector<std::string> type_keys = {"Creature","Instant","Sorcery","Enchantment","Artifact","Planeswalker","Other"};
+    std::map<std::string, std::map<int,int>> series_by_type;
+    for (auto &k : type_keys) series_by_type[k] = std::map<int,int>();
+
+    // by-color series
+    std::vector<std::string> color_keys = {"W","U","B","R","G","C"};
+    std::map<std::string, std::map<int,int>> series_by_color;
+    for (auto &c : color_keys) series_by_color[c] = std::map<int,int>();
+
+    // Recompute per-card contributions to type/color series using bucket_details (if available)
+    // We need to iterate original bucket_details (we have bucket_details map<int, vector<pair<string,int>>>)
+    // but bucket_details contains names only; instead we should iterate the rows again where possible.
+    // Simpler: use DB to enumerate the same rows originally considered above (deck vs main view path)
+    if (deck_id == -1) {
+        std::string filter = "";
+        if (state->search_entry) {
+            const char* text = gtk_editable_get_text(GTK_EDITABLE(state->search_entry));
+            filter = text ? text : "";
+        }
+        auto rows = load_cards_from_db(state->db, filter, -1, state->filter_no_deck);
+        for (const auto &row : rows) {
+            // apply same UI filters as earlier
+            if (!state->filter_colors.empty()) {
+                std::set<std::string> card_colors;
+                if (row.count("colors") && !row.at("colors").empty()) {
+                    try {
+                        auto j = nlohmann::json::parse(row.at("colors"));
+                        if (j.is_array()) for (auto &el : j) if (el.is_string()) card_colors.insert(el.get<std::string>());
+                    } catch (...) {
+                        std::string tmp = row.at("colors");
+                        for (char ch : tmp) if (!isspace((unsigned char)ch)) card_colors.insert(std::string(1,ch));
+                    }
+                }
+                if (card_colors != state->filter_colors) continue;
+            }
+            if (!state->filter_rarities.empty()) {
+                std::string card_rarity = row.count("rarity") ? row.at("rarity") : "";
+                std::transform(card_rarity.begin(), card_rarity.end(), card_rarity.begin(), ::tolower);
+                if (state->filter_rarities.count(card_rarity) == 0) continue;
+            }
+            if (!state->filter_types.empty()) {
+                std::string card_type_en = row.count("type") ? row.at("type") : "";
+                std::string card_type_local = row.count("localized_type") && !row.at("localized_type").empty() ? row.at("localized_type") : card_type_en;
+                auto lower = [](std::string s) { std::transform(s.begin(), s.end(), s.begin(), ::tolower); return s; };
+                std::string cte = lower(card_type_en);
+                std::string ctl = lower(card_type_local);
+                bool matched = false;
+                for (const auto &fk : state->filter_types) {
+                    std::string prev_lang = current_language;
+                    current_language = "it";
+                    std::string fk_it = translate_type(fk.c_str());
+                    current_language = prev_lang;
+                    std::string fk_en_l = lower(fk);
+                    std::string fk_it_l = lower(fk_it);
+                    if ((cte.find(fk_en_l) != std::string::npos) || (ctl.find(fk_en_l) != std::string::npos) || (cte.find(fk_it_l) != std::string::npos) || (ctl.find(fk_it_l) != std::string::npos)) { matched = true; break; }
+                }
+                if (!matched) continue;
+            }
+            if (state->filter_foil != -1) {
+                int foil = 0;
+                if (row.count("foil")) try { foil = std::stoi(row.at("foil")); } catch(...) { foil = 0; }
+                if (state->filter_foil != foil) continue;
+            }
+            int qty = 0;
+            if (row.count("quantity_total")) {
+                try { qty = std::stoi(row.at("quantity_total")); } catch(...) { qty = 0; }
+            } else if (row.count("quantity")) {
+                try { qty = std::stoi(row.at("quantity")); } catch(...) { qty = 0; }
+            } else qty = 1;
+            std::string mana = row.count("mana_cost") ? row.at("mana_cost") : "";
+            int cost = calculate_total_mana_cost(mana);
+            if (cost < 0) cost = 0;
+            int b = cost >= cap ? cap : cost;
+            // types: check presence of keywords
+            std::string ctype = row.count("type") ? row.at("type") : "";
+            for (auto &tk : type_keys) {
+                std::string lowered = tk;
+                std::transform(lowered.begin(), lowered.end(), lowered.begin(), ::tolower);
+                std::string ctype_l = ctype; std::transform(ctype_l.begin(), ctype_l.end(), ctype_l.begin(), ::tolower);
+                if (ctype_l.find(lowered) != std::string::npos) {
+                    series_by_type[tk][b] += qty;
+                }
+            }
+            // if no type matched, count as Other
+            bool anyt=false; for (auto &tk : type_keys) if (!series_by_type[tk].empty() && series_by_type[tk].count(b)) { anyt=true; break; }
+            if (!anyt) series_by_type["Other"][b] += qty;
+            // colors
+            std::string cols = row.count("colors") ? row.at("colors") : "";
+            if (!cols.empty()) {
+                try {
+                    auto j = nlohmann::json::parse(cols);
+                    if (j.is_array()) for (auto &c : j) {
+                        std::string cc = c.get<std::string>();
+                        if (series_by_color.count(cc) == 0) series_by_color[cc] = std::map<int,int>();
+                        series_by_color[cc][b] += qty;
+                    }
+                } catch(...) {
+                    for (char ch : cols) if (std::isalpha((unsigned char)ch)) {
+                        std::string s(1,ch);
+                        if (series_by_color.count(s) == 0) series_by_color[s] = std::map<int,int>();
+                        series_by_color[s][b] += qty;
+                    }
+                }
+            } else {
+                series_by_color["C"][b] += qty;
+            }
+        }
+    } else {
+        // deck-specific: query the cards we already iterated above
+        state->db->query("SELECT type, mana_cost, quantity, colors FROM cards WHERE deck_id = ?", [&](const std::map<std::string,std::string>& row){
+            int qty = 1;
+            try { if (row.count("quantity") && !row.at("quantity").empty()) qty = std::stoi(row.at("quantity")); } catch(...) { qty = 1; }
+            std::string mana = row.count("mana_cost") ? row.at("mana_cost") : "";
+            int cost = calculate_total_mana_cost(mana); if (cost < 0) cost = 0; int b = cost >= cap ? cap : cost;
+            std::string ctype = row.count("type") ? row.at("type") : "";
+            for (auto &tk : type_keys) {
+                std::string lowered = tk; std::transform(lowered.begin(), lowered.end(), lowered.begin(), ::tolower);
+                std::string ctype_l = ctype; std::transform(ctype_l.begin(), ctype_l.end(), ctype_l.begin(), ::tolower);
+                if (ctype_l.find(lowered) != std::string::npos) series_by_type[tk][b] += qty;
+            }
+            bool anyt=false; for (auto &tk : type_keys) if (!series_by_type[tk].empty() && series_by_type[tk].count(b)) { anyt=true; break; }
+            if (!anyt) series_by_type["Other"][b] += qty;
+            std::string cols = row.count("colors") ? row.at("colors") : "";
+            if (!cols.empty()) {
+                try {
+                    auto j = nlohmann::json::parse(cols);
+                    if (j.is_array()) for (auto &c : j) { std::string cc = c.get<std::string>(); if (series_by_color.count(cc) == 0) series_by_color[cc] = std::map<int,int>(); series_by_color[cc][b] += qty; }
+                } catch(...) { for (char ch : cols) if (std::isalpha((unsigned char)ch)) { std::string s(1,ch); if (series_by_color.count(s) == 0) series_by_color[s] = std::map<int,int>(); series_by_color[s][b] += qty; } }
+            } else { series_by_color["C"][b] += qty; }
+        }, std::vector<std::string>{std::to_string(deck_id)});
+    }
+
+    // Remove any empty series (no counts) so we don't plot unused types/colors
+    std::vector<std::string> erase_keys;
+    for (auto &p : series_by_type) {
+        bool any = false;
+        for (auto &kv : p.second) if (kv.second > 0) { any = true; break; }
+        if (!any) erase_keys.push_back(p.first);
+    }
+    for (auto &k : erase_keys) series_by_type.erase(k);
+    erase_keys.clear();
+    for (auto &p : series_by_color) {
+        bool any = false;
+        for (auto &kv : p.second) if (kv.second > 0) { any = true; break; }
+        if (!any) erase_keys.push_back(p.first);
+    }
+    for (auto &k : erase_keys) series_by_color.erase(k);
+
+    // Create surfaces up-front. Only create type/color surfaces if they contain data.
+    cairo_surface_t* surf_total = create_mana_surface_multi(series_total, cap, w, h);
+    cairo_surface_t* surf_type = nullptr;
+    cairo_surface_t* surf_color = nullptr;
+    bool has_type = !series_by_type.empty();
+    bool has_color = !series_by_color.empty();
+    if (has_type) surf_type = create_mana_surface_multi(series_by_type, cap, w, h);
+    if (has_color) surf_color = create_mana_surface_multi(series_by_color, cap, w, h);
+    // Debug: always write a PNG of the generated surface so we can inspect it on disk
+    try {
+        ensure_data_dir_exists("data");
+        std::string dbg_fname = std::string("data/debug_mana_preview_") + std::to_string(time(nullptr)) + ".png";
+        cairo_surface_write_to_png(surf_total, dbg_fname.c_str());
+        std::cout << "DEBUG: wrote debug PNG to " << dbg_fname << std::endl;
+    } catch(...) {
+        std::cout << "DEBUG: failed to write debug PNG" << std::endl;
+    }
     // create pixbuf from surface and show in dialog with export buttons and stats
-    GdkPixbuf* pb = gdk_pixbuf_get_from_surface(surf, 0, 0, w, h);
+    GdkPixbuf* pb = gdk_pixbuf_get_from_surface(surf_total, 0, 0, w, h);
+    std::cout << "DEBUG: create_mana_surface -> surf=" << (void*)surf_total << " size=" << w << "x" << h << " pb=" << (void*)pb << std::endl;
     GtkWidget* dialog = create_styled_dialog(parent, w+360, h+120);
     gtk_window_set_title(GTK_WINDOW(dialog), "Curva Mana");
     GtkWidget* hmain = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
     gtk_window_set_child(GTK_WINDOW(dialog), hmain);
-    // Left: image preview
-    GtkWidget* img = gtk_image_new_from_pixbuf(pb);
-    gtk_box_append(GTK_BOX(hmain), img);
+    // Left: image preview inside a scroller (allows large previews and zoom later)
+    GtkWidget* scroller = gtk_scrolled_window_new();
+    gtk_widget_set_hexpand(scroller, TRUE);
+    gtk_widget_set_vexpand(scroller, TRUE);
+    // Wrap the scroller in a frame with nicer margins
+    GtkWidget* frame = gtk_frame_new(NULL);
+    gtk_widget_set_margin_start(frame, 12);
+    gtk_widget_set_margin_end(frame, 12);
+    gtk_widget_set_margin_top(frame, 12);
+    gtk_widget_set_margin_bottom(frame, 12);
+    gtk_box_append(GTK_BOX(hmain), frame);
+
+    // Controls above the chart: Totale / Tipo / Colore
+    GtkWidget* top_controls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_widget_set_margin_bottom(top_controls, 8);
+    GtkWidget* btn_tot = gtk_button_new_with_label("Totale");
+    GtkWidget* btn_type = gtk_button_new_with_label("Tipo");
+    GtkWidget* btn_color = gtk_button_new_with_label("Colore");
+    // make the top control buttons compact
+    gtk_widget_set_size_request(btn_tot, 92, -1);
+    gtk_widget_set_size_request(btn_type, 92, -1);
+    gtk_widget_set_size_request(btn_color, 92, -1);
+    gtk_box_append(GTK_BOX(top_controls), btn_tot);
+    gtk_box_append(GTK_BOX(top_controls), btn_type);
+    gtk_box_append(GTK_BOX(top_controls), btn_color);
+    // Create a drawing area to render our surfaces
+    GtkWidget* da = gtk_drawing_area_new();
+    g_object_set_data(G_OBJECT(da), "mana_surface", surf_total);
+    // store other surfaces on the widget so callbacks can swap them
+    g_object_set_data(G_OBJECT(da), "mana_surface_type", surf_type);
+    g_object_set_data(G_OBJECT(da), "mana_surface_color", surf_color);
+    gtk_widget_set_size_request(da, w, h);
+    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(da), (GtkDrawingAreaDrawFunc)on_mana_area_draw, NULL, NULL);
+    // compose left area: controls + scroller containing da
+    GtkWidget* left_v = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_box_append(GTK_BOX(left_v), top_controls);
+    gtk_box_append(GTK_BOX(left_v), scroller);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroller), da);
+    gtk_frame_set_child(GTK_FRAME(frame), left_v);
+    gtk_widget_queue_draw(da);
     // Right: stats and controls
     GtkWidget* right = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
     gtk_box_append(GTK_BOX(hmain), right);
@@ -1489,54 +2461,97 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
             if (acc >= half) { median = p.first; break; }
         }
     }
-    // Summary labels
-    char buf[256];
-    snprintf(buf, sizeof(buf), "Totale carte: %d", total_cards);
-    GtkWidget* lbl_total = gtk_label_new(buf);
-    snprintf(buf, sizeof(buf), "Costo medio: %.2f", avg);
-    GtkWidget* lbl_avg = gtk_label_new(buf);
-    snprintf(buf, sizeof(buf), "Mediana: %d", median);
-    GtkWidget* lbl_median = gtk_label_new(buf);
-    snprintf(buf, sizeof(buf), "Bucket più comune: %d (%d carte)", mode_bucket, mode_count);
-    GtkWidget* lbl_mode = gtk_label_new(buf);
-    snprintf(buf, sizeof(buf), "Massimo costo bucket: %d", max_cost);
-    GtkWidget* lbl_max = gtk_label_new(buf);
-    gtk_box_append(GTK_BOX(right), lbl_total);
-    gtk_box_append(GTK_BOX(right), lbl_avg);
-    gtk_box_append(GTK_BOX(right), lbl_median);
-    gtk_box_append(GTK_BOX(right), lbl_mode);
-    gtk_box_append(GTK_BOX(right), lbl_max);
-    // Distribution list (compact)
-    GtkWidget* dist_label = gtk_label_new(NULL);
-    std::string dists = "Distribuzione: ";
-    for (auto &p : buckets) {
-        double pct = total_cards>0 ? (100.0 * p.second / total_cards) : 0.0;
-        char t[64]; snprintf(t, sizeof(t), "%d:%d(%.0f%%) ", p.first, p.second, pct);
-        dists += t;
+    // Summary: build a friendly, markup-formatted stats panel (remove raw distribution line per request)
+    {
+        std::string stats;
+        char tmp[256];
+        stats += "<big><b>Statistiche</b></big>\n";
+        snprintf(tmp, sizeof(tmp), "<b>Totale carte:</b> %d\n", total_cards);
+        stats += tmp;
+        snprintf(tmp, sizeof(tmp), "<b>Costo medio:</b> %.2f\n", avg);
+        stats += tmp;
+        snprintf(tmp, sizeof(tmp), "<b>Mediana:</b> %d\n", median);
+        stats += tmp;
+        snprintf(tmp, sizeof(tmp), "<b>Moda:</b> %d (%d carte)\n", mode_bucket, mode_count);
+        stats += tmp;
+        snprintf(tmp, sizeof(tmp), "<b>Max bucket:</b> %d\n", max_cost);
+        stats += tmp;
+        // NOTE: 'Distribuzione' line removed as requested
+        // Color breakdown
+        if (!color_counts.empty()) {
+            stats += "\n\n<b>Colori:</b> ";
+            bool firstc = true;
+            for (auto &cc : color_counts) {
+                char t[64]; snprintf(t, sizeof(t), "%s:%d", cc.first.c_str(), cc.second);
+                if (!firstc) stats += ", ";
+                stats += t;
+                firstc = false;
+            }
+        }
+        GtkWidget* stats_label = gtk_label_new(NULL);
+        gtk_label_set_markup(GTK_LABEL(stats_label), stats.c_str());
+        gtk_label_set_xalign(GTK_LABEL(stats_label), 0.0);
+        gtk_label_set_wrap(GTK_LABEL(stats_label), TRUE);
+        gtk_widget_set_size_request(stats_label, 320, -1);
+        gtk_box_append(GTK_BOX(right), stats_label);
     }
-    gtk_label_set_text(GTK_LABEL(dist_label), dists.c_str());
-    gtk_label_set_xalign(GTK_LABEL(dist_label), 0.0);
-    gtk_label_set_xalign(GTK_LABEL(lbl_total), 0.0);
-    gtk_label_set_xalign(GTK_LABEL(lbl_avg), 0.0);
-    gtk_label_set_xalign(GTK_LABEL(lbl_median), 0.0);
-    gtk_label_set_xalign(GTK_LABEL(lbl_mode), 0.0);
-    gtk_label_set_xalign(GTK_LABEL(lbl_max), 0.0);
-    gtk_box_append(GTK_BOX(right), dist_label);
     // Buttons: export png/pdf and export stats
-    GtkWidget* btns = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    GtkWidget* btns = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
     GtkWidget* export_png = gtk_button_new_with_label("Export PNG");
     GtkWidget* export_pdf = gtk_button_new_with_label("Export PDF");
     GtkWidget* export_stats = gtk_button_new_with_label("Export stats");
     GtkWidget* close = gtk_button_new_with_label("Close");
+    // make export/close buttons narrower to avoid huge column width
+    gtk_widget_set_size_request(export_png, 120, -1);
+    gtk_widget_set_size_request(export_pdf, 120, -1);
+    gtk_widget_set_size_request(export_stats, 120, -1);
+    gtk_widget_set_size_request(close, 120, -1);
     gtk_box_append(GTK_BOX(btns), export_png);
     gtk_box_append(GTK_BOX(btns), export_pdf);
     gtk_box_append(GTK_BOX(btns), export_stats);
     gtk_box_append(GTK_BOX(btns), close);
     gtk_box_append(GTK_BOX(right), btns);
 
+    // If no type/color data is available, disable the corresponding buttons
+    if (!has_type) gtk_widget_set_sensitive(btn_type, FALSE);
+    if (!has_color) gtk_widget_set_sensitive(btn_color, FALSE);
+
     // Handlers (avoid inline lambdas in macros)
-    struct ExportCtx { cairo_surface_t* surf; GtkWindow* parent; int w,h; std::map<int,int> buckets; int total; int cap; std::string deck_name; std::map<int, std::vector<std::pair<std::string,int>>> bucket_details; std::map<std::string,int> color_counts; double avg; int median; int mode_bucket; int mode_count; int max_cost; };
-    ExportCtx* ectx = new ExportCtx{surf, GTK_WINDOW(dialog), w, h, buckets, total_cards, cap, deck_name, buckets_details_capped, color_counts, avg, median, mode_bucket, mode_count, max_cost};
+    struct ExportCtx {
+        GtkWidget* da; // drawing area where surfaces are shown
+        cairo_surface_t* surf;
+        cairo_surface_t* surf_total;
+        cairo_surface_t* surf_type;
+        cairo_surface_t* surf_color;
+        GtkWindow* parent;
+        int w,h;
+        std::map<int,int> buckets;
+        int total;
+        int cap;
+        std::string deck_name;
+        std::map<int, std::vector<std::pair<std::string,int>>> bucket_details;
+        std::map<std::string,int> color_counts;
+        double avg;
+        int median;
+        int mode_bucket;
+        int mode_count;
+        int max_cost;
+    };
+    ExportCtx* ectx = new ExportCtx();
+    ectx->da = da;
+    ectx->surf = surf_total;
+    ectx->surf_total = surf_total;
+    ectx->surf_type = surf_type;
+    ectx->surf_color = surf_color;
+    ectx->parent = GTK_WINDOW(dialog);
+    ectx->w = w; ectx->h = h;
+    ectx->buckets = buckets;
+    ectx->total = total_cards;
+    ectx->cap = cap;
+    ectx->deck_name = deck_name;
+    ectx->bucket_details = buckets_details_capped;
+    ectx->color_counts = color_counts;
+    ectx->avg = avg; ectx->median = median; ectx->mode_bucket = mode_bucket; ectx->mode_count = mode_count; ectx->max_cost = max_cost;
     g_signal_connect(export_png, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data){
     ExportCtx* c = (ExportCtx*)user_data;
     if (!c || !c->surf) return;
@@ -1548,14 +2563,15 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
     }), ectx);
     g_signal_connect(export_pdf, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data){
     ExportCtx* c = (ExportCtx*)user_data;
-    if (!c) return;
+    if (!c || !c->surf) return;
     ensure_data_dir_exists("data");
     std::string base = c->deck_name.empty() ? (std::string("mana_curve_") + std::to_string(time(nullptr))) : (std::string("mana_curve_") + sanitize_filename(c->deck_name));
     std::string fname = std::string("data/") + base + ".pdf";
     cairo_surface_t* pdf = cairo_pdf_surface_create(fname.c_str(), c->w, c->h);
     cairo_t* cr = cairo_create(pdf);
-    // Redraw vectorially on the PDF surface for better quality
-    draw_mana_on_cairo(cr, c->w, c->h, c->buckets, c->total, c->cap);
+    // Paint the currently selected raster surface into the PDF (embedding raster but reliable)
+    cairo_set_source_surface(cr, c->surf, 0, 0);
+    cairo_paint(cr);
     cairo_destroy(cr);
     cairo_surface_flush(pdf);
     cairo_surface_destroy(pdf);
@@ -1594,12 +2610,38 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
         if (dlg) gtk_window_destroy(GTK_WINDOW(dlg));
     }), dialog);
 
+    // Hook up the top buttons to swap the displayed surface. Use the heap-allocated
+    // ExportCtx as the callback user_data so we don't rely on stack memory.
+    g_signal_connect(btn_tot, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data){
+        ExportCtx* e = (ExportCtx*)user_data;
+        if (!e || !e->da) return;
+        g_object_set_data(G_OBJECT(e->da), "mana_surface", e->surf_total);
+        e->surf = e->surf_total;
+        gtk_widget_queue_draw(e->da);
+    }), ectx);
+    g_signal_connect(btn_type, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data){
+        ExportCtx* e = (ExportCtx*)user_data;
+        if (!e || !e->da) return;
+        g_object_set_data(G_OBJECT(e->da), "mana_surface", e->surf_type);
+        e->surf = e->surf_type;
+        gtk_widget_queue_draw(e->da);
+    }), ectx);
+    g_signal_connect(btn_color, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data){
+        ExportCtx* e = (ExportCtx*)user_data;
+        if (!e || !e->da) return;
+        g_object_set_data(G_OBJECT(e->da), "mana_surface", e->surf_color);
+        e->surf = e->surf_color;
+        gtk_widget_queue_draw(e->da);
+    }), ectx);
+
     gtk_widget_show(dialog);
     // cleanup when dialog is destroyed
     g_signal_connect(dialog, "destroy", G_CALLBACK(+[](GtkWidget* w, gpointer user_data){
         ExportCtx* c = (ExportCtx*)user_data;
         if (c) {
-            if (c->surf) cairo_surface_destroy(c->surf);
+            if (c->surf_total) cairo_surface_destroy(c->surf_total);
+            if (c->surf_type) cairo_surface_destroy(c->surf_type);
+            if (c->surf_color) cairo_surface_destroy(c->surf_color);
             delete c;
         }
     }), ectx);
@@ -1652,6 +2694,7 @@ static std::vector<std::map<std::string, std::string>> load_cards_from_db(Databa
         struct AggItem {
             std::map<std::string,std::string> rep; // representative row
             int total_qty;
+            int no_deck_qty;
             std::string latest_date;
         };
         std::map<std::string, AggItem> agg;
@@ -1679,14 +2722,17 @@ static std::vector<std::map<std::string, std::string>> load_cards_from_db(Databa
             try { qty = std::stoi(r.count("quantity") ? r.at("quantity") : "0"); } catch(...) { qty = 0; }
             std::string added = r.count("added_date") ? r.at("added_date") : "";
             auto it = agg.find(key);
+            bool row_is_deckless = !(r.count("deck_id") && !r.at("deck_id").empty());
             if (it == agg.end()) {
                 AggItem ai;
                 ai.rep = r;
                 ai.total_qty = qty;
+                ai.no_deck_qty = row_is_deckless ? qty : 0;
                 ai.latest_date = added;
                 agg.emplace(key, std::move(ai));
             } else {
                 it->second.total_qty += qty;
+                if (row_is_deckless) it->second.no_deck_qty += qty;
                 // choose the representative with the newest added_date
                 if (!added.empty() && (it->second.latest_date.empty() || added > it->second.latest_date)) {
                     it->second.rep = r;
@@ -1699,6 +2745,8 @@ static std::vector<std::map<std::string, std::string>> load_cards_from_db(Databa
         for (auto &p : agg) {
             auto rep = p.second.rep;
             rep["quantity"] = std::to_string(p.second.total_qty);
+            rep["quantity_total"] = std::to_string(p.second.total_qty);
+            rep["quantity_no_deck"] = std::to_string(p.second.no_deck_qty);
             // Ensure the representative row carries the latest added_date for sorting
             rep["added_date"] = p.second.latest_date;
             out.push_back(rep);
@@ -1714,6 +2762,272 @@ static std::vector<std::map<std::string, std::string>> load_cards_from_db(Databa
     return cards;
 }
 
+// Paged loader: uses existing aggregation loader and returns a slice for current page.
+static std::vector<std::map<std::string, std::string>> load_cards_page(AppState* state, int &out_total) {
+    out_total = 0;
+    std::vector<std::map<std::string,std::string>> empty;
+    if (!state || !state->db) return empty;
+    std::string filter = "";
+    if (state->search_entry) {
+        const char* text = gtk_editable_get_text(GTK_EDITABLE(state->search_entry));
+        filter = text ? text : "";
+    }
+    // If viewing the main DB (no deck filter) use a DB-backed aggregated query with LIMIT/OFFSET
+    if (state->selected_deck_id == -1) {
+        // Build COUNT query to get total number of aggregated rows
+    // Use canonical_name (created by migration) for grouping if available
+    std::string count_sql = "SELECT COUNT(*) AS cnt FROM ( SELECT 1 FROM cards WHERE 1=1 ";
+        std::vector<std::string> count_params;
+        if (state->filter_no_deck) count_sql += " AND deck_id IS NULL ";
+        if (!filter.empty()) {
+            // Search on the canonical_name to allow indexed lookup
+            count_sql += " AND canonical_name LIKE '%' || LOWER(?) || '%' ";
+            count_params.push_back(filter);
+        }
+        count_sql += " GROUP BY LOWER(TRIM(COALESCE(english_name, localized_name, name))), foil )";
+        // Execute count
+        state->db->query(count_sql, [&](const std::map<std::string,std::string>& row){
+            try { out_total = std::stoi(row.at("cnt")); } catch(...) { out_total = 0; }
+        }, count_params);
+
+        bool view_all = (state->page_size == 0);
+        int effective_page_size = (state->page_size > 0) ? state->page_size : (g_page_size_default > 0 ? g_page_size_default : 50);
+        if (state->current_page < 0) state->current_page = 0;
+        int start = 0;
+        if (!view_all) {
+            start = state->current_page * effective_page_size;
+            if (start >= out_total && out_total > 0) {
+                int last = (out_total - 1) / effective_page_size;
+                state->current_page = last;
+                start = state->current_page * effective_page_size;
+            }
+        } else {
+            // viewing all: reset to first page conceptually
+            state->current_page = 0;
+        }
+
+        // Build paged aggregated query using a CTE to compute aggregated keys and latest_date
+        std::string select_sql =
+            "WITH agg AS ("
+            " SELECT canonical_name AS key, foil, SUM(quantity) AS quantity_total, SUM(CASE WHEN deck_id IS NULL THEN quantity ELSE 0 END) AS quantity_no_deck, MAX(added_date) AS latest_date"
+            " FROM cards WHERE 1=1 ";
+        std::vector<std::string> sel_params;
+        if (state->filter_no_deck) select_sql += " AND deck_id IS NULL ";
+        if (!filter.empty()) {
+            select_sql += " AND canonical_name LIKE '%' || LOWER(?) || '%' ";
+            sel_params.push_back(filter);
+        }
+        select_sql += " GROUP BY key, foil ) ";
+        select_sql +=
+            "SELECT "
+            " (SELECT id FROM cards c2 WHERE c2.canonical_name = agg.key AND c2.foil = agg.foil AND c2.added_date = agg.latest_date LIMIT 1) AS id,"
+            " (SELECT COALESCE(english_name,'') FROM cards c2 WHERE c2.canonical_name = agg.key AND c2.foil = agg.foil AND c2.added_date = agg.latest_date LIMIT 1) AS english_name,"
+            " (SELECT COALESCE(localized_name,'') FROM cards c2 WHERE c2.canonical_name = agg.key AND c2.foil = agg.foil AND c2.added_date = agg.latest_date LIMIT 1) AS localized_name,"
+            " (SELECT COALESCE(name,'') FROM cards c2 WHERE c2.canonical_name = agg.key AND c2.foil = agg.foil AND c2.added_date = agg.latest_date LIMIT 1) AS name,"
+            " (SELECT COALESCE(type,'') FROM cards c2 WHERE c2.canonical_name = agg.key AND c2.foil = agg.foil AND c2.added_date = agg.latest_date LIMIT 1) AS type,"
+            " (SELECT COALESCE(localized_type,'') FROM cards c2 WHERE c2.canonical_name = agg.key AND c2.foil = agg.foil AND c2.added_date = agg.latest_date LIMIT 1) AS localized_type,"
+            " (SELECT COALESCE(colors,'') FROM cards c2 WHERE c2.canonical_name = agg.key AND c2.foil = agg.foil AND c2.added_date = agg.latest_date LIMIT 1) AS colors,"
+            " (SELECT COALESCE(set_code,'') FROM cards c2 WHERE c2.canonical_name = agg.key AND c2.foil = agg.foil AND c2.added_date = agg.latest_date LIMIT 1) AS set_code,"
+            " (SELECT COALESCE(mana_cost,'') FROM cards c2 WHERE c2.canonical_name = agg.key AND c2.foil = agg.foil AND c2.added_date = agg.latest_date LIMIT 1) AS mana_cost,"
+            " (SELECT COALESCE(rarity,'') FROM cards c2 WHERE c2.canonical_name = agg.key AND c2.foil = agg.foil AND c2.added_date = agg.latest_date LIMIT 1) AS rarity,"
+            " agg.quantity_total AS quantity,"
+            " (SELECT COALESCE(image_url,'') FROM cards c2 WHERE c2.canonical_name = agg.key AND c2.foil = agg.foil AND c2.added_date = agg.latest_date LIMIT 1) AS image_url,"
+            " agg.latest_date AS added_date,"
+            " (SELECT COALESCE(price_usd,'') FROM cards c2 WHERE c2.canonical_name = agg.key AND c2.foil = agg.foil AND c2.added_date = agg.latest_date LIMIT 1) AS price_usd,"
+            " agg.foil AS foil, agg.quantity_total AS quantity_total, agg.quantity_no_deck AS quantity_no_deck"
+            " FROM agg ORDER BY agg.latest_date DESC";
+
+        // Append limit/offset params only when not viewing all
+        if (!view_all) {
+            select_sql += " LIMIT ? OFFSET ?";
+            sel_params.push_back(std::to_string(effective_page_size));
+            int start_off = start;
+            sel_params.push_back(std::to_string(start_off));
+        }
+
+        std::vector<std::map<std::string,std::string>> page_rows;
+        state->db->query(select_sql, [&](const std::map<std::string,std::string>& row){
+            page_rows.push_back(row);
+        }, sel_params);
+        return page_rows;
+    }
+    // Deck-specific view: use DB-backed pagination (no aggregation across rows)
+    {
+        std::vector<std::string> count_params;
+        std::string count_sql = "SELECT COUNT(*) AS cnt FROM cards WHERE 1=1";
+        // Filter to the specific deck
+        count_sql += " AND deck_id = ?";
+        count_params.push_back(std::to_string(state->selected_deck_id));
+        if (state->filter_no_deck) {
+            // If user also asked for deckless while viewing a deck, result should be empty
+            // (deck_id = X and deck_id IS NULL cannot both be true). We keep the SQL but
+            // it's effectively a no-op; leave for clarity.
+            count_sql += " AND deck_id IS NULL";
+        }
+        if (!filter.empty()) {
+            count_sql += " AND LOWER(COALESCE(english_name, localized_name, name)) LIKE '%' || LOWER(?) || '%'";
+            count_params.push_back(filter);
+        }
+        // Execute count
+        state->db->query(count_sql, [&](const std::map<std::string,std::string>& row){
+            try { out_total = std::stoi(row.at("cnt")); } catch(...) { out_total = 0; }
+        }, count_params);
+
+        bool view_all = (state->page_size == 0);
+        int effective_page_size = (state->page_size > 0) ? state->page_size : (g_page_size_default > 0 ? g_page_size_default : 50);
+        if (state->current_page < 0) state->current_page = 0;
+        int start = 0;
+        if (!view_all) {
+            start = state->current_page * effective_page_size;
+            if (start >= out_total && out_total > 0) {
+                int last = (out_total - 1) / effective_page_size;
+                state->current_page = last;
+                start = state->current_page * effective_page_size;
+            }
+        } else {
+            state->current_page = 0;
+        }
+
+        // Build paged SELECT for deck rows
+        std::string select_sql =
+            "SELECT id, english_name, localized_name, name, type, localized_type, colors, set_code, mana_cost, rarity, quantity, image_url, added_date, price_usd, foil, sideboard, deck_id FROM cards WHERE 1=1";
+        std::vector<std::string> sel_params;
+        select_sql += " AND deck_id = ?";
+        sel_params.push_back(std::to_string(state->selected_deck_id));
+        if (state->filter_no_deck) select_sql += " AND deck_id IS NULL";
+        // Server-side search by name
+        if (!filter.empty()) {
+            select_sql += " AND LOWER(COALESCE(english_name, localized_name, name)) LIKE '%' || LOWER(?) || '%'";
+            sel_params.push_back(filter);
+        }
+        // Foil filter
+        if (state->filter_foil != -1) {
+            select_sql += " AND foil = ?";
+            sel_params.push_back(std::to_string(state->filter_foil));
+        }
+        // Rarity filter (one or more)
+        if (!state->filter_rarities.empty()) {
+            select_sql += " AND (";
+            bool first = true;
+            for (const auto &r : state->filter_rarities) {
+                if (!first) select_sql += " OR ";
+                select_sql += "LOWER(rarity) = ?";
+                sel_params.push_back(r);
+                first = false;
+            }
+            select_sql += ")";
+        }
+        // Type filters: inclusive substring match on stored type/localized_type
+        if (!state->filter_types.empty()) {
+            for (const auto &t : state->filter_types) {
+                select_sql += " AND (LOWER(type) LIKE '%' || LOWER(?) || '%' OR LOWER(localized_type) LIKE '%' || LOWER(?) || '%')";
+                sel_params.push_back(t);
+                sel_params.push_back(t);
+            }
+        }
+        // Colors: ensure each requested color appears in the colors column (JSON array or compact codes)
+        if (!state->filter_colors.empty()) {
+            for (const auto &c : state->filter_colors) {
+                select_sql += " AND ((colors LIKE ?) OR (colors LIKE ?))"; // try JSON "C" or compact C
+                std::string pat1 = std::string("%\"") + c + std::string("\"%");
+                std::string pat2 = std::string("%") + c + std::string("%");
+                sel_params.push_back(pat1);
+                sel_params.push_back(pat2);
+            }
+        }
+
+        // Append pagination params only when not viewing all
+        if (!view_all) {
+            select_sql += " ORDER BY added_date DESC LIMIT ? OFFSET ?";
+            sel_params.push_back(std::to_string(effective_page_size));
+            sel_params.push_back(std::to_string(start));
+        } else {
+            select_sql += " ORDER BY added_date DESC";
+        }
+
+        std::vector<std::map<std::string,std::string>> page_rows;
+        state->db->query(select_sql, [&](const std::map<std::string,std::string>& row){
+            page_rows.push_back(row);
+        }, sel_params);
+        return page_rows;
+    }
+}
+
+// Pagination control handlers
+static void on_prev_page_clicked(GtkButton* button, gpointer user_data) {
+    (void)button;
+    GtkWindow *w = GTK_WINDOW(user_data);
+    AppState* st = (AppState*)g_object_get_data(G_OBJECT(w), "app_state");
+    if (!st) return;
+    // If viewing all rows, pagination not applicable
+    if (st->page_size == 0) return;
+    if (st->current_page > 0) {
+        st->current_page -= 1;
+        refresh_card_list(st);
+    }
+}
+
+static void on_next_page_clicked(GtkButton* button, gpointer user_data) {
+    (void)button;
+    GtkWindow *w = GTK_WINDOW(user_data);
+    AppState* st = (AppState*)g_object_get_data(G_OBJECT(w), "app_state");
+    if (!st) return;
+    // If viewing all rows, pagination not applicable
+    if (st->page_size == 0) return;
+    int ps = st->page_size > 0 ? st->page_size : 50;
+    int total_pages = (st->total_rows + ps - 1) / ps;
+    if (st->current_page + 1 < total_pages) {
+        st->current_page += 1;
+        refresh_card_list(st);
+    }
+}
+
+static void on_page_size_changed(GtkComboBox *combo, gpointer user_data) {
+    GtkWindow *w = GTK_WINDOW(user_data);
+    AppState* st = (AppState*)g_object_get_data(G_OBJECT(w), "app_state");
+    if (!st) return;
+    // If view-all toggle is active, ignore combo changes
+    if (st->view_all_toggle && GTK_IS_TOGGLE_BUTTON(st->view_all_toggle) && gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(st->view_all_toggle))) {
+        return;
+    }
+    int idx = gtk_combo_box_get_active(combo);
+    int sizes[] = {10,25,50,100};
+    if (idx >= 0 && idx < 4) st->page_size = sizes[idx];
+    st->current_page = 0;
+    // Persist chosen page size to settings so it survives restarts
+    g_page_size_default = st->page_size > 0 ? st->page_size : g_page_size_default;
+    save_settings();
+    refresh_card_list(st);
+}
+
+// Toggle handler for "View All" button. When active, page_size==0 and pagination is disabled.
+static void on_view_all_toggled(GtkToggleButton *toggle, gpointer user_data) {
+    GtkWindow *w = GTK_WINDOW(user_data);
+    AppState* st = (AppState*)g_object_get_data(G_OBJECT(w), "app_state");
+    if (!st) return;
+    gboolean active = gtk_toggle_button_get_active(toggle);
+    if (active) {
+        st->page_size = 0; // special: view all rows
+        // disable the page-size combo and navigation
+        if (st->page_size_combo) gtk_widget_set_sensitive(st->page_size_combo, FALSE);
+        if (st->prev_page_button) gtk_widget_set_sensitive(st->prev_page_button, FALSE);
+        if (st->next_page_button) gtk_widget_set_sensitive(st->next_page_button, FALSE);
+    } else {
+        // restore from combo selection
+        if (st->page_size_combo) gtk_widget_set_sensitive(st->page_size_combo, TRUE);
+        int idx = -1;
+        if (st->page_size_combo) idx = gtk_combo_box_get_active(GTK_COMBO_BOX(st->page_size_combo));
+        int sizes[] = {10,25,50,100};
+        if (idx >= 0 && idx < 4) st->page_size = sizes[idx]; else st->page_size = g_page_size_default > 0 ? g_page_size_default : 50;
+        // navigation buttons will be updated by refresh_card_list
+    }
+    // Persist
+    g_page_size_default = st->page_size;
+    save_settings();
+    st->current_page = 0;
+    refresh_card_list(st);
+}
+
 // Funzione globale per aggiornare la lista carte (GListStore)
 void refresh_card_list(AppState* state) {
     if (!state || !state->card_store) return;
@@ -1724,8 +3038,30 @@ void refresh_card_list(AppState* state) {
     }
     g_list_store_remove_all(state->card_store);
     if (!state->db) return;
-    auto cards = load_cards_from_db(state->db, filter, state->selected_deck_id, state->filter_no_deck);
-    std::cout << "Loading " << cards.size() << " cards from db" << std::endl;
+    int total_rows = 0;
+    auto cards = load_cards_page(state, total_rows);
+    state->total_rows = total_rows;
+    std::cout << "Loading " << cards.size() << " cards (page " << (state->current_page+1) << ") — total matching=" << total_rows << "\n" << std::endl;
+    // Update pagination controls (if present)
+    if (state->page_label) {
+        if (state->page_size == 0) {
+            // Viewing all rows
+            char pl[128];
+            snprintf(pl, sizeof(pl), "All (%d)", total_rows);
+            gtk_label_set_text(GTK_LABEL(state->page_label), pl);
+            if (state->prev_page_button) gtk_widget_set_sensitive(state->prev_page_button, FALSE);
+            if (state->next_page_button) gtk_widget_set_sensitive(state->next_page_button, FALSE);
+        } else {
+            int ps = state->page_size > 0 ? state->page_size : 50;
+            int total_pages = (total_rows + ps - 1) / ps;
+            if (total_pages <= 0) total_pages = 1;
+            char pl[128];
+            snprintf(pl, sizeof(pl), "%s %d/%d", "Page", state->current_page + 1, total_pages);
+            gtk_label_set_text(GTK_LABEL(state->page_label), pl);
+            if (state->prev_page_button) gtk_widget_set_sensitive(state->prev_page_button, state->current_page > 0 ? TRUE : FALSE);
+            if (state->next_page_button) gtk_widget_set_sensitive(state->next_page_button, ((state->current_page+1) < total_pages) ? TRUE : FALSE);
+        }
+    }
     int total_quantity = 0;
     int main_count = 0;
     int side_count = 0;
@@ -1774,12 +3110,61 @@ void refresh_card_list(AppState* state) {
                 std::transform(card_rarity.begin(), card_rarity.end(), card_rarity.begin(), ::tolower);
                 if (state->filter_rarities.count(card_rarity) == 0) continue;
             }
+            // Type filters: inclusive substring match. If the user selected "Creature",
+            // we should match both "Creature" and "Legendary Creature" etc.
+            if (!state->filter_types.empty()) {
+                std::string card_type_en = row.count("type") ? row.at("type") : "";
+                std::string card_type_local = row.count("localized_type") && !row.at("localized_type").empty() ? row.at("localized_type") : card_type_en;
+                auto lower = [](std::string s) {
+                    std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+                    return s;
+                };
+                std::string cte = lower(card_type_en);
+                std::string ctl = lower(card_type_local);
+                bool matched = false;
+                for (const auto &fk : state->filter_types) {
+                    std::string fk_en = fk;
+                    std::string prev_lang = current_language;
+                    // Get Italian translation of the filter key (if any) so we can match localized types too
+                    current_language = "it";
+                    std::string fk_it = translate_type(fk_en.c_str());
+                    current_language = prev_lang;
+                    std::string fk_en_l = lower(fk_en);
+                    std::string fk_it_l = lower(fk_it);
+                    if ((cte.find(fk_en_l) != std::string::npos) || (ctl.find(fk_en_l) != std::string::npos) || (cte.find(fk_it_l) != std::string::npos) || (ctl.find(fk_it_l) != std::string::npos)) {
+                        matched = true;
+                        break;
+                    }
+                }
+                if (!matched) continue;
+            }
             if (state->filter_foil != -1) {
                 if (state->filter_foil != foil) continue;
             }
             if (state->filter_no_deck) {
                 if (row.count("deck_id") && !row.at("deck_id").empty()) continue;
             }
+            // Build a human-friendly quantity display. When aggregation produced both
+            // quantity_total and quantity_no_deck we prefer to show "no-deck / total"
+            // unless the user specifically filtered to only deckless, in which case
+            // show only the deckless count.
+            std::string qty_display;
+            if (row.count("quantity_total") && row.count("quantity_no_deck")) {
+                int total_q = 0;
+                int no_deck_q = 0;
+                try { total_q = std::stoi(row.at("quantity_total")); } catch(...) { total_q = 0; }
+                try { no_deck_q = std::stoi(row.at("quantity_no_deck")); } catch(...) { no_deck_q = 0; }
+                if (state->filter_no_deck) {
+                    qty_display = std::to_string(no_deck_q);
+                } else if (no_deck_q > 0 && no_deck_q != total_q) {
+                    qty_display = std::to_string(no_deck_q) + " / " + std::to_string(total_q);
+                } else {
+                    qty_display = std::to_string(total_q);
+                }
+            } else {
+                qty_display = row.count("quantity") ? row.at("quantity") : std::string("0");
+            }
+
             CardRow* crow = card_row_new(std::stoi(row.at("id")),
                                          display_name.c_str(),
                                          display_type.c_str(),
@@ -1787,16 +3172,22 @@ void refresh_card_list(AppState* state) {
                                          row.at("set_code").c_str(),
                                          row.at("mana_cost").c_str(),
                                          row.at("rarity").c_str(),
-                                         std::stoi(row.at("quantity")),
+                                         std::stoi(row.count("quantity") ? row.at("quantity") : std::string("0")),
                                          row.at("image_url").c_str(),
                                          row.count("added_date") ? row.at("added_date").c_str() : "",
                                          row.count("price_usd") ? row.at("price_usd").c_str() : "",
-                                         foil);
+                                         foil,
+                                         qty_display.c_str());
             g_list_store_append(state->card_store, crow);
             g_object_unref(crow);
             // Accumulate totals
             try {
-                int qty = std::stoi(row.at("quantity"));
+                int qty = 0;
+                if (row.count("quantity_no_deck") && state->filter_no_deck) {
+                    try { qty = std::stoi(row.at("quantity_no_deck")); } catch(...) { qty = 0; }
+                } else {
+                    try { qty = std::stoi(row.count("quantity") ? row.at("quantity") : std::string("0")); } catch(...) { qty = 0; }
+                }
                 total_quantity += qty;
                 if (row.count("price_usd") && !row.at("price_usd").empty()) {
                     try {
@@ -1901,6 +3292,21 @@ void refresh_card_list(AppState* state) {
         }
         fsummary += " ";
     }
+    if (!state->filter_types.empty()) {
+        fsummary += "Tipo:";
+        bool firstt = true;
+        for (const auto &t : state->filter_types) {
+            if (!firstt) fsummary += ",";
+            // Show localized label for the type
+            std::string prev = current_language;
+            current_language = "it";
+            std::string lab_it = translate_type(t.c_str());
+            current_language = prev;
+            fsummary += lab_it;
+            firstt = false;
+        }
+        fsummary += " ";
+    }
     if (state->filter_foil != -1) {
         fsummary += (state->filter_foil == 1) ? "Solo Foil" : "Solo Non-Foil";
     }
@@ -1914,6 +3320,8 @@ void refresh_card_list(AppState* state) {
     // g_object_unref(selection);
     // Force redraw
     gtk_widget_queue_draw(GTK_WIDGET(state->column_view));
+    // Start background thumbnail prefetch for the rows we just loaded (best-effort)
+    try { prefetch_thumbnails_async(cards); } catch(...) {}
     // gtk_widget_queue_draw(state->listview);
 }
 
@@ -1955,6 +3363,41 @@ static bool remove_card_from_deck(AppState* state, int card_id, int to_remove) {
     // Partial remove: decrease original and insert into main deckless rows
     if (!state->db->update_quantity(card_id, current_qty - to_remove)) return false;
     return state->db->insert_card(en, ln, ty, lty, cols, setc, mana, rar, to_remove, img, price, -1, foil);
+}
+
+// Asynchronously prefetch thumbnails for the given page rows.
+// This runs in a detached thread and saves images into data/img/ if missing.
+static void prefetch_thumbnails_async(const std::vector<std::map<std::string,std::string>>& rows) {
+    // Spawn worker thread
+    std::thread([rows]() {
+        try {
+            ensure_data_dir_exists("data");
+            ensure_data_dir_exists("data/img");
+        } catch(...) {}
+        for (const auto &r : rows) {
+            try {
+                if (!r.count("image_url") || r.at("image_url").empty()) continue;
+                std::string url = r.at("image_url");
+                std::filesystem::path url_path(url);
+                std::string filename = url_path.filename().string();
+                if (filename.empty()) continue;
+                std::string filepath = std::string("data/img/") + filename;
+                if (std::filesystem::exists(filepath)) continue;
+                auto data = download_image_data(url);
+                if (!data.empty()) {
+                    std::ofstream out(filepath, std::ios::binary);
+                    if (out) {
+                        out.write((char*)data.data(), data.size());
+                        out.close();
+                    }
+                }
+                // Small throttle so we don't hammer remote servers
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            } catch(...) {
+                // Swallow network/cache errors; prefetch is best-effort
+            }
+        }
+    }).detach();
 }
 
 // Helper: move or split a card into a deck. If to_move >= current quantity, the card's deck_id
@@ -2018,12 +3461,7 @@ static void on_add_card_ok_clicked(GtkButton *button, gpointer user_data) {
             gtk_widget_grab_focus(entry);
             gtk_editable_select_region(GTK_EDITABLE(entry), 0, -1);
             // Schedule a short timeout to reliably restore focus after transient dialogs close.
-            {
-                FocusTarget* ft = new FocusTarget();
-                ft->entry = entry;
-                ft->tries = 12; // increase attempts
-                g_timeout_add(100, grab_focus_to_entry, ft);
-            }
+            schedule_focus_retries(entry, state);
         }
         return;
     }
@@ -2073,12 +3511,9 @@ static void on_add_card_ok_clicked(GtkButton *button, gpointer user_data) {
             // Reset inputs so user can add another card quickly
             gtk_editable_set_text(GTK_EDITABLE(entry), "");
             gtk_spin_button_set_value(GTK_SPIN_BUTTON(spin), 1);
-            // Try to grab focus now and also schedule the reliable timeout
+            // Try to grab focus now and also schedule the reliable timeout (configured)
             gtk_widget_grab_focus(entry);
-            FocusTarget* ft = new FocusTarget();
-            ft->entry = entry;
-            ft->tries = 12; // increase attempts
-            g_timeout_add(100, grab_focus_to_entry, ft);
+            schedule_focus_retries(entry, state);
             return;
         } else {
             // show error details dialog
@@ -2095,10 +3530,9 @@ static void on_add_card_ok_clicked(GtkButton *button, gpointer user_data) {
             gtk_box_append(GTK_BOX(dv), btn_close);
             // When closed, restore focus to the entry via a short timeout (avoid focus races)
             g_signal_connect(det, "destroy", G_CALLBACK(+[](GtkWidget*, gpointer user_data){
-                FocusTarget* ft = new FocusTarget();
-                ft->entry = (GtkWidget*)user_data;
-                ft->tries = 6;
-                g_timeout_add(50, grab_focus_to_entry, ft);
+                // Use a short custom schedule for quick retries after closing details
+                GtkWidget* ent = (GtkWidget*)user_data;
+                schedule_focus_retries_custom(ent, 6, 50);
             }), entry);
             g_signal_connect(btn_close, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data){
                 std::cout << "DEBUG: details dialog close button clicked, destroying window=" << user_data << "\n";
@@ -2245,10 +3679,8 @@ static void on_add_card_ok_clicked(GtkButton *button, gpointer user_data) {
                 gtk_box_append(GTK_BOX(dv), btn_close);
                 if (sctx->original_ctx) {
                     g_signal_connect(det, "destroy", G_CALLBACK(+[](GtkWidget*, gpointer user_data){
-                        FocusTarget* ft = new FocusTarget();
-                        ft->entry = (GtkWidget*)user_data;
-                        ft->tries = 12;
-                        g_timeout_add(100, grab_focus_to_entry, ft);
+                        GtkWidget* ent = (GtkWidget*)user_data;
+                        schedule_focus_retries(ent, nullptr);
                     }), sctx->original_ctx->entry);
                 }
                 g_signal_connect(btn_close, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data){
@@ -2283,10 +3715,8 @@ static void on_add_card_ok_clicked(GtkButton *button, gpointer user_data) {
                     // When the select dialog is destroyed, schedule focus retries for the
                     // original add-card entry (this avoids races with the WM).
                     g_signal_connect(select_dialog, "destroy", G_CALLBACK(+[](GtkWidget*, gpointer user_data){
-                        FocusTarget* ft = new FocusTarget();
-                        ft->entry = (GtkWidget*)user_data;
-                        ft->tries = 12;
-                        g_timeout_add(100, grab_focus_to_entry, ft);
+                        GtkWidget* ent = (GtkWidget*)user_data;
+                        schedule_focus_retries(ent, nullptr);
                     }), sctx->original_ctx->entry);
                 }
                 gtk_window_destroy(GTK_WINDOW(select_dialog));
@@ -3172,6 +4602,18 @@ static void on_export_database_action(GSimpleAction *action, GVariant *parameter
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo), "English");
     gtk_combo_box_set_active(GTK_COMBO_BOX(combo), 0);
     gtk_box_append(GTK_BOX(box), combo);
+    // Format selection for deck export
+    GtkWidget *fmt_label = gtk_label_new("Formato file:");
+    gtk_box_append(GTK_BOX(box), fmt_label);
+    GtkWidget *fmt_combo = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(fmt_combo), "Bilingue (formattato)");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(fmt_combo), "TSV - English");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(fmt_combo), "TSV - Italiano");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(fmt_combo), "CSV - English");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(fmt_combo), "CSV - Italiano");
+    gtk_combo_box_set_active(GTK_COMBO_BOX(fmt_combo), 0);
+    gtk_box_append(GTK_BOX(box), fmt_combo);
+    
     GtkWidget *button_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_box_append(GTK_BOX(box), button_box);
     GtkWidget *ok_button = gtk_button_new_with_label("Esporta");
@@ -3179,14 +4621,23 @@ static void on_export_database_action(GSimpleAction *action, GVariant *parameter
     gtk_box_append(GTK_BOX(button_box), ok_button);
     gtk_box_append(GTK_BOX(button_box), cancel_button);
 
-    struct ExportCtx { AppState* state; GtkWidget* combo; GtkWidget* dialog; };
-    ExportCtx* ctx = new ExportCtx{state, combo, dialog};
+    struct ExportCtx { AppState* state; GtkWidget* combo; GtkWidget* fmt_combo; GtkWidget* dialog; };
+    ExportCtx* ctx = new ExportCtx{state, combo, fmt_combo, dialog};
 
     g_signal_connect(ok_button, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data) {
         ExportCtx* c = (ExportCtx*)user_data;
         int idx = gtk_combo_box_get_active(GTK_COMBO_BOX(c->combo));
         std::string lang = (idx == 1) ? "en" : "it";
-        bool ok = export_cards_to_txt(c->state, false, -1, lang);
+        int fidx = gtk_combo_box_get_active(GTK_COMBO_BOX(c->fmt_combo));
+        std::string format_str = "bilingual";
+        switch(fidx) {
+            case 1: format_str = "tsv_en"; break;
+            case 2: format_str = "tsv_it"; break;
+            case 3: format_str = "csv_en"; break;
+            case 4: format_str = "csv_it"; break;
+            default: format_str = "bilingual"; break;
+        }
+        bool ok = export_cards_to_txt(c->state, false, -1, lang, format_str);
         GtkAlertDialog *alert = gtk_alert_dialog_new("%s", ok ? "Esportazione completata" : "Errore durante esportazione");
         gtk_alert_dialog_show(alert, GTK_WINDOW(c->dialog));
         g_object_unref(alert);
@@ -3231,6 +4682,17 @@ static void on_export_deck_action(GSimpleAction *action, GVariant *parameter, gp
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo), "English");
     gtk_combo_box_set_active(GTK_COMBO_BOX(combo), 0);
     gtk_box_append(GTK_BOX(box), combo);
+    // Format selection for deck export
+    GtkWidget *fmt_label = gtk_label_new("Formato file:");
+    gtk_box_append(GTK_BOX(box), fmt_label);
+    GtkWidget *fmt_combo = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(fmt_combo), "Bilingue (formattato)");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(fmt_combo), "TSV - English");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(fmt_combo), "TSV - Italiano");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(fmt_combo), "CSV - English");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(fmt_combo), "CSV - Italiano");
+    gtk_combo_box_set_active(GTK_COMBO_BOX(fmt_combo), 0);
+    gtk_box_append(GTK_BOX(box), fmt_combo);
     GtkWidget *button_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_box_append(GTK_BOX(box), button_box);
     GtkWidget *ok_button = gtk_button_new_with_label("Esporta");
@@ -3238,14 +4700,23 @@ static void on_export_deck_action(GSimpleAction *action, GVariant *parameter, gp
     gtk_box_append(GTK_BOX(button_box), ok_button);
     gtk_box_append(GTK_BOX(button_box), cancel_button);
 
-    struct ExportDeckCtx { AppState* state; GtkWidget* combo; GtkWidget* dialog; int deck_id; };
-    ExportDeckCtx* ctx = new ExportDeckCtx{state, combo, dialog, state->selected_deck_id};
+    struct ExportDeckCtx { AppState* state; GtkWidget* combo; GtkWidget* fmt_combo; GtkWidget* dialog; int deck_id; };
+    ExportDeckCtx* ctx = new ExportDeckCtx{state, combo, fmt_combo, dialog, state->selected_deck_id};
 
     g_signal_connect(ok_button, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data) {
         ExportDeckCtx* c = (ExportDeckCtx*)user_data;
         int idx = gtk_combo_box_get_active(GTK_COMBO_BOX(c->combo));
         std::string lang = (idx == 1) ? "en" : "it";
-        bool ok = export_cards_to_txt(c->state, true, c->deck_id, lang);
+        int fidx = gtk_combo_box_get_active(GTK_COMBO_BOX(c->fmt_combo));
+        std::string format_str = "bilingual";
+        switch(fidx) {
+            case 1: format_str = "tsv_en"; break;
+            case 2: format_str = "tsv_it"; break;
+            case 3: format_str = "csv_en"; break;
+            case 4: format_str = "csv_it"; break;
+            default: format_str = "bilingual"; break;
+        }
+        bool ok = export_cards_to_txt(c->state, true, c->deck_id, lang, format_str);
         GtkAlertDialog *alert = gtk_alert_dialog_new("%s", ok ? "Esportazione completata" : "Errore durante esportazione");
         gtk_alert_dialog_show(alert, GTK_WINDOW(c->dialog));
         g_object_unref(alert);
@@ -3310,6 +4781,57 @@ static void on_filters_action(GSimpleAction *action, GVariant *parameter, gpoint
     if (state->filter_rarities.count("rare")) gtk_check_button_set_active(GTK_CHECK_BUTTON(chk_rare), TRUE);
     if (state->filter_rarities.count("mythic")) gtk_check_button_set_active(GTK_CHECK_BUTTON(chk_mythic), TRUE);
 
+    // Types
+    GtkWidget *type_frame = gtk_frame_new("Tipo");
+    GtkWidget *type_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_frame_set_child(GTK_FRAME(type_frame), type_box);
+    // We store filter keys in English internally; labels are localized via translate_type
+    GtkWidget *chk_creature = gtk_check_button_new_with_label(translate_type("Creature").c_str());
+    GtkWidget *chk_legendary_creature = gtk_check_button_new_with_label(translate_type("Legendary Creature").c_str());
+    GtkWidget *chk_instant = gtk_check_button_new_with_label(translate_type("Instant").c_str());
+    GtkWidget *chk_sorcery = gtk_check_button_new_with_label(translate_type("Sorcery").c_str());
+    GtkWidget *chk_artifact = gtk_check_button_new_with_label(translate_type("Artifact").c_str());
+    GtkWidget *chk_enchantment = gtk_check_button_new_with_label(translate_type("Enchantment").c_str());
+    GtkWidget *chk_land = gtk_check_button_new_with_label(translate_type("Land").c_str());
+    GtkWidget *chk_planeswalker = gtk_check_button_new_with_label(translate_type("Planeswalker").c_str());
+    GtkWidget *chk_token = gtk_check_button_new_with_label(translate_type("Token").c_str());
+    GtkWidget *chk_emblem = gtk_check_button_new_with_label(translate_type("Emblem").c_str());
+    gtk_box_append(GTK_BOX(type_box), chk_creature);
+    gtk_box_append(GTK_BOX(type_box), chk_legendary_creature);
+    gtk_box_append(GTK_BOX(type_box), chk_instant);
+    gtk_box_append(GTK_BOX(type_box), chk_sorcery);
+    gtk_box_append(GTK_BOX(type_box), chk_artifact);
+    gtk_box_append(GTK_BOX(type_box), chk_enchantment);
+    gtk_box_append(GTK_BOX(type_box), chk_land);
+    gtk_box_append(GTK_BOX(type_box), chk_planeswalker);
+    gtk_box_append(GTK_BOX(type_box), chk_token);
+    gtk_box_append(GTK_BOX(type_box), chk_emblem);
+    // Initialize from state (filter keys are English)
+    if (state->filter_types.count("Creature")) gtk_check_button_set_active(GTK_CHECK_BUTTON(chk_creature), TRUE);
+    if (state->filter_types.count("Legendary Creature")) gtk_check_button_set_active(GTK_CHECK_BUTTON(chk_legendary_creature), TRUE);
+    if (state->filter_types.count("Instant")) gtk_check_button_set_active(GTK_CHECK_BUTTON(chk_instant), TRUE);
+    if (state->filter_types.count("Sorcery")) gtk_check_button_set_active(GTK_CHECK_BUTTON(chk_sorcery), TRUE);
+    if (state->filter_types.count("Artifact")) gtk_check_button_set_active(GTK_CHECK_BUTTON(chk_artifact), TRUE);
+    if (state->filter_types.count("Enchantment")) gtk_check_button_set_active(GTK_CHECK_BUTTON(chk_enchantment), TRUE);
+    if (state->filter_types.count("Land")) gtk_check_button_set_active(GTK_CHECK_BUTTON(chk_land), TRUE);
+    if (state->filter_types.count("Planeswalker")) gtk_check_button_set_active(GTK_CHECK_BUTTON(chk_planeswalker), TRUE);
+    if (state->filter_types.count("Token")) gtk_check_button_set_active(GTK_CHECK_BUTTON(chk_token), TRUE);
+    if (state->filter_types.count("Emblem")) gtk_check_button_set_active(GTK_CHECK_BUTTON(chk_emblem), TRUE);
+
+    // Custom type entry (allows adding arbitrary type substrings to filter)
+    GtkWidget *custom_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    GtkWidget *custom_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(custom_entry), "Aggiungi tipo (es. 'Vehicle' o 'Creatura')");
+    GtkWidget *custom_add = gtk_button_new_with_label("Aggiungi");
+    gtk_box_append(GTK_BOX(custom_box), custom_entry);
+    gtk_box_append(GTK_BOX(custom_box), custom_add);
+    // A small label showing currently active custom types (not in the built-in list)
+    GtkWidget *custom_label = gtk_label_new("");
+    gtk_widget_set_halign(custom_label, GTK_ALIGN_START);
+    // Pack the custom controls under the types frame
+    gtk_box_append(GTK_BOX(type_box), custom_box);
+    gtk_box_append(GTK_BOX(type_box), custom_label);
+
     // Foil selector (All / Only Foil / Only Non-Foil)
     GtkWidget *foil_frame = gtk_frame_new("Foil");
     GtkWidget *foil_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
@@ -3326,6 +4848,8 @@ static void on_filters_action(GSimpleAction *action, GVariant *parameter, gpoint
     // Pack frames
     gtk_box_append(GTK_BOX(vbox), colors_frame);
     gtk_box_append(GTK_BOX(vbox), rar_frame);
+    // Types frame
+    gtk_box_append(GTK_BOX(vbox), type_frame);
     gtk_box_append(GTK_BOX(vbox), foil_frame);
 
     // Deck membership filter (only show cards not in any deck)
@@ -3352,10 +4876,15 @@ static void on_filters_action(GSimpleAction *action, GVariant *parameter, gpoint
         GtkWidget* dialog;
         GtkWidget* chk_w; GtkWidget* chk_u; GtkWidget* chk_b; GtkWidget* chk_r; GtkWidget* chk_g;
         GtkWidget* chk_common; GtkWidget* chk_uncommon; GtkWidget* chk_rare; GtkWidget* chk_mythic;
+        // Type checkbuttons
+        GtkWidget* chk_creature; GtkWidget* chk_legendary_creature; GtkWidget* chk_instant; GtkWidget* chk_sorcery; GtkWidget* chk_artifact; GtkWidget* chk_enchantment; GtkWidget* chk_land; GtkWidget* chk_planeswalker; GtkWidget* chk_token; GtkWidget* chk_emblem;
         GtkWidget* foil_combo;
         GtkWidget* chk_not_in_deck;
+        // custom type widgets
+        GtkWidget* custom_entry;
+        GtkWidget* custom_label;
     };
-    FiltersCtx* ctx = new FiltersCtx{state, dialog, chk_w, chk_u, chk_b, chk_r, chk_g, chk_common, chk_uncommon, chk_rare, chk_mythic, foil_combo, chk_not_in_deck};
+    FiltersCtx* ctx = new FiltersCtx{state, dialog, chk_w, chk_u, chk_b, chk_r, chk_g, chk_common, chk_uncommon, chk_rare, chk_mythic, chk_creature, chk_legendary_creature, chk_instant, chk_sorcery, chk_artifact, chk_enchantment, chk_land, chk_planeswalker, chk_token, chk_emblem, foil_combo, chk_not_in_deck, custom_entry, custom_label};
     g_signal_connect(ok_button, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data) {
         FiltersCtx* c = (FiltersCtx*)user_data;
         AppState* st = c->state;
@@ -3372,6 +4901,18 @@ static void on_filters_action(GSimpleAction *action, GVariant *parameter, gpoint
     if (gtk_check_button_get_active(GTK_CHECK_BUTTON(c->chk_uncommon))) st->filter_rarities.insert("uncommon");
     if (gtk_check_button_get_active(GTK_CHECK_BUTTON(c->chk_rare))) st->filter_rarities.insert("rare");
     if (gtk_check_button_get_active(GTK_CHECK_BUTTON(c->chk_mythic))) st->filter_rarities.insert("mythic");
+        // Types (store English keys)
+        st->filter_types.clear();
+    if (gtk_check_button_get_active(GTK_CHECK_BUTTON(c->chk_creature))) st->filter_types.insert("Creature");
+    if (gtk_check_button_get_active(GTK_CHECK_BUTTON(c->chk_legendary_creature))) st->filter_types.insert("Legendary Creature");
+    if (gtk_check_button_get_active(GTK_CHECK_BUTTON(c->chk_instant))) st->filter_types.insert("Instant");
+    if (gtk_check_button_get_active(GTK_CHECK_BUTTON(c->chk_sorcery))) st->filter_types.insert("Sorcery");
+    if (gtk_check_button_get_active(GTK_CHECK_BUTTON(c->chk_artifact))) st->filter_types.insert("Artifact");
+    if (gtk_check_button_get_active(GTK_CHECK_BUTTON(c->chk_enchantment))) st->filter_types.insert("Enchantment");
+    if (gtk_check_button_get_active(GTK_CHECK_BUTTON(c->chk_land))) st->filter_types.insert("Land");
+    if (gtk_check_button_get_active(GTK_CHECK_BUTTON(c->chk_planeswalker))) st->filter_types.insert("Planeswalker");
+    if (gtk_check_button_get_active(GTK_CHECK_BUTTON(c->chk_token))) st->filter_types.insert("Token");
+    if (gtk_check_button_get_active(GTK_CHECK_BUTTON(c->chk_emblem))) st->filter_types.insert("Emblem");
     // Foil
     int idx = gtk_combo_box_get_active(GTK_COMBO_BOX(c->foil_combo));
     if (idx == 0) st->filter_foil = -1;
@@ -3380,6 +4921,25 @@ static void on_filters_action(GSimpleAction *action, GVariant *parameter, gpoint
         // Deckless filter
         gboolean no_deck_active = gtk_check_button_get_active(GTK_CHECK_BUTTON(c->chk_not_in_deck));
         st->filter_no_deck = no_deck_active ? true : false;
+        // Also accept any custom type text in the entry as an additional filter
+        if (c->custom_entry) {
+            const char* txt = gtk_editable_get_text(GTK_EDITABLE(c->custom_entry));
+            if (txt && *txt) {
+                std::string s = txt;
+                // Trim
+                while (!s.empty() && isspace((unsigned char)s.back())) s.pop_back();
+                while (!s.empty() && isspace((unsigned char)s.front())) s.erase(s.begin());
+                if (!s.empty()) {
+                    // If user typed localized name (Italian), try to find English key
+                    std::string key = s;
+                    if (get_current_language() == "it") {
+                        std::string eng = english_for_localized_type(s);
+                        if (!eng.empty()) key = eng;
+                    }
+                    st->filter_types.insert(key);
+                }
+            }
+        }
         refresh_card_list(st);
         if (c->dialog) gtk_window_destroy(GTK_WINDOW(c->dialog));
         delete c;
@@ -3390,8 +4950,11 @@ static void on_filters_action(GSimpleAction *action, GVariant *parameter, gpoint
         AppState* st = c->state;
         st->filter_colors.clear();
         st->filter_rarities.clear();
+        st->filter_types.clear();
         st->filter_foil = -1;
         st->filter_no_deck = false;
+        // clear custom label
+        if (c->custom_label) gtk_label_set_text(GTK_LABEL(c->custom_label), "");
         refresh_card_list(st);
         if (c->dialog) gtk_window_destroy(GTK_WINDOW(c->dialog));
         delete c;
@@ -3401,6 +4964,37 @@ static void on_filters_action(GSimpleAction *action, GVariant *parameter, gpoint
         FiltersCtx* c = (FiltersCtx*)user_data;
         if (c->dialog) gtk_window_destroy(GTK_WINDOW(c->dialog));
         delete c;
+    }), ctx);
+
+    // Wire the Add button: insert custom type immediately and update label
+    g_signal_connect(custom_add, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data){
+        FiltersCtx* c = (FiltersCtx*)user_data;
+        if (!c) return;
+        const char* txt = gtk_editable_get_text(GTK_EDITABLE(c->custom_entry));
+        if (!txt || !*txt) return;
+        std::string s = txt;
+        // Trim
+        while (!s.empty() && isspace((unsigned char)s.back())) s.pop_back();
+        while (!s.empty() && isspace((unsigned char)s.front())) s.erase(s.begin());
+        if (s.empty()) return;
+        std::string key = s;
+        if (get_current_language() == "it") {
+            std::string eng = english_for_localized_type(s);
+            if (!eng.empty()) key = eng;
+        }
+        c->state->filter_types.insert(key);
+        // Update custom label to show active custom types
+        std::string list;
+        for (const auto &t : c->state->filter_types) {
+            // skip built-ins
+            if (type_translations.count(t)) continue;
+            if (!list.empty()) list += ", ";
+            list += t;
+        }
+        if (list.empty()) gtk_label_set_text(GTK_LABEL(c->custom_label), ""); else gtk_label_set_text(GTK_LABEL(c->custom_label), list.c_str());
+        // Clear entry and refresh view
+        gtk_editable_set_text(GTK_EDITABLE(c->custom_entry), "");
+        refresh_card_list(c->state);
     }), ctx);
 
     gtk_window_present(GTK_WINDOW(dialog));
@@ -3517,23 +5111,8 @@ static std::string translate_type(const char* type) {
     if (!type) return "";
     std::string t = type;
     if (current_language == "en") return t;
-    static std::map<std::string, std::string> translations = {
-        {"Creature", "Creatura"},
-        {"Instant", "Istantaneo"},
-        {"Sorcery", "Stregoneria"},
-        {"Artifact", "Artefatto"},
-        {"Enchantment", "Incantesimo"},
-        {"Land", "Terra"},
-        {"Planeswalker", "Planeswalker"},
-        {"Legendary Creature", "Creatura Leggendaria"},
-        {"Legendary Artifact", "Artefatto Leggendario"},
-        {"Basic Land", "Terra Base"},
-        {"Snow Land", "Terra Neve"},
-        {"Token", "Token"},
-        {"Emblem", "Emblema"}
-    };
-    auto it = translations.find(t);
-    if (it != translations.end()) return it->second;
+    auto it = type_translations.find(t);
+    if (it != type_translations.end()) return it->second;
     return t; // Se non trovato, restituisci originale
 }
 
@@ -3668,8 +5247,14 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     state->db_button = NULL;
     state->filter_colors.clear();
     state->filter_rarities.clear();
+    state->filter_types.clear();
     state->filter_foil = -1;
     state->filter_no_deck = false;
+    // Load persisted settings (notifications, focus retry defaults, etc.)
+    load_settings();
+    // Initialize AppState with loaded defaults
+    state->focus_retry_tries = g_focus_retry_tries_default > 0 ? g_focus_retry_tries_default : 12;
+    state->focus_retry_interval_ms = g_focus_retry_interval_ms_default > 0 ? g_focus_retry_interval_ms_default : 100;
 
     // Bottone per aggiungere una nuova carta
     GtkWidget *add_card_button = gtk_button_new_with_label("Nuova Carta");
@@ -3735,6 +5320,7 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     // Add extra translations map entries (kept separate for clarity)
     __add_extra_translations();
     __add_more_translations();
+    __add_settings_translations();
     // Ensure menus reflect current language
     rebuild_menus_for_language(state);
     // Populate initial deck menu (if DB already open later we'll re-populate)
@@ -4182,9 +5768,15 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
             gtk_list_item_set_selectable(item, FALSE);
             return;
         }
-        char qty[16];
-        snprintf(qty, sizeof(qty), "%d", row->quantity);
-        gtk_label_set_text(GTK_LABEL(label), qty);
+        // Prefer a precomputed display string when available (shows "no-deck / total"),
+        // otherwise fall back to the integer quantity.
+        if (row->quantity_display && row->quantity_display[0]) {
+            gtk_label_set_text(GTK_LABEL(label), row->quantity_display);
+        } else {
+            char qty[16];
+            snprintf(qty, sizeof(qty), "%d", row->quantity);
+            gtk_label_set_text(GTK_LABEL(label), qty);
+        }
         if (row->foil) gtk_widget_add_css_class(label, "foil"); else gtk_widget_remove_css_class(label, "foil");
         // Aggiungi gesture per click destro
         GtkGesture *gesture = gtk_gesture_click_new();
@@ -4268,6 +5860,55 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     if (state->deck_label) gtk_box_append(GTK_BOX(bottom_box), state->deck_label);
     gtk_box_append(GTK_BOX(bottom_box), state->total_cards_label);
     gtk_box_append(GTK_BOX(bottom_box), state->filter_label);
+    // Pagination controls (Prev / Page X/Y / Next) and page size selector
+    // Initialize pagination state defaults (0 = view all)
+    state->page_size = g_page_size_default; // 0 means 'All rows'
+    state->current_page = 0;
+    state->total_rows = 0;
+    // Prev button
+    GtkWidget *prev_btn = gtk_button_new_with_label("◀");
+    gtk_widget_set_tooltip_text(prev_btn, "Previous page");
+    gtk_box_append(GTK_BOX(bottom_box), prev_btn);
+    // Page label
+    GtkWidget *page_lbl = gtk_label_new("Page 1/1");
+    gtk_box_append(GTK_BOX(bottom_box), page_lbl);
+    // Next button
+    GtkWidget *next_btn = gtk_button_new_with_label("▶");
+    gtk_widget_set_tooltip_text(next_btn, "Next page");
+    gtk_box_append(GTK_BOX(bottom_box), next_btn);
+    // Page size combo
+    GtkWidget *ps_combo = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ps_combo), "10");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ps_combo), "25");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ps_combo), "50");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ps_combo), "100");
+    // Set active index based on loaded page size (if not 'All')
+    int active_idx = 2; // default -> 50
+    if (state->page_size == 10) active_idx = 0;
+    else if (state->page_size == 25) active_idx = 1;
+    else if (state->page_size == 50) active_idx = 2;
+    else if (state->page_size == 100) active_idx = 3;
+    gtk_combo_box_set_active(GTK_COMBO_BOX(ps_combo), active_idx);
+    gtk_widget_set_tooltip_text(ps_combo, "Rows per page");
+    gtk_box_append(GTK_BOX(bottom_box), ps_combo);
+    // 'View All' toggle: when active, page_size == 0 and pagination is disabled
+    GtkWidget *all_toggle = gtk_toggle_button_new_with_label("All");
+    gtk_widget_set_tooltip_text(all_toggle, "Toggle view all rows (no pagination)");
+    if (state->page_size == 0) gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(all_toggle), TRUE);
+    gtk_box_append(GTK_BOX(bottom_box), all_toggle);
+    // Save widget refs in state
+    state->prev_page_button = prev_btn;
+    state->next_page_button = next_btn;
+    state->page_label = page_lbl;
+    state->page_size_combo = ps_combo;
+    state->view_all_toggle = all_toggle;
+
+    // Connect signals for pagination controls
+    g_signal_connect(prev_btn, "clicked", G_CALLBACK(on_prev_page_clicked), window);
+    g_signal_connect(next_btn, "clicked", G_CALLBACK(on_next_page_clicked), window);
+    g_signal_connect(ps_combo, "changed", G_CALLBACK(on_page_size_changed), window);
+    g_signal_connect(all_toggle, "toggled", G_CALLBACK(on_view_all_toggled), window);
+
     gtk_box_append(GTK_BOX(vbox), bottom_box);
     gtk_window_set_child(GTK_WINDOW(window), vbox);
     // Salva lo stato globale nella finestra principale
@@ -4394,6 +6035,34 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     g_signal_connect(filters_action, "activate", G_CALLBACK(on_filters_action), window);
     g_action_map_add_action(G_ACTION_MAP(app), G_ACTION(filters_action));
 
+    // Stateful desktop notifications action (boolean state) and Preferences
+    GSimpleAction *notifications_action = g_simple_action_new_stateful("notifications", G_VARIANT_TYPE_BOOLEAN, g_variant_new_boolean(g_notifications_enabled));
+    g_signal_connect(notifications_action, "activate", G_CALLBACK(+[](GSimpleAction *action, GVariant *parameter, gpointer user_data) {
+        GtkWindow *window = GTK_WINDOW(user_data);
+        AppState* state = (AppState*)g_object_get_data(G_OBJECT(window), "app_state");
+        // Toggle the boolean state
+        GVariant *cur = g_action_get_state(G_ACTION(action));
+        gboolean val = FALSE;
+        if (cur) { val = g_variant_get_boolean(cur); g_variant_unref(cur); }
+        gboolean next = !val;
+        g_simple_action_set_state(action, g_variant_new_boolean(next));
+        g_notifications_enabled = next;
+        save_settings();
+        // Rebuild view menu to ensure labels/localization updated
+        rebuild_menus_for_language(state);
+    }), window);
+    g_action_map_add_action(G_ACTION_MAP(app), G_ACTION(notifications_action));
+
+    // Preferences action to show a small dialog for notification and focus retry settings
+    GSimpleAction *preferences_action = g_simple_action_new("preferences", NULL);
+    g_signal_connect(preferences_action, "activate", G_CALLBACK(on_preferences_action), window);
+    g_action_map_add_action(G_ACTION_MAP(app), G_ACTION(preferences_action));
+
+    // Rebuild menus now that actions (including stateful notifications) are registered
+    // This ensures menu items referencing app.notifications and app.preferences
+    // are active/clickable from the first presentation of the UI.
+    rebuild_menus_for_language(state);
+
     // Azioni per ordinamento
     GSimpleAction *sort_name_asc = g_simple_action_new("sort.name.asc", NULL);
     g_signal_connect(sort_name_asc, "activate", G_CALLBACK(+[](GSimpleAction *, GVariant *, gpointer user_data) {
@@ -4511,6 +6180,18 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     g_signal_connect(add_card_action, "activate", G_CALLBACK(on_add_card_action), window);
     g_action_map_add_action(G_ACTION_MAP(app), G_ACTION(add_card_action));
 
+    // Azione per mettere a fuoco il campo di ricerca (scorciatoia Ctrl+F)
+    GSimpleAction *search_action = g_simple_action_new("search_card", NULL);
+    g_signal_connect(search_action, "activate", G_CALLBACK(+[](GSimpleAction *, GVariant *, gpointer user_data) {
+        GtkWindow *window = GTK_WINDOW(user_data);
+        AppState* state = (AppState*)g_object_get_data(G_OBJECT(window), "app_state");
+        if (state && state->search_entry) {
+            // Use the robust focus helper to retry if necessary
+            schedule_focus_retries(state->search_entry, state);
+        }
+    }), window);
+    g_action_map_add_action(G_ACTION_MAP(app), G_ACTION(search_action));
+
     // Azione per eliminare riga selezionata
     GSimpleAction *delete_selected_action = g_simple_action_new("delete_selected", NULL);
     g_signal_connect(delete_selected_action, "activate", G_CALLBACK(+[](GSimpleAction *, GVariant *, gpointer user_data) {
@@ -4553,6 +6234,9 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     // Imposta acceleratori
     gtk_application_set_accels_for_action(app, "app.add_card", (const char*[]){"<Control>n", NULL});
     gtk_application_set_accels_for_action(app, "app.delete_selected", (const char*[]){"Delete", NULL});
+    // Keyboard accelerators for search and preferences
+    gtk_application_set_accels_for_action(app, "app.search_card", (const char*[]){"<Control>f", NULL});
+    gtk_application_set_accels_for_action(app, "app.preferences", (const char*[]){"<Control>comma", NULL});
 
     // Carica ultimo database usato
     std::ifstream lastdb("lastdb.txt");

@@ -7,6 +7,12 @@
 #include <string>
 #include <ctime>
 #include <cstring>
+#include <dirent.h>
+#include <algorithm>
+#include <fstream>
+#include <chrono>
+#include <sstream>
+#include <iomanip>
 
 
 #include "database.h"
@@ -284,6 +290,157 @@ Database::Database(const std::string& db_path) : db(nullptr) {
                     if (sqlite3_exec(db, populate_fts, nullptr, nullptr, &errx) != SQLITE_OK) {
                         if (errx) sqlite3_free(errx);
                     }
+                }
+                // Performance tuning: set safe pragmas and create useful indexes
+                // These are non-breaking and use IF NOT EXISTS where applicable.
+                errx = nullptr;
+                // Use WAL for better concurrency and usually faster writes; ignore failures on older SQLite builds
+                if (sqlite3_exec(db, "PRAGMA journal_mode = WAL;", nullptr, nullptr, &errx) != SQLITE_OK) {
+                    if (errx) { std::cerr << "Warning: could not set journal_mode=WAL: " << errx << std::endl; sqlite3_free(errx); }
+                } else {
+                    // reset errx if successful
+                    errx = nullptr;
+                }
+                // Make trade-offs for desktop app: faster sync
+                sqlite3_exec(db, "PRAGMA synchronous = NORMAL;", nullptr, nullptr, nullptr);
+                sqlite3_exec(db, "PRAGMA temp_store = MEMORY;", nullptr, nullptr, nullptr);
+
+                // Create indexes to speed up common queries (name lookups, filters by deck/set/date/foil)
+                const char* idxs[] = {
+                    "CREATE INDEX IF NOT EXISTS idx_cards_deck_id ON cards (deck_id)",
+                    "CREATE INDEX IF NOT EXISTS idx_cards_deck_side ON cards (deck_id, sideboard)",
+                    "CREATE INDEX IF NOT EXISTS idx_cards_set_code ON cards (set_code)",
+                    "CREATE INDEX IF NOT EXISTS idx_cards_added_date ON cards (added_date)",
+                    "CREATE INDEX IF NOT EXISTS idx_cards_foil ON cards (foil)",
+                    "CREATE INDEX IF NOT EXISTS idx_cards_name ON cards (name)",
+                    "CREATE INDEX IF NOT EXISTS idx_cards_english_name ON cards (english_name)",
+                    "CREATE INDEX IF NOT EXISTS idx_cards_localized_name ON cards (localized_name)"
+                };
+                for (const char* idx_sql : idxs) {
+                    char* ierr = nullptr;
+                    if (sqlite3_exec(db, idx_sql, nullptr, nullptr, &ierr) != SQLITE_OK) {
+                        if (ierr) {
+                            std::cerr << "Warning creating index: " << ierr << " for stmt: " << idx_sql << std::endl;
+                            sqlite3_free(ierr);
+                        }
+                    }
+                }
+                // Run ANALYZE once to collect statistics for the query planner (best-effort)
+                errx = nullptr;
+                if (sqlite3_exec(db, "ANALYZE;", nullptr, nullptr, &errx) != SQLITE_OK) {
+                    if (errx) { sqlite3_free(errx); }
+                }
+
+                // --- Ensure migrations table exists (to track applied .sql files) ---
+                const char* create_migrations_tbl = "CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY, applied_at TEXT)";
+                errx = nullptr;
+                if (sqlite3_exec(db, create_migrations_tbl, nullptr, nullptr, &errx) != SQLITE_OK) {
+                    if (errx) { std::cerr << "Warning: could not create migrations table: " << errx << std::endl; sqlite3_free(errx); }
+                }
+
+                // --- Apply any SQL migration files found under data/migrations/ (lexicographic order) ---
+                const std::string migrations_dir = "data/migrations";
+                DIR* d = opendir(migrations_dir.c_str());
+                if (d) {
+                    std::vector<std::string> files;
+                    struct dirent* de;
+                    while ((de = readdir(d)) != nullptr) {
+                        std::string name = de->d_name;
+                        if (name.size() > 4 && name.substr(name.size()-4) == ".sql") files.push_back(name);
+                    }
+                    closedir(d);
+                    std::sort(files.begin(), files.end());
+                    for (const auto &fname : files) {
+                        // Check if already applied
+                        sqlite3_stmt* chk = nullptr;
+                        std::string chk_sql = "SELECT name FROM migrations WHERE name = ? LIMIT 1";
+                        if (sqlite3_prepare_v2(db, chk_sql.c_str(), -1, &chk, nullptr) != SQLITE_OK) continue;
+                        sqlite3_bind_text(chk, 1, fname.c_str(), -1, SQLITE_TRANSIENT);
+                        int rc = sqlite3_step(chk);
+                        bool applied = (rc == SQLITE_ROW);
+                        sqlite3_finalize(chk);
+                        if (applied) continue;
+                        // Read file content
+                        std::string path = migrations_dir + "/" + fname;
+                        std::ifstream ifs(path);
+                        if (!ifs) {
+                            std::cerr << "Warning: could not open migration file: " << path << std::endl;
+                            continue;
+                        }
+                        std::stringstream buf;
+                        buf << ifs.rdbuf();
+                        std::string sql = buf.str();
+                        if (sql.empty()) continue;
+                        char* merr = nullptr;
+                        if (sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &merr) != SQLITE_OK) {
+                            std::cerr << "Error applying migration " << fname << ": " << (merr ? merr : (char*)"unknown") << std::endl;
+                            if (merr) sqlite3_free(merr);
+                            // stop on first failing migration to avoid partial state
+                            break;
+                        }
+                        // Record applied migration with timestamp
+                        char timebuf[32] = {0};
+                        time_t now = time(nullptr);
+                        struct tm local_tm{};
+#if defined(_MSC_VER)
+                        localtime_s(&local_tm, &now);
+#else
+                        localtime_r(&now, &local_tm);
+#endif
+                        strftime(timebuf, sizeof(timebuf), "%Y-%m-%dT%H:%M:%S", &local_tm);
+                        const char* ins = "INSERT INTO migrations (name, applied_at) VALUES (?, ?)";
+                        sqlite3_stmt* pins = nullptr;
+                        if (sqlite3_prepare_v2(db, ins, -1, &pins, nullptr) == SQLITE_OK) {
+                            sqlite3_bind_text(pins, 1, fname.c_str(), -1, SQLITE_TRANSIENT);
+                            sqlite3_bind_text(pins, 2, timebuf, -1, SQLITE_TRANSIENT);
+                            sqlite3_step(pins);
+                            sqlite3_finalize(pins);
+                        }
+                    }
+                }
+
+                // --- If FTS table exists, ensure triggers keep it in sync (create if missing) ---
+                bool has_fts2 = false;
+                sqlite3_stmt* s2 = nullptr;
+                const char* q2 = "SELECT name FROM sqlite_master WHERE type='table' AND name='cards_fts'";
+                if (sqlite3_prepare_v2(db, q2, -1, &s2, nullptr) == SQLITE_OK) {
+                    if (sqlite3_step(s2) == SQLITE_ROW) has_fts2 = true;
+                    sqlite3_finalize(s2);
+                }
+                if (has_fts2) {
+                    // Helper to check/create trigger
+                    auto ensure_trigger = [&](const char* trig_name, const char* trig_sql) {
+                        sqlite3_stmt* tchk = nullptr;
+                        std::string tchk_q = std::string("SELECT name FROM sqlite_master WHERE type='trigger' AND name='") + trig_name + "'";
+                        if (sqlite3_prepare_v2(db, tchk_q.c_str(), -1, &tchk, nullptr) == SQLITE_OK) {
+                            bool exists = false;
+                            if (sqlite3_step(tchk) == SQLITE_ROW) exists = true;
+                            sqlite3_finalize(tchk);
+                            if (!exists) {
+                                char* terr = nullptr;
+                                if (sqlite3_exec(db, trig_sql, nullptr, nullptr, &terr) != SQLITE_OK) {
+                                    if (terr) { std::cerr << "Warning creating trigger " << trig_name << ": " << terr << std::endl; sqlite3_free(terr); }
+                                }
+                            }
+                        }
+                    };
+
+                    const char* trig_ins =
+                        "CREATE TRIGGER trg_cards_ai AFTER INSERT ON cards BEGIN "
+                        "INSERT INTO cards_fts(rowid, name, type, mana_cost, rarity, set_code) VALUES (new.id, COALESCE(new.english_name, new.localized_name, new.name), new.type, new.mana_cost, new.rarity, new.set_code); "
+                        "END;";
+                    const char* trig_upd =
+                        "CREATE TRIGGER trg_cards_au AFTER UPDATE ON cards BEGIN "
+                        "DELETE FROM cards_fts WHERE rowid = old.id; "
+                        "INSERT INTO cards_fts(rowid, name, type, mana_cost, rarity, set_code) VALUES (new.id, COALESCE(new.english_name, new.localized_name, new.name), new.type, new.mana_cost, new.rarity, new.set_code); "
+                        "END;";
+                    const char* trig_del =
+                        "CREATE TRIGGER trg_cards_ad AFTER DELETE ON cards BEGIN "
+                        "DELETE FROM cards_fts WHERE rowid = old.id; "
+                        "END;";
+                    ensure_trigger("trg_cards_ai", trig_ins);
+                    ensure_trigger("trg_cards_au", trig_upd);
+                    ensure_trigger("trg_cards_ad", trig_del);
                 }
             } else {
                 sqlite3_finalize(stmt);

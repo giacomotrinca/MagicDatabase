@@ -27,6 +27,28 @@ Features
 - Filters by color, rarity and foil; text search
 - Mana-curve analysis per deck (chart + statistics) and export (PNG, PDF, text)
 
+What's new (Oct 2025)
+----------------------
+
+- Improved Mana Curve preview:
+  - The "Curva Mana" dialog now computes the curve on-the-fly from the current view/filters (works for both the main DB view and per-deck views).
+  - Three curve modes are available: "Totale" (overall), "Tipo" (by card type), and "Colore" (by mana color). Use the buttons above the chart to switch between them.
+  - The chart is enclosed in a styled frame with margins for a cleaner preview.
+- Visual and data behavior:
+  - Type plots now exclude Lands (they are folded into "Other").
+  - Color plots use mana-accurate colors: White shown as grey dashed, Blue/Black/Red/Green use the expected hues, and Colorless (incolore) is magenta.
+  - Empty type/color series are not plotted and the corresponding mode buttons are disabled when no data is available.
+  - Y-axis tick labels have been added to the multi-series plots for easier reading.
+- Export and dialog improvements:
+  - Export options remain available (PNG/PDF/TXT) and are accessible from the preview dialog.
+  - Export and Close buttons are displayed in a compact column on the right of the preview; top control buttons are compact as well.
+  - The preview dialog attempts to fit its contents (no oversized fixed window), and the preview surface is pre-rendered for snappy switching between modes.
+- Other UX & performance tweaks:
+  - The per-page size and "View All" behavior are persisted between runs.
+  - Thumbnails are prefetched asynchronously for faster list navigation.
+  - The textual statistics panel has been simplified (the raw distribution line removed) and provides per-bucket lists in the exported text report.
+
+
 Quick start
 -----------
 
