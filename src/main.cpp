@@ -502,6 +502,76 @@ static gboolean grab_focus_idle(gpointer data) {
     return G_SOURCE_REMOVE;
 }
 
+// Helper used to reliably restore focus to the Add-Card entry after a transient
+// dialog closes. Using a short timeout (instead of an idle) avoids races where
+// another widget (or the window manager) steals focus immediately after the
+// dialog destruction.
+struct FocusTarget {
+    GtkWidget* entry;
+    int tries;
+};
+
+// Try to grab focus multiple times (short retries) to overcome races where the
+// window manager or other widgets steal focus when dialogs close.
+static gboolean grab_focus_to_entry(gpointer data) {
+    FocusTarget* ft = (FocusTarget*)data;
+    if (!ft) return G_SOURCE_REMOVE;
+    GtkWidget* entry = ft->entry;
+    if (entry && GTK_IS_WIDGET(entry)) {
+        // Ensure parent window is presented (helps when WM focus policy is odd)
+        GtkWindow* win = GTK_WINDOW(gtk_widget_get_ancestor(entry, GTK_TYPE_WINDOW));
+        if (win && GTK_IS_WINDOW(win)) {
+            gtk_window_present(win);
+        }
+        std::cout << "DEBUG: grab_focus_to_entry attempt=" << ft->tries << " focusing entry=" << entry << " type=" << G_OBJECT_TYPE_NAME(entry) << "\n";
+        // If already focused, we're done
+        if (win && GTK_IS_WINDOW(win)) {
+            GtkWidget* cur = gtk_window_get_focus(win);
+            if (cur == entry) {
+                if (GTK_IS_EDITABLE(entry)) gtk_editable_select_region(GTK_EDITABLE(entry), 0, -1);
+                delete ft;
+                return G_SOURCE_REMOVE;
+            }
+        }
+        // Try to grab focus now
+        gtk_widget_grab_focus(entry);
+        if (GTK_IS_EDITABLE(entry)) gtk_editable_select_region(GTK_EDITABLE(entry), 0, -1);
+        // Diagnostics: print which widget holds focus after the grab attempt
+        GtkWidget* cur_after = NULL;
+        if (win && GTK_IS_WINDOW(win)) cur_after = gtk_window_get_focus(win);
+        std::cout << "DEBUG: grab_focus_to_entry after grab: current_focus=" << cur_after << " type=" << (cur_after ? G_OBJECT_TYPE_NAME(cur_after) : "NULL") << " window=" << win << "\n";
+    } else {
+        std::cout << "DEBUG: grab_focus_to_entry called with invalid entry pointer=" << entry << "\n";
+        delete ft;
+        return G_SOURCE_REMOVE;
+    }
+
+    ft->tries -= 1;
+    if (ft->tries <= 0) {
+        delete ft;
+        return G_SOURCE_REMOVE;
+    }
+    return G_SOURCE_CONTINUE; // keep the timeout running
+}
+
+// Send a desktop notification using notify-send. Uses g_shell_quote to safely
+// quote title/body and g_spawn_command_line_async to invoke the command.
+static void send_notification(const std::string& title, const std::string& body) {
+    GError* error = NULL;
+    gchar* qtitle = g_shell_quote(title.c_str());
+    gchar* qbody = g_shell_quote(body.c_str());
+    gchar* cmd = g_strdup_printf("notify-send %s %s", qtitle, qbody);
+    gboolean ok = g_spawn_command_line_async(cmd, &error);
+    if (!ok) {
+        std::cout << "DEBUG: notify-send failed: " << (error ? error->message : "unknown") << "\n";
+        if (error) g_error_free(error);
+    }
+    g_free(cmd);
+    g_free(qtitle);
+    g_free(qbody);
+}
+
+
 struct AppState {
     std::string db_path;
     Database* db;
@@ -578,6 +648,10 @@ static GtkWidget* create_styled_dialog(GtkWindow* parent, int width = -1, int he
 // Export helper: queries cards (optionally filtered by deck) and writes a TXT file.
 // If 'deck' is true, deck_id must be provided and file is named <deckname>_data.txt
 // Otherwise file is data/tot_database.txt
+// Forward-declare load_cards_from_db with the new only_no_deck parameter so
+// this export helper (which appears earlier in the file) can call it.
+static std::vector<std::map<std::string, std::string>> load_cards_from_db(Database* db, const std::string& filter, int deck_filter, bool only_no_deck);
+
 static bool export_cards_to_txt(AppState* state, bool deck, int deck_id, const std::string& lang) {
     if (!state || !state->db) return false;
     ensure_data_dir_exists("data");
@@ -709,31 +783,105 @@ static bool export_cards_to_txt(AppState* state, bool deck, int deck_id, const s
             }
         }
     } else {
-        // Header for full DB export
-        out << "id\tname\ttype\tcolors\tset_code\tmana_cost\trarity\tquantity\tadded_date\tprice_usd\tfoil\n";
-        if (deck) {
-            // (handled above)
+        // Nicely aligned bilingual table for main DB export (no id column)
+        // Columns: name_en, name_it, type_en, type_it, colors_en, colors_it, set_code, mana_cost, rarity_en, rarity_it, quantity, price_usd, foil
+        std::string filter = "";
+        if (state->search_entry) {
+            const char* t = gtk_editable_get_text(GTK_EDITABLE(state->search_entry));
+            filter = t ? t : "";
         }
-        if (!deck) {
-            state->db->query(sql, [&](const std::map<std::string,std::string>& row) {
-                std::string name = row.count("english_name") && !row.at("english_name").empty() ? row.at("english_name") : row.at("name");
-                std::string lname = row.count("localized_name") && !row.at("localized_name").empty() ? row.at("localized_name") : row.at("name");
-                std::string type_en = row.count("type") ? row.at("type") : "";
-                std::string type_local = row.count("localized_type") && !row.at("localized_type").empty() ? row.at("localized_type") : type_en;
-                std::string out_name = (lang == "en") ? name : lname;
-                std::string out_type = (lang == "en") ? type_en : type_local;
-                out << row.at("id") << '\t'
-                    << out_name << '\t'
-                    << out_type << '\t'
-                    << (row.count("colors") ? row.at("colors") : "") << '\t'
-                    << (row.count("set_code") ? row.at("set_code") : "") << '\t'
-                    << (row.count("mana_cost") ? row.at("mana_cost") : "") << '\t'
-                    << (row.count("rarity") ? row.at("rarity") : "") << '\t'
-                    << (row.count("quantity") ? row.at("quantity") : "0") << '\t'
-                    << (row.count("added_date") ? row.at("added_date") : "") << '\t'
-                    << (row.count("price_usd") ? row.at("price_usd") : "") << '\t'
-                    << (row.count("foil") ? row.at("foil") : "0") << '\n';
-            }, params);
+        auto rows = load_cards_from_db(state->db, filter, state->selected_deck_id, state->filter_no_deck);
+        // Collect formatted fields
+        struct OutRow { std::string name_en, name_it, type_en, type_it, colors_en, colors_it, setc, mana, rarity_en, rarity_it, qty, price, foil; };
+        std::vector<OutRow> out_rows;
+        out_rows.reserve(rows.size());
+        for (const auto &row : rows) {
+            OutRow r;
+            r.name_en = row.count("english_name") && !row.at("english_name").empty() ? row.at("english_name") : row.at("name");
+            r.name_it = row.count("localized_name") && !row.at("localized_name").empty() ? row.at("localized_name") : r.name_en;
+            r.type_en = row.count("type") ? row.at("type") : "";
+            r.type_it = row.count("localized_type") && !row.at("localized_type").empty() ? row.at("localized_type") : r.type_en;
+            std::string colors_raw = row.count("colors") ? row.at("colors") : "";
+            std::string prev_lang = current_language;
+            current_language = "en";
+            r.colors_en = translate_colors(colors_raw.c_str());
+            r.rarity_en = translate_rarity(row.count("rarity") ? row.at("rarity").c_str() : "");
+            current_language = "it";
+            r.colors_it = translate_colors(colors_raw.c_str());
+            r.rarity_it = translate_rarity(row.count("rarity") ? row.at("rarity").c_str() : "");
+            current_language = prev_lang;
+            r.setc = row.count("set_code") ? row.at("set_code") : "";
+            r.mana = row.count("mana_cost") ? row.at("mana_cost") : "";
+            r.qty = row.count("quantity") ? row.at("quantity") : "0";
+            r.price = row.count("price_usd") ? row.at("price_usd") : "";
+            r.foil = row.count("foil") ? row.at("foil") : "0";
+            out_rows.push_back(std::move(r));
+        }
+        // Compute column widths with reasonable caps
+        size_t w_name_en = std::string("Name_EN").size();
+        size_t w_name_it = std::string("Name_IT").size();
+        size_t w_type_en = std::string("Type_EN").size();
+        size_t w_type_it = std::string("Type_IT").size();
+        size_t w_colors_en = std::string("Colors_EN").size();
+        size_t w_colors_it = std::string("Colors_IT").size();
+        size_t w_set = std::string("Set").size();
+        size_t w_mana = std::string("Mana").size();
+        size_t w_rarity_en = std::string("Rarity_EN").size();
+        size_t w_rarity_it = std::string("Rarity_IT").size();
+        size_t w_qty = std::string("Quantity").size();
+        size_t w_price = std::string("Price").size();
+        size_t w_foil = std::string("Foil").size();
+        for (const auto &r : out_rows) {
+            w_name_en = std::max(w_name_en, std::min<size_t>(r.name_en.size(), 60));
+            w_name_it = std::max(w_name_it, std::min<size_t>(r.name_it.size(), 60));
+            w_type_en = std::max(w_type_en, std::min<size_t>(r.type_en.size(), 40));
+            w_type_it = std::max(w_type_it, std::min<size_t>(r.type_it.size(), 40));
+            w_colors_en = std::max(w_colors_en, std::min<size_t>(r.colors_en.size(), 30));
+            w_colors_it = std::max(w_colors_it, std::min<size_t>(r.colors_it.size(), 30));
+            w_set = std::max(w_set, std::min<size_t>(r.setc.size(), 12));
+            w_mana = std::max(w_mana, std::min<size_t>(r.mana.size(), 20));
+            w_rarity_en = std::max(w_rarity_en, std::min<size_t>(r.rarity_en.size(), 12));
+            w_rarity_it = std::max(w_rarity_it, std::min<size_t>(r.rarity_it.size(), 12));
+            w_qty = std::max(w_qty, r.qty.size());
+            w_price = std::max(w_price, r.price.size());
+            w_foil = std::max(w_foil, r.foil.size());
+        }
+        // Header row
+        out << std::left << std::setw(w_name_en + 2) << "Name_EN"
+            << std::setw(w_name_it + 2) << "Name_IT"
+            << std::setw(w_type_en + 2) << "Type_EN"
+            << std::setw(w_type_it + 2) << "Type_IT"
+            << std::setw(w_colors_en + 2) << "Colors_EN"
+            << std::setw(w_colors_it + 2) << "Colors_IT"
+            << std::setw(w_set + 2) << "Set"
+            << std::setw(w_mana + 2) << "Mana"
+            << std::setw(w_rarity_en + 2) << "Rarity_EN"
+            << std::setw(w_rarity_it + 2) << "Rarity_IT"
+            << std::setw(w_qty + 2) << "Quantity"
+            << std::setw(w_price + 2) << "Price"
+            << std::setw(w_foil + 2) << "Foil" << '\n';
+        // Rows
+        for (const auto &r : out_rows) {
+            std::string ne = r.name_en.size() > 60 ? r.name_en.substr(0,57) + "..." : r.name_en;
+            std::string ni = r.name_it.size() > 60 ? r.name_it.substr(0,57) + "..." : r.name_it;
+            std::string te = r.type_en.size() > 40 ? r.type_en.substr(0,37) + "..." : r.type_en;
+            std::string ti = r.type_it.size() > 40 ? r.type_it.substr(0,37) + "..." : r.type_it;
+            std::string ce = r.colors_en.size() > 30 ? r.colors_en.substr(0,27) + "..." : r.colors_en;
+            std::string ci = r.colors_it.size() > 30 ? r.colors_it.substr(0,27) + "..." : r.colors_it;
+            out << std::left << std::setw(w_name_en + 2) << ne
+                << std::setw(w_name_it + 2) << ni
+                << std::setw(w_type_en + 2) << te
+                << std::setw(w_type_it + 2) << ti
+                << std::setw(w_colors_en + 2) << ce
+                << std::setw(w_colors_it + 2) << ci
+                << std::setw(w_set + 2) << r.setc
+                << std::setw(w_mana + 2) << r.mana
+                << std::setw(w_rarity_en + 2) << r.rarity_en
+                << std::setw(w_rarity_it + 2) << r.rarity_it
+                << std::setw(w_qty + 2) << r.qty
+                << std::setw(w_price + 2) << r.price
+                << std::setw(w_foil + 2) << r.foil
+                << '\n';
         }
     }
 
@@ -1468,7 +1616,7 @@ struct AddCardContext {
 };
 
 // Funzione per caricare le carte dal database
-static std::vector<std::map<std::string, std::string>> load_cards_from_db(Database* db, const std::string& filter = "", int deck_filter = -1) {
+static std::vector<std::map<std::string, std::string>> load_cards_from_db(Database* db, const std::string& filter = "", int deck_filter = -1, bool only_no_deck = false) {
     std::vector<std::map<std::string, std::string>> cards;
     if (!db) return cards;
     // Build SQL and optional params for deck filtering
@@ -1516,6 +1664,10 @@ static std::vector<std::map<std::string, std::string>> load_cards_from_db(Databa
             return t;
         };
         for (const auto &r : cards) {
+            // If caller requested only cards not in any deck, skip rows that belong to a deck
+            if (only_no_deck) {
+                if (r.count("deck_id") && !r.at("deck_id").empty()) continue;
+            }
             std::string en = r.count("english_name") && !r.at("english_name").empty() ? r.at("english_name") : "";
             std::string ln = r.count("localized_name") && !r.at("localized_name").empty() ? r.at("localized_name") : "";
             std::string nm = r.count("name") ? r.at("name") : "";
@@ -1572,7 +1724,7 @@ void refresh_card_list(AppState* state) {
     }
     g_list_store_remove_all(state->card_store);
     if (!state->db) return;
-    auto cards = load_cards_from_db(state->db, filter, state->selected_deck_id);
+    auto cards = load_cards_from_db(state->db, filter, state->selected_deck_id, state->filter_no_deck);
     std::cout << "Loading " << cards.size() << " cards from db" << std::endl;
     int total_quantity = 0;
     int main_count = 0;
@@ -1861,18 +2013,24 @@ static void on_add_card_ok_clicked(GtkButton *button, gpointer user_data) {
         g_object_unref(alert);
         // keep dialog open, do not delete ctx
         // Put keyboard focus back on the search entry so the user can type a new query quickly
-        if (entry && GTK_IS_WIDGET(entry)) {
+            if (entry && GTK_IS_WIDGET(entry)) {
             // Select current text so typing replaces it immediately
             gtk_widget_grab_focus(entry);
             gtk_editable_select_region(GTK_EDITABLE(entry), 0, -1);
-            // Also schedule an idle grab to reapply focus after transient dialogs are dismissed
-            g_idle_add(grab_focus_idle, entry);
+            // Schedule a short timeout to reliably restore focus after transient dialogs close.
+            {
+                FocusTarget* ft = new FocusTarget();
+                ft->entry = entry;
+                ft->tries = 12; // increase attempts
+                g_timeout_add(100, grab_focus_to_entry, ft);
+            }
         }
         return;
     }
 
-    // Single exact match: insert and keep dialog open (reset inputs)
-    if (cards.size() == 1 && cards[0].is_exact_match) {
+    // Single result: if Scryfall returned exactly one card, insert it directly
+    // (no need to show the selection dialog even for localized/Italian names).
+    if (cards.size() == 1) {
         auto& card = cards[0];
         std::cout << "Single card: " << card.name << ", price_usd: '" << card.price_usd << "'" << std::endl;
         std::string msg = "Nome: " + card.name + "\n";
@@ -1904,49 +2062,65 @@ static void on_add_card_ok_clicked(GtkButton *button, gpointer user_data) {
             msg += "\n\n[ERRORE: Nessun database aperto]";
         }
 
-        // Use a simple transient details dialog instead of GtkAlertDialog so we can
-        // reliably connect to its "destroy" signal and restore focus afterwards.
-        GtkWindow* add_win = GTK_WINDOW(gtk_widget_get_ancestor(GTK_WIDGET(entry), GTK_TYPE_WINDOW));
-        GtkWidget* det = create_styled_dialog(add_win ? add_win : ctx->parent, 480, 320);
-        gtk_window_set_title(GTK_WINDOW(det), "Dettagli Carta");
-        GtkWidget* dv = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
-        gtk_window_set_child(GTK_WINDOW(det), dv);
-        GtkWidget* lab = gtk_label_new(msg.c_str());
-        gtk_label_set_wrap(GTK_LABEL(lab), TRUE);
-        gtk_widget_set_hexpand(lab, TRUE);
-        gtk_box_append(GTK_BOX(dv), lab);
-        GtkWidget* btn_close = gtk_button_new_with_label("Chiudi");
-        gtk_box_append(GTK_BOX(dv), btn_close);
-        // When closed, restore focus to the entry via idle
-        g_signal_connect(det, "destroy", G_CALLBACK(+[](GtkWidget*, gpointer user_data){
-            g_idle_add(grab_focus_idle, user_data);
-        }), entry);
-        g_signal_connect(btn_close, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data){
-            std::cout << "DEBUG: details dialog close button clicked, destroying window=" << user_data << "\n";
-            gtk_window_destroy(GTK_WINDOW(user_data));
-        }), det);
-        // Allow Enter to close the details dialog (GTK4-style using GtkEventControllerKey)
-        {
-            GtkEventController *key = gtk_event_controller_key_new();
-            g_signal_connect(key, "key-pressed", G_CALLBACK(+[](GtkEventControllerKey* ctrl, guint keyval, guint keycode, GdkModifierType mods, gpointer user_data) -> gboolean {
-                if (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter) {
-                    std::cout << "DEBUG: details dialog key-pressed Enter, destroying window=" << user_data << "\n";
-                    gtk_window_destroy(GTK_WINDOW(user_data));
-                    return TRUE;
-                }
-                return FALSE;
+        // If insertion succeeded, send a brief desktop notification instead of
+        // showing a details dialog. On failure, show the error details dialog.
+        if (msg.find("Salvata nel database") != std::string::npos) {
+            // success path: send notify
+            std::filesystem::path p(state->db_path);
+            std::string dbname = p.filename().string();
+            std::string body = card.name + " aggiunta a " + dbname;
+            send_notification("Carta aggiunta", body);
+            // Reset inputs so user can add another card quickly
+            gtk_editable_set_text(GTK_EDITABLE(entry), "");
+            gtk_spin_button_set_value(GTK_SPIN_BUTTON(spin), 1);
+            // Try to grab focus now and also schedule the reliable timeout
+            gtk_widget_grab_focus(entry);
+            FocusTarget* ft = new FocusTarget();
+            ft->entry = entry;
+            ft->tries = 12; // increase attempts
+            g_timeout_add(100, grab_focus_to_entry, ft);
+            return;
+        } else {
+            // show error details dialog
+            GtkWindow* add_win = GTK_WINDOW(gtk_widget_get_ancestor(GTK_WIDGET(entry), GTK_TYPE_WINDOW));
+            GtkWidget* det = create_styled_dialog(add_win ? add_win : ctx->parent, 480, 320);
+            gtk_window_set_title(GTK_WINDOW(det), "Dettagli Carta");
+            GtkWidget* dv = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+            gtk_window_set_child(GTK_WINDOW(det), dv);
+            GtkWidget* lab = gtk_label_new(msg.c_str());
+            gtk_label_set_wrap(GTK_LABEL(lab), TRUE);
+            gtk_widget_set_hexpand(lab, TRUE);
+            gtk_box_append(GTK_BOX(dv), lab);
+            GtkWidget* btn_close = gtk_button_new_with_label("Chiudi");
+            gtk_box_append(GTK_BOX(dv), btn_close);
+            // When closed, restore focus to the entry via a short timeout (avoid focus races)
+            g_signal_connect(det, "destroy", G_CALLBACK(+[](GtkWidget*, gpointer user_data){
+                FocusTarget* ft = new FocusTarget();
+                ft->entry = (GtkWidget*)user_data;
+                ft->tries = 6;
+                g_timeout_add(50, grab_focus_to_entry, ft);
+            }), entry);
+            g_signal_connect(btn_close, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data){
+                std::cout << "DEBUG: details dialog close button clicked, destroying window=" << user_data << "\n";
+                gtk_window_destroy(GTK_WINDOW(user_data));
             }), det);
-            gtk_widget_add_controller(det, key);
+            // Allow Enter to close the details dialog (GTK4-style using GtkEventControllerKey)
+            {
+                GtkEventController *key = gtk_event_controller_key_new();
+                g_signal_connect(key, "key-pressed", G_CALLBACK(+[](GtkEventControllerKey* ctrl, guint keyval, guint keycode, GdkModifierType mods, gpointer user_data) -> gboolean {
+                    if (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter) {
+                        std::cout << "DEBUG: details dialog key-pressed Enter, destroying window=" << user_data << "\n";
+                        gtk_window_destroy(GTK_WINDOW(user_data));
+                        return TRUE;
+                    }
+                    return FALSE;
+                }), det);
+                gtk_widget_add_controller(det, key);
+            }
+            gtk_window_set_default_widget(GTK_WINDOW(det), btn_close);
+            gtk_window_present(GTK_WINDOW(det));
+            return;
         }
-        gtk_window_set_default_widget(GTK_WINDOW(det), btn_close);
-        gtk_window_present(GTK_WINDOW(det));
-
-        // Reset inputs so user can add another card quickly
-        gtk_editable_set_text(GTK_EDITABLE(entry), "");
-        gtk_spin_button_set_value(GTK_SPIN_BUTTON(spin), 1);
-        // Also try to grab focus now (in case no modal dialog steals it)
-        gtk_widget_grab_focus(entry);
-        return;
     }
 
     // Multiple matches - show selection dialog; keep original search dialog open
@@ -2013,7 +2187,15 @@ static void on_add_card_ok_clicked(GtkButton *button, gpointer user_data) {
 
     g_signal_connect(list_box, "row-activated", G_CALLBACK(+[](GtkWidget* list_box, GtkListBoxRow* row, gpointer user_data) {
         SelectCardContext* sctx = (SelectCardContext*)user_data;
-        size_t index = (size_t)g_object_get_data(G_OBJECT(row), "card_index");
+        std::cout << "DEBUG: row-activated handler called; sctx=" << sctx << ", row=" << row << std::endl;
+        size_t index = 0;
+        if (row) {
+            gpointer v = g_object_get_data(G_OBJECT(row), "card_index");
+            index = (size_t)v;
+            std::cout << "DEBUG: activated row index=" << index << std::endl;
+        } else {
+            std::cout << "DEBUG: activated row is NULL" << std::endl;
+        }
         if (index < sctx->cards->size()) {
             auto& card = (*sctx->cards)[index];
             std::string msg = "Nome: " + card.name + "\n";
@@ -2036,67 +2218,121 @@ static void on_add_card_ok_clicked(GtkButton *button, gpointer user_data) {
                 if (success) {
                     refresh_card_list(sctx->state);
                     g_main_context_iteration(NULL, FALSE);
-                    msg += "\n\n[Salvata nel database]";
+                    // Send brief desktop notification instead of showing details dialog
+                    std::filesystem::path p(sctx->state->db_path);
+                    std::string dbname = p.filename().string();
+                    std::string body = card.name + " aggiunta a " + dbname;
+                    send_notification("Carta aggiunta", body);
+                    // Close the selection dialog (it will be closed later in this handler)
                 } else {
                     msg += "\n\n[Errore nel salvare]";
                 }
             } else {
                 msg += "\n\n[ERRORE: Nessun database aperto]";
             }
-
-            // Show a transient details dialog so we can reconnect focus when it closes
-            GtkWindow* orig_win = NULL;
-            if (sctx->original_ctx && sctx->original_ctx->entry) orig_win = GTK_WINDOW(gtk_widget_get_ancestor(GTK_WIDGET(sctx->original_ctx->entry), GTK_TYPE_WINDOW));
-            GtkWidget* det = create_styled_dialog(orig_win ? orig_win : sctx->parent, 480, 320);
-            gtk_window_set_title(GTK_WINDOW(det), "Dettagli Carta");
-            GtkWidget* dv = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
-            gtk_window_set_child(GTK_WINDOW(det), dv);
-            GtkWidget* lab = gtk_label_new(msg.c_str());
-            gtk_label_set_wrap(GTK_LABEL(lab), TRUE);
-            gtk_box_append(GTK_BOX(dv), lab);
-            GtkWidget* btn_close = gtk_button_new_with_label("Chiudi");
-            gtk_box_append(GTK_BOX(dv), btn_close);
-            if (sctx->original_ctx) {
-                g_signal_connect(det, "destroy", G_CALLBACK(+[](GtkWidget*, gpointer user_data){
-                    g_idle_add(grab_focus_idle, user_data);
-                }), sctx->original_ctx->entry);
-            }
-            g_signal_connect(btn_close, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data){
-                std::cout << "DEBUG: details dialog close button clicked, destroying window=" << user_data << "\n";
-                gtk_window_destroy(GTK_WINDOW(user_data));
-            }), det);
-            // Allow Enter to close the details dialog (GTK4-style using GtkEventControllerKey)
-            {
-                GtkEventController *key = gtk_event_controller_key_new();
-                g_signal_connect(key, "key-pressed", G_CALLBACK(+[](GtkEventControllerKey* ctrl, guint keyval, guint keycode, GdkModifierType mods, gpointer user_data) -> gboolean {
-                    if (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter) {
-                        std::cout << "DEBUG: details dialog key-pressed Enter, destroying window=" << user_data << "\n";
-                        gtk_window_destroy(GTK_WINDOW(user_data));
-                        return TRUE;
-                    }
-                    return FALSE;
+            // If success we already sent a notification; otherwise show a details dialog with the error message
+            if (msg.find("Errore") != std::string::npos || msg.find("ERRORE") != std::string::npos) {
+                GtkWindow* orig_win = NULL;
+                if (sctx->original_ctx && sctx->original_ctx->entry) orig_win = GTK_WINDOW(gtk_widget_get_ancestor(GTK_WIDGET(sctx->original_ctx->entry), GTK_TYPE_WINDOW));
+                GtkWidget* det = create_styled_dialog(orig_win ? orig_win : sctx->parent, 480, 320);
+                gtk_window_set_title(GTK_WINDOW(det), "Dettagli Carta");
+                GtkWidget* dv = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+                gtk_window_set_child(GTK_WINDOW(det), dv);
+                GtkWidget* lab = gtk_label_new(msg.c_str());
+                gtk_label_set_wrap(GTK_LABEL(lab), TRUE);
+                gtk_box_append(GTK_BOX(dv), lab);
+                GtkWidget* btn_close = gtk_button_new_with_label("Chiudi");
+                gtk_box_append(GTK_BOX(dv), btn_close);
+                if (sctx->original_ctx) {
+                    g_signal_connect(det, "destroy", G_CALLBACK(+[](GtkWidget*, gpointer user_data){
+                        FocusTarget* ft = new FocusTarget();
+                        ft->entry = (GtkWidget*)user_data;
+                        ft->tries = 12;
+                        g_timeout_add(100, grab_focus_to_entry, ft);
+                    }), sctx->original_ctx->entry);
+                }
+                g_signal_connect(btn_close, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data){
+                    std::cout << "DEBUG: details dialog close button clicked, destroying window=" << user_data << "\n";
+                    gtk_window_destroy(GTK_WINDOW(user_data));
                 }), det);
-                gtk_widget_add_controller(det, key);
+                // Allow Enter to close the details dialog (GTK4-style using GtkEventControllerKey)
+                {
+                    GtkEventController *key = gtk_event_controller_key_new();
+                    g_signal_connect(key, "key-pressed", G_CALLBACK(+[](GtkEventControllerKey* ctrl, guint keyval, guint keycode, GdkModifierType mods, gpointer user_data) -> gboolean {
+                        if (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter) {
+                            std::cout << "DEBUG: details dialog key-pressed Enter, destroying window=" << user_data << "\n";
+                            gtk_window_destroy(GTK_WINDOW(user_data));
+                            return TRUE;
+                        }
+                        return FALSE;
+                    }), det);
+                    gtk_widget_add_controller(det, key);
+                }
+                gtk_window_set_default_widget(GTK_WINDOW(det), btn_close);
+                gtk_window_present(GTK_WINDOW(det));
             }
-            gtk_window_set_default_widget(GTK_WINDOW(det), btn_close);
-            gtk_window_present(GTK_WINDOW(det));
 
+            // Close the select dialog if present. Instead of destroying it immediately and
+            // trying to grab focus (which races with the window manager and the dialog
+            // destruction), attach a destroy handler that schedules the reliable focus
+            // retry. That way the focus attempts happen after the selection window is
+            // fully torn down.
             GtkWidget* select_dialog = gtk_widget_get_ancestor(sctx->list_box, GTK_TYPE_WINDOW);
             if (select_dialog && GTK_IS_WIDGET(select_dialog)) {
+                if (sctx->original_ctx && sctx->original_ctx->entry) {
+                    // When the select dialog is destroyed, schedule focus retries for the
+                    // original add-card entry (this avoids races with the WM).
+                    g_signal_connect(select_dialog, "destroy", G_CALLBACK(+[](GtkWidget*, gpointer user_data){
+                        FocusTarget* ft = new FocusTarget();
+                        ft->entry = (GtkWidget*)user_data;
+                        ft->tries = 12;
+                        g_timeout_add(100, grab_focus_to_entry, ft);
+                    }), sctx->original_ctx->entry);
+                }
                 gtk_window_destroy(GTK_WINDOW(select_dialog));
             }
 
-                if (sctx->original_ctx) {
-                    gtk_editable_set_text(GTK_EDITABLE(sctx->original_ctx->entry), "");
-                    gtk_spin_button_set_value(GTK_SPIN_BUTTON(sctx->original_ctx->spin), 1);
-                    // Grab focus immediately and schedule idle-grab to be safe
-                    gtk_widget_grab_focus(sctx->original_ctx->entry);
-                    g_idle_add(grab_focus_idle, sctx->original_ctx->entry);
-                }
+            if (sctx->original_ctx) {
+                // Reset inputs immediately (so the dialog below shows cleared fields)
+                gtk_editable_set_text(GTK_EDITABLE(sctx->original_ctx->entry), "");
+                gtk_spin_button_set_value(GTK_SPIN_BUTTON(sctx->original_ctx->spin), 1);
+                // Also try an immediate grab (best-effort) — the scheduled retries will
+                // perform the reliable focus restore after the selection dialog is
+                // destroyed.
+                gtk_widget_grab_focus(sctx->original_ctx->entry);
+            }
         }
         delete sctx->cards;
         delete sctx;
     }), select_ctx);
+
+    // Allow pressing Enter to activate the currently selected row even if focus
+    // is on the dialog or was moved by a mouse click. This handler emits the
+    // same "row-activated" signal so the existing selection logic (which
+    // schedules focus restore on destroy) runs in the same code path.
+    {
+        GtkEventController *key = gtk_event_controller_key_new();
+        g_signal_connect(key, "key-pressed", G_CALLBACK(+[](GtkEventControllerKey* ctrl, guint keyval, guint keycode, GdkModifierType mods, gpointer user_data) -> gboolean {
+            if (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter) {
+                std::cout << "DEBUG: Enter pressed in selection dialog" << std::endl;
+                GtkWidget* list = GTK_WIDGET(user_data);
+                GtkListBoxRow* sel = gtk_list_box_get_selected_row(GTK_LIST_BOX(list));
+                if (sel) {
+                    gpointer v = g_object_get_data(G_OBJECT(sel), "card_index");
+                    size_t idx = (size_t)v;
+                    std::cout << "DEBUG: Enter handler selected row index=" << idx << " sel=" << sel << std::endl;
+                    // Emit row-activated so the handler above runs
+                    g_signal_emit_by_name(list, "row-activated", sel);
+                    return TRUE;
+                } else {
+                    std::cout << "DEBUG: Enter pressed but no row selected" << std::endl;
+                }
+            }
+            return FALSE;
+        }), list_box);
+        // Attach controller to the dialog so it receives key events
+        gtk_widget_add_controller(dialog, key);
+    }
 
     gtk_window_present(GTK_WINDOW(dialog));
 }
@@ -3446,7 +3682,7 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         AppState* state = (AppState*)g_object_get_data(G_OBJECT(window), "app_state");
         if (!state || !state->db) return;
     // Load all cards (respecting current deck filter)
-    auto cards = load_cards_from_db(state->db, std::string(""), state->selected_deck_id);
+    auto cards = load_cards_from_db(state->db, std::string(""), state->selected_deck_id, state->filter_no_deck);
         int updated = 0;
         for (const auto& row : cards) {
             std::string search_name = row.at("english_name");
