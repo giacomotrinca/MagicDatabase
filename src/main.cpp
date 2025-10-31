@@ -5244,7 +5244,8 @@ static void on_add_card_action(GSimpleAction *action, GVariant *parameter, gpoin
         // Try an immediate grab and schedule reliable retries to overcome WM focus policies
         gtk_widget_grab_focus(state->inline_add_entry);
         if (GTK_IS_EDITABLE(state->inline_add_entry)) gtk_editable_select_region(GTK_EDITABLE(state->inline_add_entry), 0, -1);
-        schedule_focus_retries(state->inline_add_entry, state);
+        // Per user request: perform a single focus attempt only (do not schedule retries).
+        // This avoids repeated notifications and makes Ctrl+N perform one focused attempt.
         return;
     }
     // Fallback: open the legacy add dialog (used when viewing a deck)
@@ -5756,6 +5757,10 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     // Bottone per aggiungere una nuova carta
     GtkWidget *add_card_button = gtk_button_new_with_label("Nuova Carta");
     g_signal_connect(add_card_button, "clicked", G_CALLBACK(on_add_card_clicked), window);
+    // Hide the legacy "Nuova Carta" button by default so it's not shown on the
+    // main Database page (we use inline add controls there). It will be shown
+    // when a deck is selected via on_select_deck_id.
+    gtk_widget_set_visible(add_card_button, FALSE);
 
     // Bottone per refresh delle carte
     GtkWidget *refresh_button = gtk_button_new_with_label("Refresh");
