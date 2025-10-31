@@ -20,6 +20,8 @@
 #include "utils.h"
 #include <thread>
 #include <chrono>
+#include <cstring>
+#include <cstdio>
 
 // Forward declarations to allow scheduling helpers to be referenced before their definitions.
 struct AppState;
@@ -112,7 +114,7 @@ static void card_row_get_property(GObject *object, guint property_id, GValue *va
             G_OBJECT_WARN_INVALID_PROPERTY_ID(object, property_id, pspec);
             break;
     }
-}
+    }
 
 static void card_row_class_init(CardRowClass *klass) {
     GObjectClass *object_class = G_OBJECT_CLASS(klass);
@@ -319,6 +321,11 @@ static std::map<std::string, std::map<std::string, std::string>> translations = 
     {"Totale carte", {{"it","Totale carte"}, {"en","Total cards"}}},
     {"Valore totale", {{"it","Valore totale"}, {"en","Total Value"}}}
 };
+
+// Add localized label for the inline remove button used in the detail tendina
+__attribute__((unused)) static void __add_tendina_translations() {
+    translations["Rimuovi"] = {{"it","Rimuovi"}, {"en","Remove"}};
+}
 
 // Add translations for new settings labels
 __attribute__((unused)) static void __add_settings_translations() {
@@ -752,6 +759,8 @@ struct AppState {
     GtkWidget* next_page_button;
     GtkWidget* page_size_combo;
     GtkWidget* view_all_toggle;
+    // Debounce timer id for search entry changes (0 = none)
+    guint search_debounce_id;
 };
 
 // Schedule focus retries using the app-configured retries/interval.
@@ -773,6 +782,19 @@ static void schedule_focus_retries_custom(GtkWidget* entry, int tries, int inter
     ft->tries = tries > 0 ? tries : 6;
     int interval = interval_ms > 0 ? interval_ms : 50;
     g_timeout_add(interval, grab_focus_to_entry, ft);
+}
+
+// Forward declaration needed by search_debounce_cb
+void refresh_card_list(AppState* state);
+
+// Debounced timeout callback for search field. When fired, it calls
+// refresh_card_list and clears the stored timer id.
+static gboolean search_debounce_cb(gpointer user_data) {
+    AppState* state = (AppState*)user_data;
+    if (!state) return G_SOURCE_REMOVE;
+    state->search_debounce_id = 0;
+    refresh_card_list(state);
+    return G_SOURCE_REMOVE; // do not repeat
 }
 
 // Forward declaration for refresh used by deck helpers
@@ -4170,6 +4192,82 @@ static void on_row_right_click(GtkGestureClick *gesture, int n_press, double x, 
     gtk_popover_popup(GTK_POPOVER(menu));
 }
 
+// Double-click handler: toggles the detail revealer attached to the list item.
+static void on_row_double_click(GtkGestureClick *gesture, int n_press, double x, double y, gpointer user_data) {
+    (void)gesture; (void)x; (void)y;
+    if (n_press != 2) return;
+    GtkListItem *list_item = GTK_LIST_ITEM(user_data);
+    if (!list_item) return;
+    /* Debug: log double-click invocations */
+    CardRow *crow = (CardRow*)gtk_list_item_get_item(list_item);
+    const char *nm = (crow && crow->name) ? crow->name : "(no-name)";
+    g_print("on_row_double_click: n_press=2 list_item=%p name=%s\n", (void*)list_item, nm);
+    /* Debounce/deduplicate double-clicks coming from multiple per-column
+     * controllers: store a small timestamp on the shared CardRow and ignore
+     * subsequent toggles for the same row within a short interval. This
+     * prevents two controllers (attached to different column ListItems) from
+     * toggling the revealer twice and cancelling the user's action. */
+    gint64 now_ms = g_get_monotonic_time() / 1000; /* ms */
+    gboolean too_soon = FALSE;
+    if (crow) {
+        gpointer prevp = g_object_get_data(G_OBJECT(crow), "last_dbl_time");
+        if (prevp) {
+            gint prev = GPOINTER_TO_INT(prevp);
+            if (now_ms - (gint64)prev < 350) {
+                too_soon = TRUE;
+            }
+        }
+        /* store truncated ms (fits in gint) */
+        g_object_set_data(G_OBJECT(crow), "last_dbl_time", GINT_TO_POINTER((gint)(now_ms & 0x7fffffff)));
+    }
+    if (too_soon) {
+        g_print("  ignoring duplicate dblclick for row=%p\n", (void*)crow);
+        return;
+    }
+    /* Try to obtain the revealer reference. Note: ColumnView creates separate
+     * GtkListItem objects per column, so the per-column ListItem may not hold
+     * the "detail_revealer" data — the name column's ListItem does. Fallback
+     * to the CardRow GObject which we populate during bind. */
+    GtkWidget *revealer = (GtkWidget*)g_object_get_data(G_OBJECT(list_item), "detail_revealer");
+    if (!revealer && crow) {
+        revealer = (GtkWidget*)g_object_get_data(G_OBJECT(crow), "detail_revealer");
+    }
+    if (!revealer || !GTK_IS_REVEALER(revealer)) {
+        g_print("  no valid revealer found for list_item=%p, row=%p\n", (void*)list_item, (void*)crow);
+        return;
+    }
+    gboolean currently = gtk_revealer_get_reveal_child(GTK_REVEALER(revealer));
+    g_print("  toggling revealer=%p currently=%d -> new=%d\n", (void*)revealer, (int)currently, (int)!currently);
+    gtk_revealer_set_reveal_child(GTK_REVEALER(revealer), !currently);
+}
+
+// Remove button handler: deletes the underlying card (single action) and refreshes the view.
+static void on_remove_button_clicked(GtkButton *button, gpointer user_data) {
+    (void)button;
+    GtkListItem *list_item = GTK_LIST_ITEM(user_data);
+    if (!list_item) return;
+    CardRow *row = (CardRow*)gtk_list_item_get_item(list_item);
+    if (!row) return;
+    // Find AppState via the column view ancestor
+    GtkWidget *w = GTK_WIDGET(list_item);
+    GtkWidget *column_view = gtk_widget_get_ancestor(w, GTK_TYPE_COLUMN_VIEW);
+    if (!column_view) return;
+    GtkRoot *root = gtk_widget_get_root(column_view);
+    AppState *state = NULL;
+    if (root && G_IS_OBJECT(root)) state = (AppState*)g_object_get_data(G_OBJECT(root), "app_state");
+    if (!state || !state->db) return;
+    // Use existing DB helper to delete the card (this will handle quantities)
+    if (state->db->delete_card(row->id)) {
+        std::cout << "Deleted card id=" << row->id << std::endl;
+    } else {
+        std::cout << "Error deleting card id=" << row->id << std::endl;
+    }
+    // Collapse revealer (if any) and refresh list
+    GtkWidget *revealer = (GtkWidget*)g_object_get_data(G_OBJECT(list_item), "detail_revealer");
+    if (revealer && GTK_IS_REVEALER(revealer)) gtk_revealer_set_reveal_child(GTK_REVEALER(revealer), FALSE);
+    refresh_card_list(state);
+}
+
 static void on_delete_card(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
     GtkWindow *window = GTK_WINDOW(user_data);
     AppState* state = (AppState*)g_object_get_data(G_OBJECT(window), "app_state");
@@ -5116,6 +5214,358 @@ static std::string translate_type(const char* type) {
     return t; // Se non trovato, restituisci originale
 }
 
+/* PicCtx used to pass picture + raw data to the main-loop invoker */
+struct PicCtx { GtkWidget* pic; std::vector<unsigned char>* data; };
+/* Text update context used to set oracle text on the main thread */
+struct TextCtx { GtkWidget* lbl; char* text; };
+static gboolean on_picture_update_invoke(gpointer user_data);
+static gboolean on_oracle_update_invoke(gpointer user_data);
+
+/* Named callbacks to avoid passing inline lambdas through G_CALLBACK (preprocessor-safe) */
+static void name_factory_setup_cb(GtkListItemFactory *factory, GtkListItem *item, gpointer user_data) {
+    (void)factory; (void)user_data;
+    /* Structure per list item:
+     * outer_vbox
+     *  ├ visible_box (contains name_label, meta_label)  <-- always visible and receives gestures
+     *  └ revealer (contains detail panel with Remove button)
+     */
+    GtkWidget *outer_vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    gtk_widget_add_css_class(outer_vbox, "db-row");
+
+    GtkWidget *visible_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    GtkWidget *name_label = gtk_label_new("");
+    gtk_label_set_xalign(GTK_LABEL(name_label), 0.0);
+    gtk_label_set_ellipsize(GTK_LABEL(name_label), PANGO_ELLIPSIZE_END);
+    gtk_widget_add_css_class(name_label, "name-label");
+
+    GtkWidget *meta_label = gtk_label_new("");
+    gtk_label_set_xalign(GTK_LABEL(meta_label), 0.0);
+    gtk_label_set_ellipsize(GTK_LABEL(meta_label), PANGO_ELLIPSIZE_END);
+    gtk_widget_add_css_class(meta_label, "meta-label");
+
+    gtk_box_append(GTK_BOX(visible_box), name_label);
+    gtk_box_append(GTK_BOX(visible_box), meta_label);
+
+    /* Also attach double-click gestures to the two visible labels inside the
+     * name column so clicking anywhere on the row (including the name area)
+     * toggles the tendina. We attach them to the labels to avoid colliding
+     * with other per-column controllers. */
+    GtkGesture *name_dbl = gtk_gesture_click_new();
+    gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(name_dbl), GDK_BUTTON_PRIMARY);
+    g_signal_connect(name_dbl, "pressed", G_CALLBACK(on_row_double_click), item);
+    if (name_label) gtk_widget_add_controller(name_label, GTK_EVENT_CONTROLLER(name_dbl));
+    if (meta_label) gtk_widget_add_controller(meta_label, GTK_EVENT_CONTROLLER(name_dbl));
+
+    /* Double-click gesture (primary button) used to toggle the revealer is
+     * attached to each column's cell widgets instead of the name column's
+     * visible_box to avoid duplicate invocations when multiple controllers
+     * are present. (Per-column controllers are created in the column
+     * factories' setup callbacks.) */
+
+    /* Right-click gesture for context menu attached to visible_box as well */
+    GtkGesture *rclk = gtk_gesture_click_new();
+    gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(rclk), GDK_BUTTON_SECONDARY);
+    g_signal_connect(rclk, "pressed", G_CALLBACK(on_row_right_click), item);
+    gtk_widget_add_controller(visible_box, GTK_EVENT_CONTROLLER(rclk));
+
+    /* The detail revealer (collapsed by default) placed below the visible row */
+    GtkWidget *revealer = gtk_revealer_new();
+    gtk_revealer_set_reveal_child(GTK_REVEALER(revealer), FALSE);
+    gtk_revealer_set_transition_duration(GTK_REVEALER(revealer), 260);
+    gtk_revealer_set_transition_type(GTK_REVEALER(revealer), GTK_REVEALER_TRANSITION_TYPE_SLIDE_DOWN);
+
+    GtkWidget *detail_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    gtk_widget_add_css_class(detail_box, "detail-panel");
+    gtk_widget_set_margin_start(detail_box, 8);
+    gtk_widget_set_margin_end(detail_box, 8);
+    gtk_widget_set_margin_top(detail_box, 6);
+    gtk_widget_set_margin_bottom(detail_box, 6);
+
+    /* Left: picture area */
+    GtkWidget *picture = gtk_picture_new();
+    gtk_picture_set_content_fit(GTK_PICTURE(picture), GTK_CONTENT_FIT_CONTAIN);
+    gtk_widget_set_size_request(picture, 200, 280); // approximate card aspect
+    gtk_widget_set_hexpand(picture, FALSE);
+    gtk_widget_set_vexpand(picture, FALSE);
+    gtk_box_append(GTK_BOX(detail_box), picture);
+    /* Small Remove button just to the right of the image */
+    GtkWidget *remove_btn = gtk_button_new_with_label(translate("Rimuovi").c_str());
+    gtk_widget_add_css_class(remove_btn, "danger");
+    gtk_widget_add_css_class(remove_btn, "compact-button");
+    gtk_widget_set_size_request(remove_btn, 92, -1);
+    gtk_widget_set_valign(remove_btn, GTK_ALIGN_START);
+    gtk_widget_set_halign(remove_btn, GTK_ALIGN_START);
+    gtk_box_append(GTK_BOX(detail_box), remove_btn);
+
+    /* Middle: info vbox */
+    GtkWidget *info_vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_widget_set_hexpand(info_vbox, TRUE);
+    gtk_widget_set_vexpand(info_vbox, FALSE);
+    GtkWidget *title_label = gtk_label_new(""); gtk_label_set_xalign(GTK_LABEL(title_label), 0.0); gtk_widget_add_css_class(title_label, "detail-title");
+    GtkWidget *type_label = gtk_label_new(""); gtk_label_set_xalign(GTK_LABEL(type_label), 0.0); gtk_widget_add_css_class(type_label, "detail-meta");
+    GtkWidget *colors_label = gtk_label_new(""); gtk_label_set_xalign(GTK_LABEL(colors_label), 0.0); gtk_widget_add_css_class(colors_label, "detail-meta");
+    GtkWidget *rarity_label = gtk_label_new(""); gtk_label_set_xalign(GTK_LABEL(rarity_label), 0.0); gtk_widget_add_css_class(rarity_label, "detail-meta");
+    GtkWidget *set_label = gtk_label_new(""); gtk_label_set_xalign(GTK_LABEL(set_label), 0.0); gtk_widget_add_css_class(set_label, "detail-meta");
+    GtkWidget *mana_label = gtk_label_new(""); gtk_label_set_xalign(GTK_LABEL(mana_label), 0.0); gtk_widget_add_css_class(mana_label, "detail-meta");
+    /* Oracle / rules text (wrapping, may be long) */
+    GtkWidget *oracle_label = gtk_label_new(""); gtk_label_set_xalign(GTK_LABEL(oracle_label), 0.0); gtk_widget_add_css_class(oracle_label, "detail-text"); gtk_label_set_wrap(GTK_LABEL(oracle_label), TRUE);
+    GtkWidget *qty_label = gtk_label_new(""); gtk_label_set_xalign(GTK_LABEL(qty_label), 0.0); gtk_widget_add_css_class(qty_label, "detail-meta");
+    GtkWidget *deck_label = gtk_label_new(""); gtk_label_set_xalign(GTK_LABEL(deck_label), 0.0); gtk_widget_add_css_class(deck_label, "detail-meta");
+    gtk_box_append(GTK_BOX(info_vbox), title_label);
+    gtk_box_append(GTK_BOX(info_vbox), type_label);
+    gtk_box_append(GTK_BOX(info_vbox), colors_label);
+    gtk_box_append(GTK_BOX(info_vbox), rarity_label);
+    gtk_box_append(GTK_BOX(info_vbox), set_label);
+    gtk_box_append(GTK_BOX(info_vbox), mana_label);
+    gtk_box_append(GTK_BOX(info_vbox), oracle_label);
+    gtk_box_append(GTK_BOX(info_vbox), qty_label);
+    gtk_box_append(GTK_BOX(info_vbox), deck_label);
+    gtk_box_append(GTK_BOX(detail_box), info_vbox);
+
+    gtk_revealer_set_child(GTK_REVEALER(revealer), detail_box);
+
+    /* Make outer structure */
+    gtk_box_append(GTK_BOX(outer_vbox), visible_box);
+    gtk_box_append(GTK_BOX(outer_vbox), revealer);
+
+    /* Keep convenient references on the ListItem for handlers */
+    g_object_set_data(G_OBJECT(item), "detail_revealer", revealer);
+    /* Also store the revealer on the underlying CardRow (set during bind) so
+     * double-click handlers attached to other column ListItems can locate it. */
+    /* Note: we set this in bind when we have access to the CardRow instance. */
+    g_object_set_data(G_OBJECT(item), "visible_box", visible_box);
+    g_object_set_data(G_OBJECT(item), "remove_btn", remove_btn);
+
+    /* Wire remove handler to the ListItem (user_data = item) */
+    g_signal_connect(remove_btn, "clicked", G_CALLBACK(on_remove_button_clicked), item);
+
+    /* Watch revealer open/close so we can mark per-item tendina state and
+     * also store the flag on the shared CardRow object. Storing on the
+     * CardRow makes the state available to bind callbacks for other column
+     * ListItem instances. We still set it on the ListItem for the current
+     * widget instance. */
+    g_signal_connect(revealer, "notify::reveal-child", G_CALLBACK(+[](GObject *obj, GParamSpec*, gpointer user_data){
+        GtkListItem *item = GTK_LIST_ITEM(user_data);
+        GtkRevealer *r = GTK_REVEALER(obj);
+        gboolean reveal = gtk_revealer_get_reveal_child(r);
+        g_object_set_data(G_OBJECT(item), "tendina_open", GINT_TO_POINTER(reveal ? 1 : 0));
+        /* Also set on the CardRow (shared model) so other column ListItems
+         * can consult the row-level flag when deciding visibility. */
+        CardRow *row = (CardRow*)gtk_list_item_get_item(item);
+        if (row) {
+            g_object_set_data(G_OBJECT(row), "tendina_open", GINT_TO_POINTER(reveal ? 1 : 0));
+        }
+    }), item);
+
+    gtk_list_item_set_child(item, outer_vbox);
+}
+
+static void name_factory_bind_cb(GtkListItemFactory *factory, GtkListItem *item, gpointer user_data) {
+    (void)factory; (void)user_data;
+    CardRow *row = (CardRow*)gtk_list_item_get_item(item);
+    GtkWidget *outer = gtk_list_item_get_child(item);
+    if (!outer) return;
+    /* visible_box is first child of outer_vbox */
+    GtkWidget *visible_box = gtk_widget_get_first_child(outer);
+    if (!visible_box) return;
+    GtkWidget *name_label = gtk_widget_get_first_child(visible_box);
+    GtkWidget *meta_label = name_label ? gtk_widget_get_next_sibling(name_label) : NULL;
+    /* Detail widgets: picture + info labels are children of the detail_box (second child of outer_vbox) */
+    GtkWidget *revealer = gtk_widget_get_next_sibling(visible_box);
+    GtkWidget *detail_box = revealer ? gtk_revealer_get_child(GTK_REVEALER(revealer)) : NULL;
+    GtkWidget *picture = NULL, *info_vbox = NULL, *title_label = NULL, *type_label = NULL, *colors_label = NULL, *rarity_label = NULL, *set_label = NULL, *mana_label = NULL, *oracle_label = NULL, *qty_label = NULL, *deck_label = NULL, *remove_btn = NULL;
+    if (detail_box) {
+        /* detail_box children: picture, remove_btn, info_vbox */
+        picture = gtk_widget_get_first_child(detail_box);
+        remove_btn = picture ? gtk_widget_get_next_sibling(picture) : NULL;
+        info_vbox = remove_btn ? gtk_widget_get_next_sibling(remove_btn) : NULL;
+        if (info_vbox) {
+            title_label = gtk_widget_get_first_child(info_vbox);
+            type_label = title_label ? gtk_widget_get_next_sibling(title_label) : NULL;
+            colors_label = type_label ? gtk_widget_get_next_sibling(type_label) : NULL;
+            rarity_label = colors_label ? gtk_widget_get_next_sibling(colors_label) : NULL;
+            set_label = rarity_label ? gtk_widget_get_next_sibling(rarity_label) : NULL;
+            mana_label = set_label ? gtk_widget_get_next_sibling(set_label) : NULL;
+            oracle_label = mana_label ? gtk_widget_get_next_sibling(mana_label) : NULL;
+            qty_label = oracle_label ? gtk_widget_get_next_sibling(oracle_label) : NULL;
+            deck_label = qty_label ? gtk_widget_get_next_sibling(qty_label) : NULL;
+            /* remove_btn already is the middle child (picture -> remove_btn -> info_vbox) */
+        }
+    }
+    if (!row) {
+        if (name_label) gtk_label_set_text(GTK_LABEL(name_label), "");
+        if (meta_label) gtk_label_set_text(GTK_LABEL(meta_label), "");
+        gtk_list_item_set_selectable(item, FALSE);
+        return;
+    }
+    if (row->id == ROW_ID_SEPARATOR_TITLE) {
+        std::string sep = translate("Sideboard");
+        std::string markup = "<span weight='bold'>" + sep + "</span>";
+        if (name_label) gtk_label_set_markup(GTK_LABEL(name_label), markup.c_str());
+        if (meta_label) gtk_widget_set_visible(meta_label, FALSE);
+        gtk_label_set_xalign(GTK_LABEL(name_label), 0.5);
+        gtk_widget_set_hexpand(name_label, TRUE);
+        gtk_list_item_set_selectable(item, FALSE);
+        gtk_widget_add_css_class(outer, "separator-row");
+        ensure_separator_css_provider();
+        if (separator_css_provider) {
+            gtk_style_context_add_provider(gtk_widget_get_style_context(outer), GTK_STYLE_PROVIDER(separator_css_provider), GTK_STYLE_PROVIDER_PRIORITY_USER);
+        }
+        gtk_widget_remove_css_class(GTK_WIDGET(name_label), "foil");
+        return;
+    }
+    if (row->id == ROW_ID_HEADER) {
+        std::string hdr = translate("Nome");
+        std::string markup = "<span weight='bold'>" + hdr + "</span>";
+        if (name_label) gtk_label_set_markup(GTK_LABEL(name_label), markup.c_str());
+        if (meta_label) gtk_widget_set_visible(meta_label, FALSE);
+        gtk_label_set_xalign(GTK_LABEL(name_label), 0.0);
+        gtk_list_item_set_selectable(item, FALSE);
+        gtk_widget_add_css_class(outer, "header-row");
+        ensure_separator_css_provider();
+        if (separator_css_provider) {
+            gtk_style_context_add_provider(gtk_widget_get_style_context(outer), GTK_STYLE_PROVIDER(separator_css_provider), GTK_STYLE_PROVIDER_PRIORITY_USER);
+        }
+        return;
+    }
+    // Normal row: populate name and meta (type + set)
+    if (name_label) gtk_label_set_text(GTK_LABEL(name_label), row->name ? row->name : "");
+    std::string meta;
+    if (row->type && row->set_code) {
+        meta = std::string(row->type) + " • " + (row->set_code ? row->set_code : "");
+    } else if (row->type) meta = row->type;
+    if (meta_label) gtk_label_set_text(GTK_LABEL(meta_label), meta.c_str());
+    /* Remove any visual-only classes that may have been applied when this ListItem was reused */
+    gtk_widget_remove_css_class(outer, "separator-row");
+    gtk_widget_remove_css_class(outer, "header-row");
+    // Apply foil styling
+    if (row->foil) {
+        if (name_label) gtk_widget_add_css_class(name_label, "foil");
+    } else {
+        if (name_label) gtk_widget_remove_css_class(name_label, "foil");
+    }
+    // Populate detail panel (if present)
+    if (title_label) gtk_label_set_text(GTK_LABEL(title_label), row->name ? row->name : "");
+    if (type_label) gtk_label_set_text(GTK_LABEL(type_label), row->type ? row->type : "");
+    if (colors_label) gtk_label_set_text(GTK_LABEL(colors_label), row->translated_colors ? row->translated_colors : "");
+    if (rarity_label) gtk_label_set_text(GTK_LABEL(rarity_label), translate_rarity(row->rarity).c_str());
+    if (set_label) gtk_label_set_text(GTK_LABEL(set_label), row->set_code ? row->set_code : "");
+    if (mana_label) gtk_label_set_text(GTK_LABEL(mana_label), row->mana_cost ? row->mana_cost : "");
+    if (qty_label) gtk_label_set_text(GTK_LABEL(qty_label), row->quantity_display ? row->quantity_display : std::to_string(row->quantity).c_str());
+
+    /* Ensure the CardRow object stores a reference to the detail revealer so
+     * gestures coming from other column ListItem objects can find and toggle it.
+     * We store a plain pointer; lifetime of the revealer is tied to the ListItem
+     * UI so this is safe while the row is visible. */
+    if (row && revealer) {
+        g_object_set_data(G_OBJECT(row), "detail_revealer", revealer);
+    }
+
+    /* Deck membership: query DB for decks that contain cards with same name */
+    if (deck_label) {
+        gtk_label_set_text(GTK_LABEL(deck_label), translate("Non in alcun mazzo").c_str());
+        /* Try to find the AppState to access DB */
+        GtkWidget *colv = gtk_widget_get_ancestor(outer, GTK_TYPE_COLUMN_VIEW);
+        if (colv) {
+            GtkRoot *root = gtk_widget_get_root(colv);
+            if (root && G_IS_OBJECT(root)) {
+                AppState *state = (AppState*)g_object_get_data(G_OBJECT(root), "app_state");
+                if (state && state->db) {
+                    std::vector<std::string> params;
+                    params.push_back(std::string(row->name ? row->name : ""));
+                    std::vector<std::string> deck_names;
+                    state->db->query("SELECT DISTINCT d.name AS deck_name FROM decks d JOIN cards c ON c.deck_id = d.id WHERE LOWER(COALESCE(c.english_name,c.localized_name,c.name)) = LOWER(?)", [&](const std::map<std::string,std::string>& r){
+                        if (r.count("deck_name")) deck_names.push_back(r.at("deck_name"));
+                    }, params);
+                    if (!deck_names.empty()) {
+                        std::string joined;
+                        for (size_t i=0;i<deck_names.size();++i) {
+                            if (i) joined += ", ";
+                            joined += deck_names[i];
+                        }
+                        gtk_label_set_text(GTK_LABEL(deck_label), joined.c_str());
+                        /* store deck names on the ListItem so other column binds can hide themselves */
+                        char* old = (char*)g_object_get_data(G_OBJECT(item), "in_deck_names");
+                        if (old) g_free(old);
+                        g_object_set_data(G_OBJECT(item), "in_deck_names", g_strdup(joined.c_str()));
+                    }
+                    else {
+                        char* old = (char*)g_object_get_data(G_OBJECT(item), "in_deck_names");
+                        if (old) { g_free(old); g_object_set_data(G_OBJECT(item), "in_deck_names", NULL); }
+                    }
+                }
+            }
+        }
+    }
+
+    /* Load picture (async if needed) */
+    if (picture && row->image_url && strlen(row->image_url)>0) {
+        std::string url = row->image_url;
+        // If cached file exists, load synchronously; otherwise spawn async loader
+        std::filesystem::path up(url);
+        std::string filename = up.filename().string();
+        std::string filepath = std::string("data/img/") + filename;
+        if (std::filesystem::exists(filepath)) {
+            std::vector<unsigned char> data = load_image_from_file(filepath);
+            if (!data.empty()) {
+                GBytes *bytes = g_bytes_new(data.data(), data.size());
+                GdkTexture *texture = gdk_texture_new_from_bytes(bytes, nullptr);
+                if (texture) {
+                    gtk_picture_set_paintable(GTK_PICTURE(picture), GDK_PAINTABLE(texture));
+                    g_object_unref(texture);
+                }
+                g_bytes_unref(bytes);
+            }
+        } else {
+            // spawn thread to download and update picture when ready
+            std::string u = url;
+            GtkWidget *pic = picture;
+            std::thread([u, pic]() {
+                auto data = download_image_data(u);
+                if (data.empty()) return;
+                // save into cache
+                try {
+                    std::filesystem::path upath(u);
+                    std::string fname = upath.filename().string();
+                    std::string fpath = std::string("data/img/") + fname;
+                    std::ofstream out(fpath, std::ios::binary);
+                    if (out) { out.write((char*)data.data(), data.size()); out.close(); }
+                } catch(...) {}
+                // create texture on main thread
+                PicCtx* pctx = new PicCtx();
+                pctx->pic = pic;
+                pctx->data = new std::vector<unsigned char>(data.begin(), data.end());
+                g_main_context_invoke(NULL, (GSourceFunc)on_picture_update_invoke, pctx);
+            }).detach();
+        }
+    }
+}
+
+static gboolean on_picture_update_invoke(gpointer user_data) {
+    PicCtx* ctx = (PicCtx*)user_data;
+    if (!ctx) return G_SOURCE_REMOVE;
+    GBytes *bytes = g_bytes_new(ctx->data->data(), ctx->data->size());
+    GdkTexture *texture = gdk_texture_new_from_bytes(bytes, nullptr);
+    if (texture) {
+        gtk_picture_set_paintable(GTK_PICTURE(ctx->pic), GDK_PAINTABLE(texture));
+        g_object_unref(texture);
+    }
+    g_bytes_unref(bytes);
+    delete ctx->data;
+    delete ctx;
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean on_oracle_update_invoke(gpointer user_data) {
+    TextCtx* tc = (TextCtx*)user_data;
+    if (!tc) return G_SOURCE_REMOVE;
+    if (tc->lbl) {
+        gtk_label_set_text(GTK_LABEL(tc->lbl), tc->text ? tc->text : "");
+    }
+    if (tc) { g_free(tc->text); delete tc; }
+    return G_SOURCE_REMOVE;
+}
+
 static void on_activate(GtkApplication *app, gpointer user_data) {
     // Carica CSS personalizzato
     GtkCssProvider *provider = gtk_css_provider_new();
@@ -5245,6 +5695,7 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     state->deck_label = NULL;
     state->deck_delete_button = NULL;
     state->db_button = NULL;
+    state->search_debounce_id = 0;
     state->filter_colors.clear();
     state->filter_rarities.clear();
     state->filter_types.clear();
@@ -5304,7 +5755,13 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         GtkWindow* window = GTK_WINDOW(user_data);
         AppState* state = (AppState*)g_object_get_data(G_OBJECT(window), "app_state");
         if (!state) return;
-        refresh_card_list(state);
+        // Debounce rapid typing: cancel previous timeout and schedule a new one
+        if (state->search_debounce_id != 0) {
+            g_source_remove(state->search_debounce_id);
+            state->search_debounce_id = 0;
+        }
+    // 100 ms debounce interval (more responsive)
+    state->search_debounce_id = g_timeout_add(100, search_debounce_cb, state);
     }), window);
 
     state->search_entry = search_entry;
@@ -5320,6 +5777,7 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     // Add extra translations map entries (kept separate for clarity)
     __add_extra_translations();
     __add_more_translations();
+    __add_tendina_translations();
     __add_settings_translations();
     // Ensure menus reflect current language
     rebuild_menus_for_language(state);
@@ -5399,11 +5857,11 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     gtk_widget_add_css_class(box, "color-box");
     // Use CSS-based sizing (1em) so the color square matches the font height and stays square.
     // Center vertically relative to the row text and prevent the box from expanding to fill the cell.
-    gtk_widget_set_valign(box, GTK_ALIGN_CENTER);
-    gtk_widget_set_halign(box, GTK_ALIGN_START);
-    gtk_widget_set_hexpand(box, FALSE);
-    gtk_widget_set_vexpand(box, FALSE);
-    gtk_widget_set_margin_end(box, 6);
+        /* make this cell respond to double-click/right-click like the name column */
+        GtkGesture *dbl = gtk_gesture_click_new();
+        gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(dbl), GDK_BUTTON_PRIMARY);
+        g_signal_connect(dbl, "pressed", G_CALLBACK(on_row_double_click), item);
+        gtk_widget_add_controller(box, GTK_EVENT_CONTROLLER(dbl));
         gtk_list_item_set_child(item, box);
     }), NULL);
     g_signal_connect(color_factory, "bind", G_CALLBACK(+[](GtkListItemFactory *, GtkListItem *item, gpointer) {
@@ -5426,8 +5884,11 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         char css_buf[512];
         // width/height in em units makes the box side equal to current font size (approx. font height)
         // force min/max to keep it square. Add a small border-radius for nicer look.
-        snprintf(css_buf, sizeof(css_buf), ".color-box { background-color: rgba(%d,%d,%d,1.0); border: 1px solid rgba(0,0,0,0.6); width: 1em; height: 1em; min-width: 1em; min-height: 1em; max-width: 1em; max-height: 1em; border-radius: 2px; display: inline-block; }",
-             (int)(color.red * 255), (int)(color.green * 255), (int)(color.blue * 255));
+       /* GTK CSS doesn't support the 'width', 'height', 'max-width', 'max-height' or 'display'
+        * properties in the same way as browser CSS. Use min-width/min-height and border-radius
+        * only to avoid theme parser warnings. */
+       snprintf(css_buf, sizeof(css_buf), ".color-box { background-color: rgba(%d,%d,%d,1.0); border: 1px solid rgba(0,0,0,0.6); min-width: 1em; min-height: 1em; border-radius: 2px; }",
+           (int)(color.red * 255), (int)(color.green * 255), (int)(color.blue * 255));
         GtkCssProvider *prov = gtk_css_provider_new();
         gtk_css_provider_load_from_string(prov, css_buf);
         gtk_style_context_add_provider(gtk_widget_get_style_context(box), GTK_STYLE_PROVIDER(prov), GTK_STYLE_PROVIDER_PRIORITY_USER);
@@ -5441,70 +5902,19 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         GtkEventController *motion = gtk_event_controller_motion_new();
         g_signal_connect(motion, "enter", G_CALLBACK(on_row_enter), item);
         gtk_widget_add_controller(box, motion);
+    /* visibility for this cell depends only on deck membership. The small
+     * color-square column should remain visible when the tendina is open; we
+     * only hide it when the card is in a deck. */
+    char* _in_deck = (char*)g_object_get_data(G_OBJECT(item), "in_deck_names");
+    if (_in_deck && strlen(_in_deck) > 0) gtk_widget_set_visible(box, FALSE); else gtk_widget_set_visible(box, TRUE);
     }), NULL);
     GtkColumnViewColumn *color_col = gtk_column_view_column_new(NULL, color_factory);
     gtk_column_view_append_column(column_view, color_col);
 
     // Colonna Nome
     GtkListItemFactory *name_factory = gtk_signal_list_item_factory_new();
-    g_signal_connect(name_factory, "setup", G_CALLBACK(+[](GtkListItemFactory *, GtkListItem *item, gpointer) {
-        GtkWidget *label = gtk_label_new("");
-        gtk_label_set_xalign(GTK_LABEL(label), 0.0);
-        gtk_label_set_ellipsize(GTK_LABEL(label), PANGO_ELLIPSIZE_END);
-        gtk_list_item_set_child(item, label);
-    }), NULL);
-    g_signal_connect(name_factory, "bind", G_CALLBACK(+[](GtkListItemFactory *, GtkListItem *item, gpointer) {
-        CardRow *row = (CardRow*)gtk_list_item_get_item(item);
-        GtkWidget *label = gtk_list_item_get_child(item);
-        if (!row) {
-            gtk_label_set_text(GTK_LABEL(label), "");
-            gtk_list_item_set_selectable(item, FALSE);
-            return;
-        }
-        if (row->id == ROW_ID_SEPARATOR_TITLE) {
-            // Separator title: centered bold text, non-selectable and styled
-            std::string sep = translate("Sideboard");
-            std::string markup = "<span weight='bold'>" + sep + "</span>";
-            gtk_label_set_markup(GTK_LABEL(label), markup.c_str());
-            gtk_label_set_xalign(GTK_LABEL(label), 0.5);
-            gtk_widget_set_hexpand(label, TRUE);
-            gtk_list_item_set_selectable(item, FALSE);
-            // Apply separator CSS class/style to the whole list item so it spans all columns
-            gtk_widget_add_css_class(GTK_WIDGET(item), "separator-row");
-            ensure_separator_css_provider();
-            if (separator_css_provider) {
-                gtk_style_context_add_provider(gtk_widget_get_style_context(GTK_WIDGET(item)), GTK_STYLE_PROVIDER(separator_css_provider), GTK_STYLE_PROVIDER_PRIORITY_USER);
-            }
-            gtk_widget_remove_css_class(label, "foil");
-            return;
-        }
-        if (row->id == ROW_ID_HEADER) {
-            std::string hdr = translate("Nome");
-            std::string markup = "<span weight='bold'>" + hdr + "</span>";
-            gtk_label_set_markup(GTK_LABEL(label), markup.c_str());
-            gtk_label_set_xalign(GTK_LABEL(label), 0.0);
-            gtk_list_item_set_selectable(item, FALSE);
-            /* Apply header-row class so the repeated header visually matches the main header */
-            gtk_widget_add_css_class(GTK_WIDGET(item), "header-row");
-            ensure_separator_css_provider();
-            if (separator_css_provider) {
-                gtk_style_context_add_provider(gtk_widget_get_style_context(GTK_WIDGET(item)), GTK_STYLE_PROVIDER(separator_css_provider), GTK_STYLE_PROVIDER_PRIORITY_USER);
-            }
-            return;
-        }
-        // Normal row
-        gtk_label_set_text(GTK_LABEL(label), row->name ? row->name : "");
-        /* Remove any visual-only classes that may have been applied when this ListItem was reused */
-        gtk_widget_remove_css_class(GTK_WIDGET(item), "separator-row");
-        gtk_widget_remove_css_class(GTK_WIDGET(item), "header-row");
-        // Apply foil styling
-        if (row->foil) gtk_widget_add_css_class(label, "foil"); else gtk_widget_remove_css_class(label, "foil");
-        // Aggiungi gesture per click destro
-        GtkGesture *gesture = gtk_gesture_click_new();
-        gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(gesture), GDK_BUTTON_SECONDARY);
-        g_signal_connect(gesture, "pressed", G_CALLBACK(on_row_right_click), item);
-        gtk_widget_add_controller(label, GTK_EVENT_CONTROLLER(gesture));
-    }), NULL);
+    g_signal_connect(name_factory, "setup", G_CALLBACK(name_factory_setup_cb), NULL);
+    g_signal_connect(name_factory, "bind", G_CALLBACK(name_factory_bind_cb), NULL);
     GtkColumnViewColumn *name_col = gtk_column_view_column_new("Nome", name_factory);
     gtk_column_view_column_set_expand(name_col, TRUE);
     gtk_column_view_column_set_resizable(name_col, FALSE);
@@ -5519,6 +5929,12 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         gtk_label_set_xalign(GTK_LABEL(label), 0.5);
         gtk_label_set_ellipsize(GTK_LABEL(label), PANGO_ELLIPSIZE_END);
         gtk_list_item_set_child(item, label);
+    /* Right-click is handled per-cell; double-click is handled on the whole row (outer_vbox)
+     * to avoid conflicting/overlapping gesture controllers. */
+        GtkGesture *rclk = gtk_gesture_click_new();
+        gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(rclk), GDK_BUTTON_SECONDARY);
+        g_signal_connect(rclk, "pressed", G_CALLBACK(on_row_right_click), item);
+        gtk_widget_add_controller(label, GTK_EVENT_CONTROLLER(rclk));
     }), NULL);
     g_signal_connect(type_factory, "bind", G_CALLBACK(+[](GtkListItemFactory *, GtkListItem *item, gpointer) {
         CardRow *row = (CardRow*)gtk_list_item_get_item(item);
@@ -5541,8 +5957,15 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
             gtk_list_item_set_selectable(item, FALSE);
             return;
         }
-        gtk_label_set_text(GTK_LABEL(label), row->type ? row->type : "");
-        if (row->foil) gtk_widget_add_css_class(label, "foil"); else gtk_widget_remove_css_class(label, "foil");
+    gtk_label_set_text(GTK_LABEL(label), row->type ? row->type : "");
+    if (row->foil) gtk_widget_add_css_class(label, "foil"); else gtk_widget_remove_css_class(label, "foil");
+    /* Hide this column cell when the card is in a deck OR when the tendina is open */
+    char* _in_deck = (char*)g_object_get_data(G_OBJECT(item), "in_deck_names");
+    gpointer _t = NULL;
+    if (row) _t = g_object_get_data(G_OBJECT(row), "tendina_open");
+    if (!_t) _t = g_object_get_data(G_OBJECT(item), "tendina_open");
+    gboolean is_open = _t ? (GPOINTER_TO_INT(_t) != 0) : FALSE;
+    if ((_in_deck && strlen(_in_deck) > 0) || is_open) gtk_widget_set_visible(label, FALSE); else gtk_widget_set_visible(label, TRUE);
         // Aggiungi gesture per click destro
         GtkGesture *gesture = gtk_gesture_click_new();
         gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(gesture), GDK_BUTTON_SECONDARY);
@@ -5552,7 +5975,8 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     GtkColumnViewColumn *type_col = gtk_column_view_column_new("Tipo", type_factory);
     gtk_column_view_column_set_expand(type_col, TRUE);
     gtk_column_view_column_set_resizable(type_col, FALSE);
-    gtk_column_view_append_column(column_view, type_col);
+    // NOTE: hide the separate 'Tipo' column — the type is now displayed in the Name column's meta label.
+    // Do not append type_col to the column_view to keep the UI compact.
     state->type_col = type_col;
     // gtk_column_view_column_set_sorter(type_col, GTK_SORTER(gtk_string_sorter_new(gtk_property_expression_new(G_TYPE_STRING, card_row_get_type(), "type"))));
 
@@ -5563,6 +5987,15 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         gtk_label_set_xalign(GTK_LABEL(label), 0.5);
         gtk_label_set_ellipsize(GTK_LABEL(label), PANGO_ELLIPSIZE_END);
         gtk_list_item_set_child(item, label);
+    /* Make this cell also respond to double-click so clicking anywhere on the row toggles the tendina. */
+        GtkGesture *dbl = gtk_gesture_click_new();
+        gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(dbl), GDK_BUTTON_PRIMARY);
+        g_signal_connect(dbl, "pressed", G_CALLBACK(on_row_double_click), item);
+        gtk_widget_add_controller(label, GTK_EVENT_CONTROLLER(dbl));
+        GtkGesture *rclk = gtk_gesture_click_new();
+        gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(rclk), GDK_BUTTON_SECONDARY);
+        g_signal_connect(rclk, "pressed", G_CALLBACK(on_row_right_click), item);
+        gtk_widget_add_controller(label, GTK_EVENT_CONTROLLER(rclk));
     }), NULL);
     g_signal_connect(colors_factory, "bind", G_CALLBACK(+[](GtkListItemFactory *, GtkListItem *item, gpointer) {
         CardRow *row = (CardRow*)gtk_list_item_get_item(item);
@@ -5585,8 +6018,14 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
             gtk_list_item_set_selectable(item, FALSE);
             return;
         }
-        gtk_label_set_text(GTK_LABEL(label), row->translated_colors ? row->translated_colors : "");
-        if (row->foil) gtk_widget_add_css_class(label, "foil"); else gtk_widget_remove_css_class(label, "foil");
+    gtk_label_set_text(GTK_LABEL(label), row->translated_colors ? row->translated_colors : "");
+    if (row->foil) gtk_widget_add_css_class(label, "foil"); else gtk_widget_remove_css_class(label, "foil");
+    char* _in_deck = (char*)g_object_get_data(G_OBJECT(item), "in_deck_names");
+    gpointer _t = NULL;
+    if (row) _t = g_object_get_data(G_OBJECT(row), "tendina_open");
+    if (!_t) _t = g_object_get_data(G_OBJECT(item), "tendina_open");
+    gboolean is_open = _t ? (GPOINTER_TO_INT(_t) != 0) : FALSE;
+    if ((_in_deck && strlen(_in_deck) > 0) || is_open) gtk_widget_set_visible(label, FALSE); else gtk_widget_set_visible(label, TRUE);
         // Aggiungi gesture per click destro
         GtkGesture *gesture = gtk_gesture_click_new();
         gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(gesture), GDK_BUTTON_SECONDARY);
@@ -5607,6 +6046,15 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         gtk_label_set_xalign(GTK_LABEL(label), 0.5);
         gtk_label_set_ellipsize(GTK_LABEL(label), PANGO_ELLIPSIZE_END);
         gtk_list_item_set_child(item, label);
+    /* Make this cell also respond to double-click so clicking anywhere on the row toggles the tendina. */
+        GtkGesture *dbl = gtk_gesture_click_new();
+        gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(dbl), GDK_BUTTON_PRIMARY);
+        g_signal_connect(dbl, "pressed", G_CALLBACK(on_row_double_click), item);
+        gtk_widget_add_controller(label, GTK_EVENT_CONTROLLER(dbl));
+        GtkGesture *rclk = gtk_gesture_click_new();
+        gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(rclk), GDK_BUTTON_SECONDARY);
+        g_signal_connect(rclk, "pressed", G_CALLBACK(on_row_right_click), item);
+        gtk_widget_add_controller(label, GTK_EVENT_CONTROLLER(rclk));
     }), NULL);
     g_signal_connect(mana_factory, "bind", G_CALLBACK(+[](GtkListItemFactory *, GtkListItem *item, gpointer) {
         CardRow *row = (CardRow*)gtk_list_item_get_item(item);
@@ -5635,8 +6083,14 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         } else {
             snprintf(cost_str, sizeof(cost_str), "0");
         }
-        gtk_label_set_text(GTK_LABEL(label), cost_str);
-        if (row->foil) gtk_widget_add_css_class(label, "foil"); else gtk_widget_remove_css_class(label, "foil");
+    gtk_label_set_text(GTK_LABEL(label), cost_str);
+    if (row->foil) gtk_widget_add_css_class(label, "foil"); else gtk_widget_remove_css_class(label, "foil");
+    char* _in_deck = (char*)g_object_get_data(G_OBJECT(item), "in_deck_names");
+    gpointer _t = NULL;
+    if (row) _t = g_object_get_data(G_OBJECT(row), "tendina_open");
+    if (!_t) _t = g_object_get_data(G_OBJECT(item), "tendina_open");
+    gboolean is_open = _t ? (GPOINTER_TO_INT(_t) != 0) : FALSE;
+    if ((_in_deck && strlen(_in_deck) > 0) || is_open) gtk_widget_set_visible(label, FALSE); else gtk_widget_set_visible(label, TRUE);
         // Aggiungi gesture per click destro
         GtkGesture *gesture = gtk_gesture_click_new();
         gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(gesture), GDK_BUTTON_SECONDARY);
@@ -5657,6 +6111,15 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         gtk_label_set_xalign(GTK_LABEL(label), 0.5);
         gtk_label_set_ellipsize(GTK_LABEL(label), PANGO_ELLIPSIZE_END);
         gtk_list_item_set_child(item, label);
+    /* Make this cell also respond to double-click so clicking anywhere on the row toggles the tendina. */
+        GtkGesture *dbl = gtk_gesture_click_new();
+        gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(dbl), GDK_BUTTON_PRIMARY);
+        g_signal_connect(dbl, "pressed", G_CALLBACK(on_row_double_click), item);
+        gtk_widget_add_controller(label, GTK_EVENT_CONTROLLER(dbl));
+        GtkGesture *rclk = gtk_gesture_click_new();
+        gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(rclk), GDK_BUTTON_SECONDARY);
+        g_signal_connect(rclk, "pressed", G_CALLBACK(on_row_right_click), item);
+        gtk_widget_add_controller(label, GTK_EVENT_CONTROLLER(rclk));
     }), NULL);
     g_signal_connect(rarity_factory, "bind", G_CALLBACK(+[](GtkListItemFactory *, GtkListItem *item, gpointer) {
         CardRow *row = (CardRow*)gtk_list_item_get_item(item);
@@ -5684,6 +6147,8 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     std::string localized_rarity = translate_rarity(raw_rarity);
     gtk_label_set_text(GTK_LABEL(label), localized_rarity.c_str());
         if (row->foil) gtk_widget_add_css_class(label, "foil"); else gtk_widget_remove_css_class(label, "foil");
+        char* _in_deck = (char*)g_object_get_data(G_OBJECT(item), "in_deck_names");
+        if (_in_deck && strlen(_in_deck) > 0) gtk_widget_set_visible(label, FALSE); else gtk_widget_set_visible(label, TRUE);
         // Aggiungi gesture per click destro
         GtkGesture *gesture = gtk_gesture_click_new();
         gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(gesture), GDK_BUTTON_SECONDARY);
@@ -5704,6 +6169,15 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         gtk_label_set_xalign(GTK_LABEL(label), 0.5);
         gtk_label_set_ellipsize(GTK_LABEL(label), PANGO_ELLIPSIZE_END);
         gtk_list_item_set_child(item, label);
+    /* Make this cell also respond to double-click so clicking anywhere on the row toggles the tendina. */
+        GtkGesture *dbl = gtk_gesture_click_new();
+        gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(dbl), GDK_BUTTON_PRIMARY);
+        g_signal_connect(dbl, "pressed", G_CALLBACK(on_row_double_click), item);
+        gtk_widget_add_controller(label, GTK_EVENT_CONTROLLER(dbl));
+        GtkGesture *rclk = gtk_gesture_click_new();
+        gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(rclk), GDK_BUTTON_SECONDARY);
+        g_signal_connect(rclk, "pressed", G_CALLBACK(on_row_right_click), item);
+        gtk_widget_add_controller(label, GTK_EVENT_CONTROLLER(rclk));
     }), NULL);
     g_signal_connect(date_factory, "bind", G_CALLBACK(+[](GtkListItemFactory *, GtkListItem *item, gpointer) {
         CardRow *row = (CardRow*)gtk_list_item_get_item(item);
@@ -5727,8 +6201,14 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
             return;
         }
     std::string formatted = format_datetime(row->added_date ? row->added_date : "");
-        gtk_label_set_text(GTK_LABEL(label), formatted.c_str());
-        if (row->foil) gtk_widget_add_css_class(label, "foil"); else gtk_widget_remove_css_class(label, "foil");
+    gtk_label_set_text(GTK_LABEL(label), formatted.c_str());
+    if (row->foil) gtk_widget_add_css_class(label, "foil"); else gtk_widget_remove_css_class(label, "foil");
+    char* _in_deck = (char*)g_object_get_data(G_OBJECT(item), "in_deck_names");
+    gpointer _t = NULL;
+    if (row) _t = g_object_get_data(G_OBJECT(row), "tendina_open");
+    if (!_t) _t = g_object_get_data(G_OBJECT(item), "tendina_open");
+    gboolean is_open = _t ? (GPOINTER_TO_INT(_t) != 0) : FALSE;
+    if ((_in_deck && strlen(_in_deck) > 0) || is_open) gtk_widget_set_visible(label, FALSE); else gtk_widget_set_visible(label, TRUE);
         // Aggiungi gesture per click destro
         GtkGesture *gesture = gtk_gesture_click_new();
         gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(gesture), GDK_BUTTON_SECONDARY);
@@ -5747,6 +6227,15 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         GtkWidget *label = gtk_label_new("");
         gtk_label_set_xalign(GTK_LABEL(label), 0.5);
         gtk_list_item_set_child(item, label);
+    /* Make this cell also respond to double-click so clicking anywhere on the row toggles the tendina. */
+        GtkGesture *dbl = gtk_gesture_click_new();
+        gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(dbl), GDK_BUTTON_PRIMARY);
+        g_signal_connect(dbl, "pressed", G_CALLBACK(on_row_double_click), item);
+        gtk_widget_add_controller(label, GTK_EVENT_CONTROLLER(dbl));
+        GtkGesture *rclk = gtk_gesture_click_new();
+        gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(rclk), GDK_BUTTON_SECONDARY);
+        g_signal_connect(rclk, "pressed", G_CALLBACK(on_row_right_click), item);
+        gtk_widget_add_controller(label, GTK_EVENT_CONTROLLER(rclk));
     }), NULL);
     g_signal_connect(qty_factory, "bind", G_CALLBACK(+[](GtkListItemFactory *, GtkListItem *item, gpointer) {
         CardRow *row = (CardRow*)gtk_list_item_get_item(item);
@@ -5778,6 +6267,8 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
             gtk_label_set_text(GTK_LABEL(label), qty);
         }
         if (row->foil) gtk_widget_add_css_class(label, "foil"); else gtk_widget_remove_css_class(label, "foil");
+        char* _in_deck = (char*)g_object_get_data(G_OBJECT(item), "in_deck_names");
+        if (_in_deck && strlen(_in_deck) > 0) gtk_widget_set_visible(label, FALSE); else gtk_widget_set_visible(label, TRUE);
         // Aggiungi gesture per click destro
         GtkGesture *gesture = gtk_gesture_click_new();
         gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(gesture), GDK_BUTTON_SECONDARY);
@@ -6271,6 +6762,25 @@ static GMenu* create_context_menu(CardRow *row, AppState *state) {
 }
 
 int main(int argc, char *argv[]) {
+    // Check for --log flag. If not present, silence stdout/stderr so logs
+    // (g_print / std::cout) do not appear. If present, leave streams as-is.
+    bool log_enabled = false;
+    int dst = 1;
+    for (int src = 1; src < argc; ++src) {
+        if (strcmp(argv[src], "--log") == 0) {
+            log_enabled = true;
+            continue; // drop from argv
+        }
+        argv[dst++] = argv[src];
+    }
+    argc = dst;
+
+    if (!log_enabled) {
+        // Redirect stdout/stderr to /dev/null to suppress logs by default
+        freopen("/dev/null", "w", stdout);
+        freopen("/dev/null", "w", stderr);
+    }
+
     GtkApplication *app = gtk_application_new("org.magicdb.collection", G_APPLICATION_DEFAULT_FLAGS);
     g_signal_connect(app, "activate", G_CALLBACK(on_activate), NULL);
     int status = g_application_run(G_APPLICATION(app), argc, argv);
