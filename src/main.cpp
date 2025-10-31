@@ -728,6 +728,10 @@ struct AppState {
     GtkColumnView* column_view;
     GtkSelectionModel* selection;
     GtkWidget* search_entry;
+    // Inline add controls (when viewing main DB)
+    GtkWidget* inline_add_entry;
+    GtkWidget* inline_add_spin;
+    GtkWidget* inline_add_foil;
     GtkColumnViewColumn *name_col, *type_col, *colors_col, *mana_col, *rarity_col, *date_col, *qty_col;
     GtkWidget* add_card_button;
     GtkWidget* file_button;
@@ -2679,6 +2683,20 @@ struct AddCardContext {
     GtkWidget* foil_checkbox;
 };
 
+// Find a descendant widget that implements GtkEditable (e.g., the internal
+// entry inside a GtkSpinButton). Returns the first match or NULL if none found.
+static GtkWidget* find_editable_descendant(GtkWidget* root) {
+    if (!root) return NULL;
+    GtkWidget* child = gtk_widget_get_first_child(root);
+    while (child) {
+        if (GTK_IS_EDITABLE(child)) return child;
+        GtkWidget* found = find_editable_descendant(child);
+        if (found) return found;
+        child = gtk_widget_get_next_sibling(child);
+    }
+    return NULL;
+}
+
 // Funzione per caricare le carte dal database
 static std::vector<std::map<std::string, std::string>> load_cards_from_db(Database* db, const std::string& filter = "", int deck_filter = -1, bool only_no_deck = false) {
     std::vector<std::map<std::string, std::string>> cards;
@@ -3533,6 +3551,10 @@ static void on_add_card_ok_clicked(GtkButton *button, gpointer user_data) {
             // Reset inputs so user can add another card quickly
             gtk_editable_set_text(GTK_EDITABLE(entry), "");
             gtk_spin_button_set_value(GTK_SPIN_BUTTON(spin), 1);
+            // If there was a foil checkbox, reset it as well
+            if (ctx->foil_checkbox) {
+                g_object_set(G_OBJECT(ctx->foil_checkbox), "active", FALSE, NULL);
+            }
             // Try to grab focus now and also schedule the reliable timeout (configured)
             gtk_widget_grab_focus(entry);
             schedule_focus_retries(entry, state);
@@ -3748,6 +3770,9 @@ static void on_add_card_ok_clicked(GtkButton *button, gpointer user_data) {
                 // Reset inputs immediately (so the dialog below shows cleared fields)
                 gtk_editable_set_text(GTK_EDITABLE(sctx->original_ctx->entry), "");
                 gtk_spin_button_set_value(GTK_SPIN_BUTTON(sctx->original_ctx->spin), 1);
+                if (sctx->original_ctx->foil_checkbox) {
+                    g_object_set(G_OBJECT(sctx->original_ctx->foil_checkbox), "active", FALSE, NULL);
+                }
                 // Also try an immediate grab (best-effort) — the scheduled retries will
                 // perform the reliable focus restore after the selection dialog is
                 // destroyed.
@@ -5842,6 +5867,85 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     gtk_box_append(GTK_BOX(button_box), add_card_button);
     gtk_box_append(GTK_BOX(button_box), refresh_button);
     gtk_box_append(GTK_BOX(button_box), search_entry);
+    // Inline add controls (shown in main DB view). These replace the old
+    // modal add dialog for quick additions: entry + quantity spin + foil.
+    GtkWidget *inline_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(inline_entry), "Aggiungi carta...");
+    gtk_widget_set_size_request(inline_entry, 180, -1);
+    gtk_widget_set_margin_start(inline_entry, 6);
+
+    GtkWidget *inline_spin = gtk_spin_button_new_with_range(1, 100, 1);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(inline_spin), 1);
+    gtk_widget_set_size_request(inline_spin, 56, -1);
+    gtk_widget_set_margin_start(inline_spin, 8);
+    gtk_widget_set_margin_end(inline_spin, 8);
+
+    GtkWidget *inline_foil = gtk_check_button_new_with_label("Foil");
+    gtk_widget_set_margin_start(inline_foil, 6);
+
+    // Create AddCardContext for inline widgets and connect entry activate
+    AddCardContext* inline_ctx = new AddCardContext{inline_entry, inline_spin, state, GTK_WINDOW(window), inline_foil};
+    g_signal_connect(inline_entry, "activate", G_CALLBACK(on_add_card_ok_clicked), inline_ctx);
+
+    // Attach a key controller to the spin so Enter triggers the add action
+    {
+        GtkEventController *spin_key = gtk_event_controller_key_new();
+        g_signal_connect(spin_key, "key-pressed", G_CALLBACK(+[](GtkEventControllerKey* ctrl, guint keyval, guint keycode, GdkModifierType mods, gpointer user_data) -> gboolean {
+            (void)ctrl; (void)keycode; (void)mods;
+            AddCardContext* c = (AddCardContext*)user_data;
+            if (!c) return FALSE;
+            if (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter) {
+                on_add_card_ok_clicked(NULL, c);
+                return TRUE;
+            }
+            return FALSE;
+        }), inline_ctx);
+        gtk_widget_add_controller(inline_spin, spin_key);
+    }
+
+    // Connect to the internal editable of the spin after it's realized so that
+    // the internal entry's "activate" is handled (some themes create the
+    // child lazily).
+    g_signal_connect(inline_spin, "realize", G_CALLBACK(+[](GtkWidget* spin, gpointer user_data){
+        AddCardContext* c = (AddCardContext*)user_data;
+        if (!c) return;
+        GtkWidget* edit = find_editable_descendant(spin);
+        if (edit) {
+            g_signal_connect(edit, "activate", G_CALLBACK(on_add_card_ok_clicked), c);
+        }
+    }), inline_ctx);
+
+    // Key controller on the button_box: if focus is inside the inline widgets
+    // and Enter is pressed, trigger add.
+    {
+        GtkEventController *bb_key = gtk_event_controller_key_new();
+        g_signal_connect(bb_key, "key-pressed", G_CALLBACK(+[](GtkEventControllerKey* ctrl, guint keyval, guint keycode, GdkModifierType mods, gpointer user_data) -> gboolean {
+            (void)ctrl; (void)keycode; (void)mods;
+            AddCardContext* c = (AddCardContext*)user_data;
+            if (!c) return FALSE;
+            if (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter) {
+                GtkWindow *win = c->parent;
+                if (!GTK_IS_WINDOW(win)) return FALSE;
+                GtkWidget *focused = gtk_window_get_focus(win);
+                if (!focused) return FALSE;
+                if (focused == c->entry || focused == c->spin || gtk_widget_is_ancestor(GTK_WIDGET(c->spin), focused)) {
+                    on_add_card_ok_clicked(NULL, c);
+                    return TRUE;
+                }
+            }
+            return FALSE;
+        }), inline_ctx);
+        gtk_widget_add_controller(button_box, bb_key);
+    }
+
+    // Append inline widgets to the button box (hidden when viewing a deck)
+    gtk_box_append(GTK_BOX(button_box), inline_entry);
+    gtk_box_append(GTK_BOX(button_box), inline_spin);
+    gtk_box_append(GTK_BOX(button_box), inline_foil);
+
+    state->inline_add_entry = inline_entry;
+    state->inline_add_spin = inline_spin;
+    state->inline_add_foil = inline_foil;
     if (deck_delete_button) gtk_box_append(GTK_BOX(button_box), deck_delete_button);
     if (db_button) gtk_box_append(GTK_BOX(button_box), db_button);
 

@@ -542,6 +542,11 @@ bool Database::insert_card(const std::string& english_name, const std::string& l
         }
         sqlite3_bind_int(update_stmt, 1, existing_qty + quantity);
         sqlite3_bind_int(update_stmt, 2, existing_id);
+        // Some SQLite builds with contentless FTS5 may raise errors inside triggers
+        // (e.g. "cannot DELETE from contentless fts5 table"). To avoid failing the
+        // user's save operation, drop the FTS triggers temporarily, perform the
+        // update, then recreate the triggers if the FTS table exists.
+        sqlite3_exec(db, "DROP TRIGGER IF EXISTS trg_cards_ai; DROP TRIGGER IF EXISTS trg_cards_au; DROP TRIGGER IF EXISTS trg_cards_ad;", nullptr, nullptr, nullptr);
         rc = sqlite3_step(update_stmt);
         sqlite3_finalize(update_stmt);
         if (rc != SQLITE_DONE) {
@@ -549,27 +554,68 @@ bool Database::insert_card(const std::string& english_name, const std::string& l
             return false;
         }
         std::cout << "Updated card " << english_name << " quantity to " << (existing_qty + quantity) << std::endl;
+        // Attempt to recreate lightweight FTS triggers (best-effort). If cards_fts
+        // exists, create the standard triggers to keep it in sync.
+        sqlite3_stmt* s2 = nullptr;
+        const char* q2 = "SELECT name FROM sqlite_master WHERE type='table' AND name='cards_fts'";
+        if (sqlite3_prepare_v2(db, q2, -1, &s2, nullptr) == SQLITE_OK) {
+            if (sqlite3_step(s2) == SQLITE_ROW) {
+                // create triggers (ignore errors)
+                const char* trig_ins =
+                    "CREATE TRIGGER trg_cards_ai AFTER INSERT ON cards BEGIN "
+                    "INSERT INTO cards_fts(rowid, name, type, mana_cost, rarity, set_code) VALUES (new.id, COALESCE(new.english_name, new.localized_name, new.name), new.type, new.mana_cost, new.rarity, new.set_code); "
+                    "END;";
+                const char* trig_upd =
+                    "CREATE TRIGGER trg_cards_au AFTER UPDATE ON cards BEGIN "
+                    "DELETE FROM cards_fts WHERE rowid = old.id; "
+                    "INSERT INTO cards_fts(rowid, name, type, mana_cost, rarity, set_code) VALUES (new.id, COALESCE(new.english_name, new.localized_name, new.name), new.type, new.mana_cost, new.rarity, new.set_code); "
+                    "END;";
+                const char* trig_del =
+                    "CREATE TRIGGER trg_cards_ad AFTER DELETE ON cards BEGIN "
+                    "DELETE FROM cards_fts WHERE rowid = old.id; "
+                    "END;";
+                sqlite3_exec(db, trig_ins, nullptr, nullptr, nullptr);
+                sqlite3_exec(db, trig_upd, nullptr, nullptr, nullptr);
+                sqlite3_exec(db, trig_del, nullptr, nullptr, nullptr);
+            }
+            sqlite3_finalize(s2);
+        }
         return true;
     } else {
         sqlite3_finalize(check_stmt);
         // Non esiste, inserisci nuova (imposta added_date alla data/ora corrente in formato ISO)
-        const char* insert_sql = "INSERT INTO cards (english_name, localized_name, name, type, localized_type, colors, set_code, mana_cost, rarity, quantity, image_url, added_date, price_usd, foil, sideboard, deck_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        const char* insert_sql = "INSERT INTO cards (english_name, localized_name, name, canonical_name, type, localized_type, colors, set_code, mana_cost, rarity, quantity, image_url, added_date, price_usd, foil, sideboard, deck_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
         sqlite3_stmt* insert_stmt;
         if (sqlite3_prepare_v2(db, insert_sql, -1, &insert_stmt, nullptr) != SQLITE_OK) {
             std::cerr << "Errore prepare insert: " << sqlite3_errmsg(db) << std::endl;
             return false;
         }
+    // Compute canonical_name similar to migration: lower(trim(coalesce(english_name, localized_name, name)))
+    std::string base_name = !english_name.empty() ? english_name : (!localized_name.empty() ? localized_name : std::string());
+    // trim
+    auto trim = [](std::string s) {
+        size_t start = 0;
+        while (start < s.size() && isspace((unsigned char)s[start])) ++start;
+        size_t end = s.size();
+        while (end > start && isspace((unsigned char)s[end-1])) --end;
+        return s.substr(start, end - start);
+    };
+    std::string canonical = trim(base_name);
+    // tolower
+    for (auto &c : canonical) c = (char)tolower((unsigned char)c);
+
     sqlite3_bind_text(insert_stmt, 1, english_name.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(insert_stmt, 2, localized_name.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(insert_stmt, 3, localized_name.c_str(), -1, SQLITE_TRANSIENT); // name = localized for backward
-    sqlite3_bind_text(insert_stmt, 4, type.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(insert_stmt, 5, localized_type.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(insert_stmt, 6, colors.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(insert_stmt, 7, set_code.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(insert_stmt, 8, mana_cost.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(insert_stmt, 9, rarity.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(insert_stmt, 10, quantity);
-    sqlite3_bind_text(insert_stmt, 11, image_url.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(insert_stmt, 4, canonical.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(insert_stmt, 5, type.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(insert_stmt, 6, localized_type.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(insert_stmt, 7, colors.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(insert_stmt, 8, set_code.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(insert_stmt, 9, mana_cost.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(insert_stmt, 10, rarity.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(insert_stmt, 11, quantity);
+    sqlite3_bind_text(insert_stmt, 12, image_url.c_str(), -1, SQLITE_TRANSIENT);
         // Calcola timestamp ISO locale: YYYY-MM-DDTHH:MM:SS
         char timebuf[32] = {0};
         time_t now = time(nullptr);
@@ -580,22 +626,48 @@ bool Database::insert_card(const std::string& english_name, const std::string& l
         localtime_r(&now, &local_tm);
 #endif
         strftime(timebuf, sizeof(timebuf), "%Y-%m-%dT%H:%M:%S", &local_tm);
-        sqlite3_bind_text(insert_stmt, 12, timebuf, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(insert_stmt, 13, price_usd.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(insert_stmt, 13, timebuf, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(insert_stmt, 14, price_usd.c_str(), -1, SQLITE_TRANSIENT);
         // bind foil
-        sqlite3_bind_int(insert_stmt, 14, foil);
+        sqlite3_bind_int(insert_stmt, 15, foil);
         // bind sideboard
-        sqlite3_bind_int(insert_stmt, 15, sideboard);
+        sqlite3_bind_int(insert_stmt, 16, sideboard);
         if (deck_id != -1) {
-            sqlite3_bind_int(insert_stmt, 16, deck_id);
+            sqlite3_bind_int(insert_stmt, 17, deck_id);
         } else {
-            sqlite3_bind_null(insert_stmt, 16);
+            sqlite3_bind_null(insert_stmt, 17);
         }
+        // As above, drop FTS triggers before insert to avoid FTS5 trigger errors
+        sqlite3_exec(db, "DROP TRIGGER IF EXISTS trg_cards_ai; DROP TRIGGER IF EXISTS trg_cards_au; DROP TRIGGER IF EXISTS trg_cards_ad;", nullptr, nullptr, nullptr);
         rc = sqlite3_step(insert_stmt);
         sqlite3_finalize(insert_stmt);
         if (rc != SQLITE_DONE) {
             std::cerr << "Errore insert: " << sqlite3_errmsg(db) << std::endl;
             return false;
+        }
+        // recreate triggers if FTS table exists (best-effort)
+        sqlite3_stmt* s3 = nullptr;
+        const char* q3 = "SELECT name FROM sqlite_master WHERE type='table' AND name='cards_fts'";
+        if (sqlite3_prepare_v2(db, q3, -1, &s3, nullptr) == SQLITE_OK) {
+            if (sqlite3_step(s3) == SQLITE_ROW) {
+                const char* trig_ins =
+                    "CREATE TRIGGER trg_cards_ai AFTER INSERT ON cards BEGIN "
+                    "INSERT INTO cards_fts(rowid, name, type, mana_cost, rarity, set_code) VALUES (new.id, COALESCE(new.english_name, new.localized_name, new.name), new.type, new.mana_cost, new.rarity, new.set_code); "
+                    "END;";
+                const char* trig_upd =
+                    "CREATE TRIGGER trg_cards_au AFTER UPDATE ON cards BEGIN "
+                    "DELETE FROM cards_fts WHERE rowid = old.id; "
+                    "INSERT INTO cards_fts(rowid, name, type, mana_cost, rarity, set_code) VALUES (new.id, COALESCE(new.english_name, new.localized_name, new.name), new.type, new.mana_cost, new.rarity, new.set_code); "
+                    "END;";
+                const char* trig_del =
+                    "CREATE TRIGGER trg_cards_ad AFTER DELETE ON cards BEGIN "
+                    "DELETE FROM cards_fts WHERE rowid = old.id; "
+                    "END;";
+                sqlite3_exec(db, trig_ins, nullptr, nullptr, nullptr);
+                sqlite3_exec(db, trig_upd, nullptr, nullptr, nullptr);
+                sqlite3_exec(db, trig_del, nullptr, nullptr, nullptr);
+            }
+            sqlite3_finalize(s3);
         }
         std::cout << "Inserted new card " << english_name << std::endl;
         return true;
@@ -908,7 +980,7 @@ bool Database::restore_snapshot(int snapshot_id) {
     if (sqlite3_step(sdel) != SQLITE_DONE) { sqlite3_finalize(sdel); sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr); return false; }
     sqlite3_finalize(sdel);
     // Insert snapshot rows as new cards for this deck
-    const char* ins = "INSERT INTO cards (english_name, localized_name, name, type, localized_type, colors, set_code, mana_cost, rarity, quantity, image_url, added_date, price_usd, foil, sideboard, deck_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+    const char* ins = "INSERT INTO cards (english_name, localized_name, name, canonical_name, type, localized_type, colors, set_code, mana_cost, rarity, quantity, image_url, added_date, price_usd, foil, sideboard, deck_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
     sqlite3_stmt* pins = nullptr;
     if (sqlite3_prepare_v2(db, ins, -1, &pins, nullptr) != SQLITE_OK) { sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr); return false; }
     // iterate snapshot rows
@@ -937,20 +1009,32 @@ bool Database::restore_snapshot(int snapshot_id) {
     sqlite3_bind_text(pins, 1, en_s, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(pins, 2, ln_s, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(pins, 3, ln_s, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(pins, 4, ty_s, -1, SQLITE_TRANSIENT);
+    // compute canonical_name from english/localized/name (coalesce)
+    std::string base_name2 = en_s && strlen(en_s) ? std::string(en_s) : (ln_s && strlen(ln_s) ? std::string(ln_s) : std::string());
+    auto trim2 = [](std::string s) {
+        size_t start = 0;
+        while (start < s.size() && isspace((unsigned char)s[start])) ++start;
+        size_t end = s.size();
+        while (end > start && isspace((unsigned char)s[end-1])) --end;
+        return s.substr(start, end - start);
+    };
+    std::string canonical2 = trim2(base_name2);
+    for (auto &c : canonical2) c = (char)tolower((unsigned char)c);
+    sqlite3_bind_text(pins, 4, canonical2.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(pins, 5, ty_s, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(pins, 6, cols_s, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(pins, 7, setc_s, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(pins, 8, mana_s, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(pins, 9, rar_s, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(pins, 10, qty);
-        sqlite3_bind_text(pins, 11, "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(pins, 6, ty_s, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(pins, 7, cols_s, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(pins, 8, setc_s, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(pins, 9, mana_s, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(pins, 10, rar_s, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(pins, 11, qty);
+        sqlite3_bind_text(pins, 12, "", -1, SQLITE_TRANSIENT);
         char timebuf2[32] = {0}; time_t now = time(nullptr); struct tm ltm{}; localtime_r(&now, &ltm); strftime(timebuf2, sizeof(timebuf2), "%Y-%m-%dT%H:%M:%S", &ltm);
-        sqlite3_bind_text(pins, 12, timebuf2, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(pins, 13, "", -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(pins, 14, foil);
-        sqlite3_bind_int(pins, 15, side);
-        sqlite3_bind_int(pins, 16, deck_id);
+        sqlite3_bind_text(pins, 13, timebuf2, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(pins, 14, "", -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(pins, 15, foil);
+        sqlite3_bind_int(pins, 16, side);
+        sqlite3_bind_int(pins, 17, deck_id);
         int rc = sqlite3_step(pins);
         sqlite3_reset(pins);
         if (rc != SQLITE_DONE) { sqlite3_finalize(pins); sqlite3_finalize(ssel); sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr); return false; }
