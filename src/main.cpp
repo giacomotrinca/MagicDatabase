@@ -577,7 +577,7 @@ struct FocusTarget {
 };
 
 // Forward declaration for send_notification (defined later)
-static void send_notification(const std::string& title, const std::string& body);
+static void send_notification(const std::string& title, const std::string& body, const std::string& icon);
 
 // Try to grab focus multiple times (short retries) to overcome races where the
 // window manager or other widgets steal focus when dialogs close.
@@ -630,9 +630,8 @@ static gboolean grab_focus_to_entry(gpointer data) {
     ft->tries -= 1;
     ft->attempt += 1;
     if (ft->tries <= 0) {
-        std::cout << "DEBUG: grab_focus_to_entry exhausted retries, will notify user and stop\n";
-        // Inform the user briefly and provide a hint to focus manually
-        send_notification("MagicDatabase", "Impossibile ripristinare il focus automatico. Premi Ctrl+N per focalizzare il campo di ricerca.");
+    std::cout << "DEBUG: grab_focus_to_entry exhausted retries, giving up and stopping\n";
+    // Informational only on stdout; per user preference do NOT send desktop notification on focus failures.
         delete ft;
         return G_SOURCE_REMOVE;
     }
@@ -701,12 +700,19 @@ static void load_settings() {
 
 // Send a desktop notification using notify-send. Uses g_shell_quote to safely
 // quote title/body and g_spawn_command_line_async to invoke the command.
-static void send_notification(const std::string& title, const std::string& body) {
+static void send_notification(const std::string& title, const std::string& body, const std::string& icon) {
     if (!g_notifications_enabled) return;
     GError* error = NULL;
     gchar* qtitle = g_shell_quote(title.c_str());
     gchar* qbody = g_shell_quote(body.c_str());
-    gchar* cmd = g_strdup_printf("notify-send %s %s", qtitle, qbody);
+    gchar* qicon = NULL;
+    if (!icon.empty()) qicon = g_shell_quote(icon.c_str());
+    gchar* cmd = NULL;
+    if (qicon) {
+        cmd = g_strdup_printf("notify-send --icon %s %s %s", qicon, qtitle, qbody);
+    } else {
+        cmd = g_strdup_printf("notify-send %s %s", qtitle, qbody);
+    }
     gboolean ok = g_spawn_command_line_async(cmd, &error);
     if (!ok) {
         std::cout << "DEBUG: notify-send failed: " << (error ? error->message : "unknown") << "\n";
@@ -715,6 +721,7 @@ static void send_notification(const std::string& title, const std::string& body)
     g_free(cmd);
     g_free(qtitle);
     g_free(qbody);
+    if (qicon) g_free(qicon);
 }
 
 
@@ -3547,7 +3554,7 @@ static void on_add_card_ok_clicked(GtkButton *button, gpointer user_data) {
             std::filesystem::path p(state->db_path);
             std::string dbname = p.filename().string();
             std::string body = card.name + " aggiunta a " + dbname;
-            send_notification("Carta aggiunta", body);
+            send_notification("Carta aggiunta", body, "#file:magicdb-icon.png");
             // Reset inputs so user can add another card quickly
             gtk_editable_set_text(GTK_EDITABLE(entry), "");
             gtk_spin_button_set_value(GTK_SPIN_BUTTON(spin), 1);
@@ -3700,7 +3707,7 @@ static void on_add_card_ok_clicked(GtkButton *button, gpointer user_data) {
                     std::filesystem::path p(sctx->state->db_path);
                     std::string dbname = p.filename().string();
                     std::string body = card.name + " aggiunta a " + dbname;
-                    send_notification("Carta aggiunta", body);
+                    send_notification("Carta aggiunta", body, "#file:magicdb-icon.png");
                     // Close the selection dialog (it will be closed later in this handler)
                 } else {
                     msg += "\n\n[Errore nel salvare]";
@@ -5227,6 +5234,20 @@ static GdkRGBA get_color_for_mana(const char* colors) {
 }
 
 static void on_add_card_action(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
+    (void)action; (void)parameter;
+    GtkWindow *window = GTK_WINDOW(user_data);
+    if (!window) return;
+    AppState* state = (AppState*)g_object_get_data(G_OBJECT(window), "app_state");
+    // If we're in the main DB view (no deck selected) and the inline controls
+    // exist, focus the inline add entry instead of opening the modal dialog.
+    if (state && state->selected_deck_id == -1 && state->inline_add_entry && GTK_IS_WIDGET(state->inline_add_entry)) {
+        // Try an immediate grab and schedule reliable retries to overcome WM focus policies
+        gtk_widget_grab_focus(state->inline_add_entry);
+        if (GTK_IS_EDITABLE(state->inline_add_entry)) gtk_editable_select_region(GTK_EDITABLE(state->inline_add_entry), 0, -1);
+        schedule_focus_retries(state->inline_add_entry, state);
+        return;
+    }
+    // Fallback: open the legacy add dialog (used when viewing a deck)
     on_add_card_clicked(NULL, user_data);
 }
 
