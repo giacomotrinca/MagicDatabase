@@ -1,58 +1,80 @@
-MagicDatabase
-===============
 
-A compact desktop collection manager for Magic: The Gathering.
+# MagicDatabase
 
-This GTK4 application is written in modern C++ and stores card data locally in SQLite. It integrates with Scryfall for card metadata and images, supports decks and sideboards, provides tagging and snapshots (deck versioning), and includes a per-deck mana-curve analyzer with PNG/PDF export and a textual report.
+**MagicDatabase** is your GTK4 command center for Magic: The Gathering. Sync straight from Scryfall, keep every card in a fast local SQLite vault, and break down mana curves without leaving the desktop.
 
-Table of contents
-- Features
-- Quick start
-- Dependencies
-- How to use (short)
-- Mana curve export
-- Export filenames & data layout
-- Troubleshooting
-- Development notes
-- Contributing
-- License & contact
+![Main window](screenshot/screenshot_ui.png)
+![Card detail](screenshot/screenshot_card_detail.png)
+![Mana curve analytics](screenshot/screenshot_mana_curve.png)
 
-Features
---------
+## Table of Contents
+- [Feature Rundown](#feature-rundown)
+- [Mana Curve Engine](#mana-curve-engine)
+- [Scryfall Sync and Pricing](#scryfall-sync-and-pricing)
+- [Database and Storage](#database-and-storage)
+- [Getting Started](#getting-started)
+- [Everyday Workflow](#everyday-workflow)
+- [Keyboard Shortcuts](#keyboard-shortcuts)
+- [Data Layout](#data-layout)
+- [Troubleshooting](#troubleshooting)
+- [License](#license)
 
-- Local SQLite storage for your collection
-- Scryfall integration for accurate card data and images
-- Decks with sideboard support and per-deck snapshots (create/list/restore)
-- Tags and notes for cards and decks, searchable
-- Filters by color, rarity and foil; text search
-- Mana-curve analysis per deck (chart + statistics) and export (PNG, PDF, text)
+## Feature Rundown
+- **Collection-first UI**: GTK4 `GtkColumnView` with instant sorting (including the USD price column), inline quantity updates, and paginated browsing. The footer keeps a running total of card count and aggregated value, formatted with currency helpers from `utils.cpp`.
+- **Deck aware by design**: create, select, and purge decks, move cards between main and sideboard, and keep split quantities in sync when spreading a card across multiple lists.
+- **Detail pane that matters**: double-click to open a sliding inspector with localized oracle text, pricing, color identity, and high-res art. Thumbnails are cached on disk (`data/img/`) via asynchronous prefetching so the list stays snappy even on cold starts.
+- **Filters and search**: filter by color identity, rarity, foil status, deck membership, and string search (`Ctrl+F`). Filters mirror the bilingual UI, translating type/rary names on the fly.
+- **Multilingual & polite**: toggle Italian/English from the View menu. Desktop notifications and focus behavior can be customized in Preferences (retry counts and delay are persisted in `settings.ini`).
+- **Exports built in**: from the File menu export the whole database or a single deck. Database exports are bilingual tables (EN/IT) with columns for mana cost, rarity, USD price, and foil flag; deck exports provide aligned main/sideboard lists in the chosen language.
+- **Offline friendly**: once downloaded, cards, prices, settings, and images live locally. Scryfall responses are cached for 10 minutes, and the app never requires an always-on connection beyond the API calls you initiate.
 
-What's new (Oct 2025)
-----------------------
+## Mana Curve Engine
+- **Scope aware**: the curve recomputes from whichever view you are in. On decks it uses the exact 99/60-card list; on the main database it respects current filters and aggregates duplicates exactly like the grid.
+- **Bucket math**: converted mana values are summed into buckets `0..10` (with `>=6` collapsed into a single bar). Mana symbols are parsed from `{}` strings or legacy cost text, so hybrid and colorless pips contribute correctly.
+- **Statistics galore**: averages and medians are tracked separately for the whole deck, non-land spells, creatures, and non-creature spells. The mode bucket, max bucket, and per-bucket card lists feed both the UI and the exported report.
+- **Land targets**: recommended land counts follow a simple heuristic: 40% for 60-card shells, 38% for 70–89 cards, and 37% for 90+. The UI highlights the delta between the recommendation and your current land count.
+- **Spell targets**: expected spell distributions shift automatically depending on deck size.
 
-- Improved Mana Curve preview:
-  - The "Curva Mana" dialog now computes the curve on-the-fly from the current view/filters (works for both the main DB view and per-deck views).
-  - Three curve modes are available: "Totale" (overall), "Tipo" (by card type), and "Colore" (by mana color). Use the buttons above the chart to switch between them.
-  - The chart is enclosed in a styled frame with margins for a cleaner preview.
-- Visual and data behavior:
-  - Type plots now exclude Lands (they are folded into "Other").
-  - Color plots use mana-accurate colors: White shown as grey dashed, Blue/Black/Red/Green use the expected hues, and Colorless (incolore) is magenta.
-  - Empty type/color series are not plotted and the corresponding mode buttons are disabled when no data is available.
-  - Y-axis tick labels have been added to the multi-series plots for easier reading.
-- Export and dialog improvements:
-  - Export options remain available (PNG/PDF/TXT) and are accessible from the preview dialog.
-  - Export and Close buttons are displayed in a compact column on the right of the preview; top control buttons are compact as well.
-  - The preview dialog attempts to fit its contents (no oversized fixed window), and the preview surface is pre-rendered for snappy switching between modes.
-- Other UX & performance tweaks:
-  - The per-page size and "View All" behavior are persisted between runs.
-  - Thumbnails are prefetched asynchronously for faster list navigation.
-  - The textual statistics panel has been simplified (the raw distribution line removed) and provides per-bucket lists in the exported text report.
+  | Mana Value | 60-card decks | Commander (90+) |
+  | ---------- | ------------- | ---------------- |
+  | 1          | 24%           | 18%              |
+  | 2          | 22%           | 20%              |
+  | 3          | 18%           | 19%              |
+  | 4          | 16%           | 16%              |
+  | 5          | 12%           | 14%              |
+  | 6+         | 8%            | 13%              |
 
+  Targets are converted into absolute counts for your spell total, and the report shows `actual / target / delta` for each bucket.
+- **Color requirements**: land sources are inferred from JSON color data, type lines (`Plains`, `Island`, etc.), and oracle text that produces mana. The earliest turn you need one, two, or three of the same pip determines the requirement via these heuristics:
 
-Quick start
------------
+  | Earliest turn | Single pip | Double pip | Triple pip |
+  | ------------- | ---------- | ---------- | ----------- |
+  | 1             | 14 sources | -          | -           |
+  | 2             | 12 sources | 20 sources | -           |
+  | 3             | 11 sources | 17 sources | 23 sources  |
+  | 4             | 10 sources | 15 sources | 21 sources  |
+  | 5             | 9 sources  | 14 sources | 19 sources  |
 
-Clone, build and run (fish shell example):
+  Shares between pips and actual colored sources are compared, and the UI labels deltas with up/down trend chips.
+- **Role detection**: removal, board wipes, ramp, and card draw are detected through multilingual oracle-text heuristics (e.g., `destroy target`, `cerca nel tuo grimorio una carta terra`, `draw two cards`, `create a Treasure`). Counts surface in the sidebar and the exported text file.
+- **Color and type overlays**: toggle between total curve, by-type (creature, instant, sorcery, enchantment, artifact, planeswalker, other) and by-color (WUBRGC) views. Lines use color-accurate palettes, dashed for white to keep contrast.
+- **Exports**: one click produces `data/mana_curve_<name>.png`, `data/mana_curve_<name>.pdf` (vector via Cairo), and `data/mana_stats_<name>.txt` with bucket breakdowns, color shares, and per-bucket card lists. Surfaces are pre-rendered so swapping modes is instant.
+
+## Scryfall Sync and Pricing
+- Uses `libcurl` and `nlohmann::json` to hit Scryfall's search endpoint. Italian results are preferred; if none match the query, the app falls back to English and then backfills localized data when possible.
+- Responses are cached (LRU-style) for 10 minutes per query, keeping repeated lookups instantaneous. Price lookups use the `cards/named?exact=` endpoint as a fallback when the search payload lacks USD data.
+- Retrieved USD prices land in the database and in the dedicated price column. The main footer multiplies price by quantity to display total collection value; totals respect filters when you export.
+- Artwork URLs are prefetched asynchronously into `data/img/` so once a card is seen the detail pane can load instantly even offline.
+
+## Database and Storage
+- Pure SQLite with automatic migrations: when opening a database, missing columns (`added_date`, `price_usd`, `english_name`, `localized_name`, `localized_type`, `deck_id`, `foil`, `sideboard`, `oracle_text`) are added in place. Auxiliary tables for potential features (snapshots, tags, notes) are provisioned automatically so extensions can hook straight into them.
+- Full-text search (FTS5) tables and triggers are created when available, keeping the `cards_fts` index synchronized with inserts, updates, and deletes.
+- Performance tweaks: WAL mode, relaxed synchronous, memory temp store, and helpful indexes (`deck_id`, `sideboard`, `set_code`, `added_date`, `foil`, `name`, `english_name`) are enabled automatically.
+- Settings (language, notifications, focus retry parameters, last deck) are stored in `data/settings.ini`. The last opened database path is cached in `lastdb.txt` for quick relaunches.
+- Fonts: the Inter family ships in `data/fonts/` so charts and the UI render consistently across distros.
+
+## Getting Started
+Clone, build, and run (fish shell example):
 
 ```fish
 git clone https://github.com/giacomotrinca/MagicDatabase.git
@@ -61,22 +83,16 @@ make
 ./magicdb
 ```
 
-If the binary does not start, install the system development packages listed below and re-run `make`.
-
-Dependencies
-------------
-
-Required (development packages / headers):
-
+### Dependencies
 - C++17 toolchain (g++ or clang)
 - GTK4 development headers
-- sqlite3 development headers
-- Cairo development headers (for PNG/PDF export)
+- SQLite3 development headers
+- Cairo development headers (PNG/PDF export)
 - libcurl development headers
-- nlohmann/json (header-only) or distro package
-- make, pkg-config
+- nlohmann-json (header-only) or distro package
+- make and pkg-config
 
-Example for Ubuntu/Debian:
+Ubuntu/Debian packages:
 
 ```fish
 sudo apt update
@@ -84,74 +100,33 @@ sudo apt install -y build-essential pkg-config git \
   libgtk-4-dev libsqlite3-dev libcairo2-dev libcurl4-openssl-dev nlohmann-json3-dev
 ```
 
-How to use (short)
-------------------
+## Everyday Workflow
+- Launch `./magicdb`, or rely on the auto-open of the last database via `lastdb.txt`.
+- Create or open a database from **File → New/Open**. Everything lives under `data/`, so syncing the folder backs up cards, exports, and settings.
+- Add cards with **File → New Card** (`Ctrl+N`). The dialog searches Scryfall, shows localized details, and inserts cards directly into the database. Foil state, oracle text, and USD price are stored along with the quantity.
+- Build decks via **File → Create Deck**. Use drag/send actions to move cards between collection, main deck, and sideboard; the column view exposes quantity, price, rarity, and mana cost for quick auditing.
+- Hit **View → Filters** to slice by color identity, rarity, foil state, or to show only cards not assigned to any deck. Filters are applied before mana-curve calculations and exports.
+- Fire the **Mana Curve** action from the deck menu or toolbar for deep analytics. Use the type/color buttons above the chart to compare archetype silhouettes.
+- Use **File → Export Database/Deck** when you need list text, or the mana-curve export buttons for presentation-ready assets.
 
-- Launch: `./magicdb`
-- Create/open a database (File → New / Open). Databases and exported files are placed under `data/`.
-- Add cards (File → New Card or Ctrl+N). Mark cards as foil when appropriate.
-- Create/select decks (File → Select Deck) and add cards; mark sideboard entries.
-- Use View → Filters to filter by color/rarity/foil or to show "not in any deck".
+## Keyboard Shortcuts
+- `Ctrl+N` – add a card via Scryfall search
+- `Ctrl+F` – focus the search box
+- `Ctrl+,` – open Preferences
 
-Mana curve export
------------------
+## Data Layout
+- `data/` – everything runtime-related: databases, exports, cached images, settings, mana-curve artifacts.
+- `data/img/` – card art cached from Scryfall.
+- `data/mana_curve_*.png|pdf|txt` – exports generated by the analytics view.
+- `data/<deck>_data.txt` – deck exports; `data/tot_database_<date>_data.txt` and TSV/CSV siblings for collection exports.
+- `lastdb.txt` – remembers the most recently opened database path.
 
-The Mana Curve view is deck-scoped and includes:
+## Troubleshooting
+- **Missing GTK/Cairo headers**: ensure `pkg-config --cflags --libs gtk4` returns flags. Install `libgtk-4-dev` and `libcairo2-dev` if it does not.
+- **Corrupted or empty PDF export**: verify Cairo development headers are available when compiling; rebuild after installing `libcairo2-dev`.
+- **Duplicate rows**: foil and sideboard flags are part of the identity when aggregating. Toggle filters or merge duplicates from the deck management actions.
+- **Scryfall quota or connectivity**: cached responses live for 10 minutes. If you query the same card repeatedly while offline, the cached entry will be used.
 
-- Histogram (CMC buckets 0..10+)
-- Statistics: total cards, average CMC, median, mode, per-bucket distribution
-- Exports:
-  - PNG: raster snapshot
-  - PDF: vector redraw (high quality)
-  - Text report: per-bucket card lists and color breakdown
+## License
 
-Export filenames & data layout
------------------------------
-
-- All exports are written to `data/`.
-- Naming conventions:
-  - `data/mana_curve_<sanitized-deck-name>.png`
-  - `data/mana_curve_<sanitized-deck-name>.pdf`
-  - `data/mana_stats_<sanitized-deck-name>.txt`
-- Card `colors` are stored as a JSON array (e.g. `["W","U"]`). `foil` and `sideboard` are integer flags (0/1).
-
-Troubleshooting
----------------
-
-- PDF export crashes or corrupted PDF: ensure Cairo development headers are installed (e.g. `libcairo2-dev` on Debian/Ubuntu).
-- GTK/Cairo header errors while building: verify `pkg-config --cflags --libs gtk4` returns usable flags.
-- Duplicate rows: check whether `foil` or `sideboard` differ — those fields are part of uniqueness rules.
-
-Development notes
------------------
-
-- The database wrapper includes helper methods for snapshots, tags, and notes. Consider adding unit tests using SQLite in-memory to validate insert/merge/split behavior.
-- Filters are implemented client-side for responsiveness; for very large databases, prefer translating filters to SQL `WHERE` clauses.
-
-Contributing
-------------
-
-Contributions are welcome. Suggested tasks:
-
-- Add or improve translations (EN/IT)
-- Add unit tests for the database layer
-- Improve mana-curve visuals or export metadata
-
-Workflow:
-
-```bash
-git checkout -b feature/your-thing
-implement and test
-git push origin feature/your-thing
-open a PR
-```
-
-License & contact
------------------
-
-MIT — see the `LICENSE` file.
-
-Author: Giacomo Trinca — https://github.com/giacomotrinca
-Issues: https://github.com/giacomotrinca/MagicDatabase/issues
-
----
+MIT — see `LICENSE` for full terms. Built by [Giacomo Trinca](https://github.com/giacomotrinca); issues and feature requests welcome.
