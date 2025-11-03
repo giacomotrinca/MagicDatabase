@@ -23,11 +23,13 @@
 #include <cstring>
 #include <cstdio>
 #include <cmath>
+#include <cstdlib>
 #include <algorithm>
 #include <atomic>
 
 #include <sstream>
 #include <iomanip>
+#include <locale>
 // Forward declarations to allow scheduling helpers to be referenced before their definitions.
 struct AppState;
 struct ManaStatsExportCtx;
@@ -285,12 +287,30 @@ static double parse_price_to_double(const std::string& raw_price) {
     if (!cleaned.empty() && (cleaned[0] == '$' || cleaned[0] == '€')) {
         cleaned.erase(cleaned.begin());
     }
+    cleaned.erase(std::remove(cleaned.begin(), cleaned.end(), '"'), cleaned.end());
     if (cleaned.empty()) return 0.0;
-    try {
-        return std::stod(cleaned);
-    } catch (...) {
-        return 0.0;
+    bool has_comma = cleaned.find(',') != std::string::npos;
+    bool has_dot = cleaned.find('.') != std::string::npos;
+    if (has_comma && has_dot) {
+        size_t last_comma = cleaned.rfind(',');
+        size_t last_dot = cleaned.rfind('.');
+        if (last_comma > last_dot) {
+            cleaned.erase(std::remove(cleaned.begin(), cleaned.end(), '.'), cleaned.end());
+            std::replace(cleaned.begin(), cleaned.end(), ',', '.');
+        } else {
+            cleaned.erase(std::remove(cleaned.begin(), cleaned.end(), ','), cleaned.end());
+        }
+    } else if (has_comma) {
+        std::replace(cleaned.begin(), cleaned.end(), ',', '.');
     }
+    cleaned.erase(std::remove(cleaned.begin(), cleaned.end(), ' '), cleaned.end());
+    cleaned.erase(std::remove(cleaned.begin(), cleaned.end(), '\''), cleaned.end());
+    std::istringstream iss(cleaned);
+    iss.imbue(std::locale::classic());
+    double value = 0.0;
+    iss >> value;
+    if (iss.fail()) return 0.0;
+    return value;
 }
 
 static std::string format_currency_value(double value) {
@@ -848,6 +868,9 @@ struct ManaStatsExportCtx {
     cairo_surface_t* surf_total = nullptr;
     cairo_surface_t* surf_type = nullptr;
     cairo_surface_t* surf_color = nullptr;
+    GtkWidget* btn_total = nullptr;
+    GtkWidget* btn_type = nullptr;
+    GtkWidget* btn_color = nullptr;
     int w = 0;
     int h = 0;
     std::map<int,int> buckets;
@@ -955,6 +978,21 @@ static void stats_set_surface(ManaStatsExportCtx* ctx, cairo_surface_t* surf) {
     gtk_widget_queue_draw(ctx->da);
 }
 
+static void stats_mark_active_button(ManaStatsExportCtx* ctx, GtkWidget* active) {
+    if (!ctx) return;
+    GtkWidget* buttons[] = {ctx->btn_total, ctx->btn_type, ctx->btn_color};
+    for (GtkWidget* btn : buttons) {
+        if (!btn) continue;
+        gtk_widget_remove_css_class(btn, "stats-switch-active");
+    }
+    if (active) gtk_widget_add_css_class(active, "stats-switch-active");
+}
+
+static void stats_set_surface_active(ManaStatsExportCtx* ctx, cairo_surface_t* surf, GtkWidget* active) {
+    stats_set_surface(ctx, surf);
+    stats_mark_active_button(ctx, active);
+}
+
 static void on_stats_back_clicked(GtkButton*, gpointer user_data) {
     AppState* state = (AppState*)user_data;
     if (!state) return;
@@ -965,19 +1003,20 @@ static void on_stats_back_clicked(GtkButton*, gpointer user_data) {
 static void on_stats_surface_total(GtkButton*, gpointer user_data) {
     ManaStatsExportCtx* ctx = (ManaStatsExportCtx*)user_data;
     if (!ctx) return;
-    stats_set_surface(ctx, ctx->surf_total ? ctx->surf_total : ctx->surf);
+    cairo_surface_t* surf = ctx->surf_total ? ctx->surf_total : ctx->surf;
+    stats_set_surface_active(ctx, surf, ctx->btn_total);
 }
 
 static void on_stats_surface_type(GtkButton*, gpointer user_data) {
     ManaStatsExportCtx* ctx = (ManaStatsExportCtx*)user_data;
     if (!ctx || !ctx->surf_type) return;
-    stats_set_surface(ctx, ctx->surf_type);
+    stats_set_surface_active(ctx, ctx->surf_type, ctx->btn_type);
 }
 
 static void on_stats_surface_color(GtkButton*, gpointer user_data) {
     ManaStatsExportCtx* ctx = (ManaStatsExportCtx*)user_data;
     if (!ctx || !ctx->surf_color) return;
-    stats_set_surface(ctx, ctx->surf_color);
+    stats_set_surface_active(ctx, ctx->surf_color, ctx->btn_color);
 }
 
 // Schedule focus retries using the app-configured retries/interval.
@@ -2431,20 +2470,28 @@ static void draw_mana_multi_on_cairo(cairo_t* cr, int width, int height, const s
     cairo_pattern_destroy(bg);
 
     const int margin = 48;
-    int w = width - margin*2;
-    int h = height - margin*2;
+    const int legend_width = 180;
+    const int legend_padding = 24;
     int buckets = cap_bucket + 1;
 
     int maxc = 1;
     for (auto &s : series) for (auto &p : s.second) if (p.second > maxc) maxc = p.second;
 
-    double left = margin, top = margin, right = margin + w, bottom = margin + h;
+    double left = margin;
+    double top = margin;
+    double right = width - margin - legend_width;
+    if (right <= left + 10) right = width - margin - 10;
+    double bottom = height - margin;
+    double plot_w = right - left;
+    if (plot_w <= 0) plot_w = 1;
+    double plot_h = bottom - top;
+    if (plot_h <= 0) plot_h = 1;
 
     cairo_set_line_width(cr, 1.0);
     cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.06);
     int y_steps = 4;
     for (int s=0;s<=y_steps;++s) {
-        double yy = top + (h * (double)s / (double)y_steps);
+        double yy = top + (plot_h * (double)s / (double)y_steps);
         cairo_move_to(cr, left, yy);
         cairo_line_to(cr, right, yy);
         cairo_stroke(cr);
@@ -2462,18 +2509,19 @@ static void draw_mana_multi_on_cairo(cairo_t* cr, int width, int height, const s
     };
 
     int si = 0;
-    double legend_x = right - 180;
+    double legend_x = right + legend_padding;
     double legend_y = top + 12;
     for (auto &s : series) {
         std::vector<double> xs(buckets), ys(buckets);
         for (int i=0;i<buckets;++i) {
-            double x = left + (w * ((i + 0.0) / (double)(buckets - 1 < 1 ? 1 : buckets - 1)));
+            double denom = (double)(buckets - 1 < 1 ? 1 : buckets - 1);
+            double x = left + (plot_w * ((i + 0.0) / denom));
             xs[i] = x;
             int v = 0;
             auto it = s.second.find(i);
             if (it != s.second.end()) v = it->second;
             double y = bottom;
-            if (maxc > 0) y = bottom - ((h - 24) * (v / (double)maxc));
+            if (maxc > 0) y = bottom - ((plot_h - 24.0) * (v / (double)maxc));
             ys[i] = y;
         }
 
@@ -2497,7 +2545,7 @@ static void draw_mana_multi_on_cairo(cairo_t* cr, int width, int height, const s
         }
 
         cairo_new_path(cr);
-        cairo_move_to(cr, xs[0], bottom);
+    cairo_move_to(cr, xs[0], bottom);
         for (int i=0;i<buckets;++i) cairo_line_to(cr, xs[i], ys[i]);
         cairo_line_to(cr, xs.back(), bottom);
         cairo_close_path(cr);
@@ -2560,12 +2608,13 @@ static void draw_mana_multi_on_cairo(cairo_t* cr, int width, int height, const s
         else snprintf(lbl, sizeof(lbl), ">=%d", cap_bucket);
         cairo_text_extents_t ext;
         cairo_text_extents(cr, lbl, &ext);
-        double lx = left + (w * ((i + 0.0) / (double)(buckets - 1 < 1 ? 1 : buckets - 1))) - ext.width/2.0 - ext.x_bearing;
+        double lx = left + (plot_w * ((i + 0.0) / (double)(buckets - 1 < 1 ? 1 : buckets - 1))) - ext.width/2.0 - ext.x_bearing;
         double ly = bottom + 20;
         cairo_move_to(cr, lx, ly);
         cairo_show_text(cr, lbl);
     }
 
+    double max_tick_label_width = 0.0;
     cairo_set_font_size(cr, 11.0);
     for (int s=0;s<=y_steps;++s) {
         double frac = (double)(y_steps - s) / (double)y_steps;
@@ -2573,12 +2622,35 @@ static void draw_mana_multi_on_cairo(cairo_t* cr, int width, int height, const s
         char lb[32]; snprintf(lb, sizeof(lb), "%d", val);
         cairo_text_extents_t ext;
         cairo_text_extents(cr, lb, &ext);
-        double yy = top + (h * (double)s / (double)y_steps);
+        if (ext.width > max_tick_label_width) max_tick_label_width = ext.width;
+        double yy = top + (plot_h * (double)s / (double)y_steps);
         double lx = left - 10 - ext.width;
         double ly = yy + ext.height/2.0;
         cairo_move_to(cr, lx, ly);
         cairo_show_text(cr, lb);
     }
+
+    cairo_set_font_size(cr, 13.0);
+    cairo_set_source_rgba(cr, 0.9, 0.95, 1.0, 0.9);
+    cairo_select_font_face(cr, "Inter", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+    const char* x_label = "Costo di mana";
+    cairo_text_extents_t x_ext;
+    cairo_text_extents(cr, x_label, &x_ext);
+    double x_label_x = left + plot_w / 2.0 - (x_ext.width / 2.0 + x_ext.x_bearing);
+    double x_label_y = bottom + 42.0;
+    cairo_move_to(cr, x_label_x, x_label_y);
+    cairo_show_text(cr, x_label);
+
+    const char* y_label = "Numero di carte";
+    cairo_text_extents_t y_ext;
+    cairo_text_extents(cr, y_label, &y_ext);
+    cairo_save(cr);
+    double y_label_offset = left - max_tick_label_width - 26.0;
+    cairo_translate(cr, y_label_offset, top + plot_h / 2.0);
+    cairo_rotate(cr, -M_PI / 2.0);
+    cairo_move_to(cr, - (y_ext.width / 2.0 + y_ext.x_bearing), 0);
+    cairo_show_text(cr, y_label);
+    cairo_restore(cr);
 
     cairo_set_source_rgba(cr, 0.9, 0.95, 1.0, 0.92);
     cairo_select_font_face(cr, "Inter", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
@@ -3341,68 +3413,6 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
     stats_clear(state, false);
 
     GtkWidget* container = state->stats_container;
-    std::string header_title = deck_name.empty() ? std::string("Curva Mana") : deck_name + " • Curva Mana";
-
-    GtkWidget* header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gtk_widget_set_hexpand(header, TRUE);
-    gtk_widget_set_margin_bottom(header, 12);
-    gtk_box_append(GTK_BOX(container), header);
-
-    GtkWidget* back_btn = gtk_button_new_with_label("← Database");
-    gtk_widget_add_css_class(back_btn, "ghost-button");
-    g_signal_connect(back_btn, "clicked", G_CALLBACK(on_stats_back_clicked), state);
-    gtk_box_append(GTK_BOX(header), back_btn);
-
-    GtkWidget* title_lbl = gtk_label_new(header_title.c_str());
-    gtk_label_set_xalign(GTK_LABEL(title_lbl), 0.0);
-    gtk_widget_set_hexpand(title_lbl, TRUE);
-    gtk_box_append(GTK_BOX(header), title_lbl);
-
-    std::string info_text = "Carte: " + std::to_string(total_cards);
-    GtkWidget* info_lbl = gtk_label_new(info_text.c_str());
-    gtk_widget_add_css_class(info_lbl, "muted");
-    gtk_box_append(GTK_BOX(header), info_lbl);
-
-    GtkWidget* hmain = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 16);
-    gtk_widget_set_hexpand(hmain, TRUE);
-    gtk_widget_set_vexpand(hmain, TRUE);
-    gtk_box_append(GTK_BOX(container), hmain);
-
-    GtkWidget* left_v = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
-    gtk_widget_set_hexpand(left_v, TRUE);
-    gtk_widget_set_vexpand(left_v, TRUE);
-    gtk_box_append(GTK_BOX(hmain), left_v);
-
-    GtkWidget* top_controls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    gtk_widget_set_margin_bottom(top_controls, 8);
-    GtkWidget* btn_tot = gtk_button_new_with_label("Totale");
-    GtkWidget* btn_type = gtk_button_new_with_label("Tipo");
-    GtkWidget* btn_color = gtk_button_new_with_label("Colore");
-    gtk_widget_set_size_request(btn_tot, 92, -1);
-    gtk_widget_set_size_request(btn_type, 92, -1);
-    gtk_widget_set_size_request(btn_color, 92, -1);
-    gtk_box_append(GTK_BOX(top_controls), btn_tot);
-    gtk_box_append(GTK_BOX(top_controls), btn_type);
-    gtk_box_append(GTK_BOX(top_controls), btn_color);
-    gtk_box_append(GTK_BOX(left_v), top_controls);
-
-    GtkWidget* chart_frame = gtk_frame_new(NULL);
-    gtk_widget_add_css_class(chart_frame, "stats-chart-frame");
-    gtk_widget_set_hexpand(chart_frame, TRUE);
-    gtk_widget_set_vexpand(chart_frame, TRUE);
-    gtk_box_append(GTK_BOX(left_v), chart_frame);
-
-    GtkWidget* da = gtk_drawing_area_new();
-    gtk_widget_set_hexpand(da, TRUE);
-    gtk_widget_set_vexpand(da, TRUE);
-    gtk_widget_set_size_request(da, w, h);
-    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(da), (GtkDrawingAreaDrawFunc)on_mana_area_draw, NULL, NULL);
-    gtk_frame_set_child(GTK_FRAME(chart_frame), da);
-
-    GtkWidget* right = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
-    gtk_widget_set_hexpand(right, TRUE);
-    gtk_widget_set_vexpand(right, TRUE);
-    gtk_box_append(GTK_BOX(hmain), right);
 
     auto format_double = [](double value) {
         char buf[32];
@@ -3420,6 +3430,252 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
         std::snprintf(buf, sizeof(buf), "Δ %s%d", delta > 0 ? "+" : "", delta);
         return std::string(buf);
     };
+    auto translate_color_code = [](const std::string& code) {
+        if (code == "W") return std::string("Bianco");
+        if (code == "U") return std::string("Blu");
+        if (code == "B") return std::string("Nero");
+        if (code == "R") return std::string("Rosso");
+        if (code == "G") return std::string("Verde");
+        if (code == "C") return std::string("Incolore");
+        return code;
+    };
+
+    double removal_share = spells_count > 0 ? (double)removal_spells / (double)spells_count : 0.0;
+    double ramp_share = spells_count > 0 ? (double)ramp_spells / (double)spells_count : 0.0;
+    double draw_share = spells_count > 0 ? (double)card_draw_spells / (double)spells_count : 0.0;
+
+    std::string header_title = deck_name.empty() ? std::string("Curva Mana") : deck_name + " • Curva Mana";
+    std::ostringstream hero_meta_stream;
+    hero_meta_stream << "Media mana totale " << format_double(avg_total_cmc)
+                     << " • Non terre " << format_double(avg_non_land_cmc)
+                     << " • Terre consigliate " << recommended_lands;
+    if (land_delta != 0) {
+        hero_meta_stream << " (" << (land_delta > 0 ? "+" : "") << land_delta << ")";
+    }
+    std::string hero_subtitle = hero_meta_stream.str();
+
+    GtkWidget* hero = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 24);
+    gtk_widget_add_css_class(hero, "stats-hero");
+    gtk_widget_set_hexpand(hero, TRUE);
+    gtk_box_append(GTK_BOX(container), hero);
+
+    GtkWidget* hero_left = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_widget_add_css_class(hero_left, "stats-hero-left");
+    gtk_widget_set_hexpand(hero_left, TRUE);
+    gtk_box_append(GTK_BOX(hero), hero_left);
+
+    GtkWidget* back_btn = gtk_button_new_with_label("← Database");
+    gtk_widget_set_hexpand(back_btn, FALSE);
+    gtk_widget_set_halign(back_btn, GTK_ALIGN_START);
+    gtk_widget_add_css_class(back_btn, "ghost-button");
+    gtk_widget_add_css_class(back_btn, "compact-button");
+    gtk_widget_add_css_class(back_btn, "stats-hero-back");
+    g_signal_connect(back_btn, "clicked", G_CALLBACK(on_stats_back_clicked), state);
+    gtk_box_append(GTK_BOX(hero_left), back_btn);
+
+    GtkWidget* title_lbl = gtk_label_new(header_title.c_str());
+    gtk_widget_add_css_class(title_lbl, "stats-hero-title");
+    gtk_label_set_xalign(GTK_LABEL(title_lbl), 0.0);
+    gtk_box_append(GTK_BOX(hero_left), title_lbl);
+
+    GtkWidget* subtitle_lbl = gtk_label_new(hero_subtitle.c_str());
+    gtk_widget_add_css_class(subtitle_lbl, "stats-hero-subtitle");
+    gtk_label_set_xalign(GTK_LABEL(subtitle_lbl), 0.0);
+    gtk_label_set_wrap(GTK_LABEL(subtitle_lbl), TRUE);
+    gtk_box_append(GTK_BOX(hero_left), subtitle_lbl);
+
+    GtkWidget* hero_metrics = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    gtk_widget_add_css_class(hero_metrics, "stats-hero-metrics");
+    gtk_widget_set_hexpand(hero_metrics, TRUE);
+    gtk_widget_set_halign(hero_metrics, GTK_ALIGN_END);
+    gtk_widget_set_valign(hero_metrics, GTK_ALIGN_CENTER);
+    gtk_box_append(GTK_BOX(hero), hero_metrics);
+
+    auto hero_metric = [&](const std::string& title, const std::string& value, const std::string& subtitle) {
+        GtkWidget* pill = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+        gtk_widget_add_css_class(pill, "stats-hero-pill");
+        GtkWidget* pt = gtk_label_new(title.c_str());
+        gtk_widget_add_css_class(pt, "stats-hero-pill-title");
+        gtk_label_set_xalign(GTK_LABEL(pt), 0.0);
+        gtk_box_append(GTK_BOX(pill), pt);
+        GtkWidget* pv = gtk_label_new(value.c_str());
+        gtk_widget_add_css_class(pv, "stats-hero-pill-value");
+        gtk_label_set_xalign(GTK_LABEL(pv), 0.0);
+        gtk_box_append(GTK_BOX(pill), pv);
+        if (!subtitle.empty()) {
+            GtkWidget* ps = gtk_label_new(subtitle.c_str());
+            gtk_widget_add_css_class(ps, "stats-hero-pill-subtitle");
+            gtk_label_set_xalign(GTK_LABEL(ps), 0.0);
+            gtk_label_set_wrap(GTK_LABEL(ps), TRUE);
+            gtk_box_append(GTK_BOX(pill), ps);
+        }
+        gtk_box_append(GTK_BOX(hero_metrics), pill);
+    };
+
+    hero_metric("Carte totali", std::to_string(total_cards), deck_name.empty() ? std::string("Collezione") : deck_name);
+    hero_metric("Terre", std::to_string(land_cards), format_percent(land_ratio));
+    hero_metric("CMC medio", format_double(avg_non_land_cmc), std::string("Totale ") + format_double(avg_total_cmc));
+    hero_metric("Spell chiave", std::to_string(removal_spells) + " rim.", format_percent(removal_share));
+
+    GtkWidget* content = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 24);
+    gtk_widget_add_css_class(content, "stats-content");
+    gtk_widget_set_hexpand(content, TRUE);
+    gtk_widget_set_vexpand(content, TRUE);
+    gtk_box_append(GTK_BOX(container), content);
+
+    GtkWidget* left_column = gtk_box_new(GTK_ORIENTATION_VERTICAL, 16);
+    gtk_widget_add_css_class(left_column, "stats-main-column");
+    gtk_widget_set_hexpand(left_column, TRUE);
+    gtk_widget_set_vexpand(left_column, TRUE);
+    gtk_box_append(GTK_BOX(content), left_column);
+
+    GtkWidget* right_column = gtk_box_new(GTK_ORIENTATION_VERTICAL, 16);
+    gtk_widget_add_css_class(right_column, "stats-sidebar");
+    gtk_widget_set_hexpand(right_column, TRUE);
+    gtk_widget_set_vexpand(right_column, TRUE);
+    gtk_box_append(GTK_BOX(content), right_column);
+
+    GtkWidget* chart_card = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+    gtk_widget_add_css_class(chart_card, "stats-card");
+    gtk_widget_add_css_class(chart_card, "stats-chart-card");
+    gtk_widget_set_hexpand(chart_card, TRUE);
+    gtk_widget_set_vexpand(chart_card, TRUE);
+    gtk_box_append(GTK_BOX(left_column), chart_card);
+
+    std::string chart_caption = "Visualizza totale, tipologia e colori";
+    GtkWidget* chart_header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_hexpand(chart_header, TRUE);
+    gtk_box_append(GTK_BOX(chart_card), chart_header);
+
+    GtkWidget* chart_title = gtk_label_new("Curva di mana");
+    gtk_widget_add_css_class(chart_title, "stats-card-title");
+    gtk_label_set_xalign(GTK_LABEL(chart_title), 0.0);
+    gtk_box_append(GTK_BOX(chart_header), chart_title);
+
+    GtkWidget* chart_desc = gtk_label_new(chart_caption.c_str());
+    gtk_widget_add_css_class(chart_desc, "stats-card-subtitle");
+    gtk_label_set_xalign(GTK_LABEL(chart_desc), 0.0);
+    gtk_label_set_wrap(GTK_LABEL(chart_desc), TRUE);
+    gtk_box_append(GTK_BOX(chart_card), chart_desc);
+
+    GtkWidget* switch_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_widget_add_css_class(switch_box, "stats-switch");
+    gtk_box_append(GTK_BOX(chart_card), switch_box);
+
+    GtkWidget* btn_tot = gtk_button_new_with_label("Totale");
+    GtkWidget* btn_type = gtk_button_new_with_label("Tipo");
+    GtkWidget* btn_color = gtk_button_new_with_label("Colore");
+    gtk_widget_add_css_class(btn_tot, "stats-switch-button");
+    gtk_widget_add_css_class(btn_type, "stats-switch-button");
+    gtk_widget_add_css_class(btn_color, "stats-switch-button");
+    gtk_box_append(GTK_BOX(switch_box), btn_tot);
+    gtk_box_append(GTK_BOX(switch_box), btn_type);
+    gtk_box_append(GTK_BOX(switch_box), btn_color);
+
+    GtkWidget* chart_frame = gtk_frame_new(NULL);
+    gtk_widget_add_css_class(chart_frame, "stats-chart-frame");
+    gtk_widget_set_hexpand(chart_frame, TRUE);
+    gtk_widget_set_vexpand(chart_frame, TRUE);
+    gtk_box_append(GTK_BOX(chart_card), chart_frame);
+
+    GtkWidget* da = gtk_drawing_area_new();
+    gtk_widget_set_hexpand(da, TRUE);
+    gtk_widget_set_vexpand(da, TRUE);
+    gtk_widget_set_size_request(da, w, h);
+    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(da), (GtkDrawingAreaDrawFunc)on_mana_area_draw, NULL, NULL);
+    gtk_frame_set_child(GTK_FRAME(chart_frame), da);
+
+    GtkWidget* chart_hint = gtk_label_new("Suggerimento: alterna le viste per mettere a confronto curva, tipi e colori.");
+    gtk_widget_add_css_class(chart_hint, "stats-card-hint");
+    gtk_label_set_xalign(GTK_LABEL(chart_hint), 0.0);
+    gtk_label_set_wrap(GTK_LABEL(chart_hint), TRUE);
+    gtk_box_append(GTK_BOX(chart_card), chart_hint);
+
+    GtkWidget* insights_card = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_widget_add_css_class(insights_card, "stats-card");
+    gtk_widget_add_css_class(insights_card, "stats-highlights-card");
+    gtk_box_append(GTK_BOX(left_column), insights_card);
+
+    GtkWidget* insights_title = gtk_label_new("Highlights");
+    gtk_widget_add_css_class(insights_title, "stats-card-title");
+    gtk_label_set_xalign(GTK_LABEL(insights_title), 0.0);
+    gtk_box_append(GTK_BOX(insights_card), insights_title);
+
+    GtkWidget* highlights_list = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_widget_add_css_class(highlights_list, "stats-highlight-list");
+    gtk_box_append(GTK_BOX(insights_card), highlights_list);
+
+    auto append_highlight = [&](const std::string& text) {
+        GtkWidget* row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+        gtk_widget_add_css_class(row, "stats-highlight-item");
+        GtkWidget* bullet = gtk_label_new("•");
+        gtk_widget_add_css_class(bullet, "stats-highlight-bullet");
+        gtk_label_set_xalign(GTK_LABEL(bullet), 0.0);
+        gtk_box_append(GTK_BOX(row), bullet);
+        GtkWidget* lbl = gtk_label_new(text.c_str());
+        gtk_widget_add_css_class(lbl, "stats-highlight-text");
+        gtk_label_set_xalign(GTK_LABEL(lbl), 0.0);
+        gtk_label_set_wrap(GTK_LABEL(lbl), TRUE);
+        gtk_box_append(GTK_BOX(row), lbl);
+        gtk_box_append(GTK_BOX(highlights_list), row);
+    };
+
+    std::string mode_label = mode_bucket == 6 ? std::string("CMC 6+") : std::string("CMC ") + std::to_string(mode_bucket);
+    append_highlight("La curva picco è " + mode_label + " con " + std::to_string(mode_count) + " carte.");
+
+    std::string land_highlight;
+    if (land_delta > 0) land_highlight = "Hai " + std::to_string(land_delta) + " terre in più rispetto al target consigliato (" + std::to_string(recommended_lands) + ").";
+    else if (land_delta < 0) land_highlight = "Aggiungi " + std::to_string(std::abs(land_delta)) + " terre per raggiungere il target consigliato (" + std::to_string(recommended_lands) + ").";
+    else land_highlight = "Numero di terre già allineato al target consigliato (" + std::to_string(recommended_lands) + ").";
+    append_highlight(land_highlight);
+
+    double dominant_color_share = 0.0;
+    std::string dominant_color = "C";
+    if (total_pips > 0) {
+        for (const auto& kv : pip_counts) {
+            if (kv.second <= 0) continue;
+            double share = kv.second / total_pips;
+            if (share > dominant_color_share) {
+                dominant_color_share = share;
+                dominant_color = kv.first;
+            }
+        }
+    } else if (land_cards > 0) {
+        for (const auto& kv : color_sources) {
+            if (kv.second <= 0) continue;
+            double share = kv.second / (double)land_cards;
+            if (share > dominant_color_share) {
+                dominant_color_share = share;
+                dominant_color = kv.first;
+            }
+        }
+    }
+    std::string color_highlight;
+    if (dominant_color_share > 0.0) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%.0f%%", dominant_color_share * 100.0);
+        color_highlight = "Il colore dominante è " + translate_color_code(dominant_color) + " (" + std::string(buf) + " delle richieste di mana).";
+    } else {
+        color_highlight = "Distribuzione colori bilanciata: nessun colore domina le richieste di mana.";
+    }
+    append_highlight(color_highlight);
+
+    GtkWidget* summary_card = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+    gtk_widget_add_css_class(summary_card, "stats-card");
+    gtk_box_append(GTK_BOX(right_column), summary_card);
+
+    GtkWidget* summary_title = gtk_label_new("Panoramica rapida");
+    gtk_widget_add_css_class(summary_title, "stats-card-title");
+    gtk_label_set_xalign(GTK_LABEL(summary_title), 0.0);
+    gtk_box_append(GTK_BOX(summary_card), summary_title);
+
+    GtkWidget* summary_flow = gtk_flow_box_new();
+    gtk_flow_box_set_selection_mode(GTK_FLOW_BOX(summary_flow), GTK_SELECTION_NONE);
+    gtk_flow_box_set_row_spacing(GTK_FLOW_BOX(summary_flow), 12);
+    gtk_flow_box_set_column_spacing(GTK_FLOW_BOX(summary_flow), 12);
+    gtk_widget_add_css_class(summary_flow, "stats-pill-flow");
+    gtk_box_append(GTK_BOX(summary_card), summary_flow);
+
     auto create_stats_pill = [&](const std::string& title, const std::string& value, const std::string& subtitle) {
         GtkWidget* pill = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
         gtk_widget_add_css_class(pill, "stats-pill");
@@ -3443,11 +3699,6 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
         return pill;
     };
 
-    GtkWidget* summary_flow = gtk_flow_box_new();
-    gtk_flow_box_set_selection_mode(GTK_FLOW_BOX(summary_flow), GTK_SELECTION_NONE);
-    gtk_widget_add_css_class(summary_flow, "stats-pill-flow");
-    gtk_widget_set_margin_bottom(summary_flow, 8);
-    gtk_box_append(GTK_BOX(right), summary_flow);
     auto append_pill = [&](GtkWidget* pill) {
         gtk_flow_box_insert(GTK_FLOW_BOX(summary_flow), pill, -1);
     };
@@ -3461,9 +3712,6 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
     append_pill(create_stats_pill("Creature", std::to_string(creature_cards), creature_sub));
     std::string non_creature_sub = std::string("avg ") + format_double(avg_non_creature_cmc) + " • " + format_percent(non_creature_ratio);
     append_pill(create_stats_pill("Non Creature", std::to_string(non_creature_spells), non_creature_sub));
-    double removal_share = spells_count > 0 ? (double)removal_spells / (double)spells_count : 0.0;
-    double ramp_share = spells_count > 0 ? (double)ramp_spells / (double)spells_count : 0.0;
-    double draw_share = spells_count > 0 ? (double)card_draw_spells / (double)spells_count : 0.0;
     std::string removal_sub = format_percent(removal_share);
     if (board_wipes > 0) removal_sub += std::string(" • wipe ") + std::to_string(board_wipes);
     append_pill(create_stats_pill("Rimozioni", std::to_string(removal_spells), removal_sub));
@@ -3521,7 +3769,7 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
         gtk_grid_attach(GTK_GRID(curve_grid), lbl_delta, 3, curve_row, 1, 1);
         curve_row++;
     }
-    gtk_box_append(GTK_BOX(right), curve_panel);
+    gtk_box_append(GTK_BOX(right_column), curve_panel);
 
     GtkWidget* color_panel = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
     gtk_widget_add_css_class(color_panel, "stats-panel");
@@ -3589,23 +3837,41 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
         gtk_grid_attach(GTK_GRID(color_grid), lbl_share, 4, color_row, 1, 1);
         color_row++;
     }
-    gtk_box_append(GTK_BOX(right), color_panel);
+    gtk_box_append(GTK_BOX(right_column), color_panel);
 
-    GtkWidget* btns = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
-    gtk_widget_set_margin_top(btns, 12);
+    GtkWidget* actions_card = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_widget_add_css_class(actions_card, "stats-card");
+    gtk_widget_add_css_class(actions_card, "stats-actions-card");
+    gtk_box_append(GTK_BOX(right_column), actions_card);
+
+    GtkWidget* actions_title = gtk_label_new("Esporta");
+    gtk_widget_add_css_class(actions_title, "stats-card-title");
+    gtk_label_set_xalign(GTK_LABEL(actions_title), 0.0);
+    gtk_box_append(GTK_BOX(actions_card), actions_title);
+
+    GtkWidget* actions_flow = gtk_flow_box_new();
+    gtk_flow_box_set_selection_mode(GTK_FLOW_BOX(actions_flow), GTK_SELECTION_NONE);
+    gtk_flow_box_set_row_spacing(GTK_FLOW_BOX(actions_flow), 12);
+    gtk_flow_box_set_column_spacing(GTK_FLOW_BOX(actions_flow), 12);
+    gtk_widget_add_css_class(actions_flow, "stats-actions-flow");
+    gtk_box_append(GTK_BOX(actions_card), actions_flow);
+
     GtkWidget* export_png = gtk_button_new_with_label("Export PNG");
     GtkWidget* export_pdf = gtk_button_new_with_label("Export PDF");
     GtkWidget* export_stats = gtk_button_new_with_label("Export stats");
     GtkWidget* close = gtk_button_new_with_label("Chiudi");
-    gtk_widget_set_size_request(export_png, 120, -1);
-    gtk_widget_set_size_request(export_pdf, 120, -1);
-    gtk_widget_set_size_request(export_stats, 120, -1);
-    gtk_widget_set_size_request(close, 120, -1);
-    gtk_box_append(GTK_BOX(btns), export_png);
-    gtk_box_append(GTK_BOX(btns), export_pdf);
-    gtk_box_append(GTK_BOX(btns), export_stats);
-    gtk_box_append(GTK_BOX(btns), close);
-    gtk_box_append(GTK_BOX(right), btns);
+    gtk_widget_add_css_class(export_png, "accent-button");
+    gtk_widget_add_css_class(export_png, "stats-action-button");
+    gtk_widget_add_css_class(export_pdf, "accent-button");
+    gtk_widget_add_css_class(export_pdf, "stats-action-button");
+    gtk_widget_add_css_class(export_stats, "ghost-button");
+    gtk_widget_add_css_class(export_stats, "stats-action-button");
+    gtk_widget_add_css_class(close, "ghost-button");
+    gtk_widget_add_css_class(close, "stats-action-button");
+    gtk_flow_box_insert(GTK_FLOW_BOX(actions_flow), export_png, -1);
+    gtk_flow_box_insert(GTK_FLOW_BOX(actions_flow), export_pdf, -1);
+    gtk_flow_box_insert(GTK_FLOW_BOX(actions_flow), export_stats, -1);
+    gtk_flow_box_insert(GTK_FLOW_BOX(actions_flow), close, -1);
 
     if (!has_type) gtk_widget_set_sensitive(btn_type, FALSE);
     if (!has_color) gtk_widget_set_sensitive(btn_color, FALSE);
@@ -3619,6 +3885,9 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
     ectx->surf_total = surf_total;
     ectx->surf_type = surf_type;
     ectx->surf_color = surf_color;
+    ectx->btn_total = btn_tot;
+    ectx->btn_type = btn_type;
+    ectx->btn_color = btn_color;
     ectx->w = w;
     ectx->h = h;
     ectx->buckets = buckets;
@@ -3751,7 +4020,7 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
     g_signal_connect(btn_type, "clicked", G_CALLBACK(on_stats_surface_type), ectx);
     g_signal_connect(btn_color, "clicked", G_CALLBACK(on_stats_surface_color), ectx);
 
-    stats_set_surface(ectx, ectx->surf_total);
+    stats_set_surface_active(ectx, ectx->surf_total, ectx->btn_total);
     gtk_stack_set_visible_child_name(GTK_STACK(state->main_stack), "stats");
 }
 
@@ -7119,8 +7388,46 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     ".detail-title { font-size: 15px; font-weight: 600; color: @text_primary; }\n"
     ".detail-meta { font-size: 12px; color: @text_muted; }\n"
     ".detail-text { font-size: 12px; line-height: 1.4; color: @text_primary; opacity: 0.88; }\n"
-        ".stat-label { color: @accent_primary; font-weight: 600; }\n"
-        ".foil { color: #ffd977; text-shadow: 0 0 4px rgba(255,217,119,0.42); }\n"
+    ".stat-label { color: @accent_primary; font-weight: 600; }\n"
+    ".foil { color: #ffd977; text-shadow: 0 0 4px rgba(255,217,119,0.42); }\n"
+    ".stats-root { color: @text_primary; }\n"
+    ".stats-hero { background-image: linear-gradient(135deg, rgba(138,108,255,0.26), rgba(61,201,255,0.18)); border: 1px solid rgba(138,108,255,0.32); border-radius: 20px; padding: 20px 24px; box-shadow: 0 20px 48px rgba(10,16,32,0.45); }\n"
+    ".stats-hero-left { min-width: 240px; }\n"
+    ".stats-hero-title { font-size: 22px; font-weight: 700; letter-spacing: 0.3px; color: @text_primary; }\n"
+    ".stats-hero-subtitle { color: rgba(236,240,255,0.75); font-size: 13px; max-width: 540px; }\n"
+    ".stats-hero-back { margin-bottom: 6px; padding: 2px 12px; min-width: 0; font-size: 12px; }\n"
+    ".stats-hero-metrics { padding-left: 12px; }\n"
+    ".stats-hero-pill { min-width: 130px; padding: 10px 14px; border-radius: 14px; background-color: rgba(12,16,28,0.65); border: 1px solid rgba(255,255,255,0.08); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.05); }\n"
+    ".stats-hero-pill-title { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: rgba(236,240,255,0.6); }\n"
+    ".stats-hero-pill-value { font-size: 20px; font-weight: 600; }\n"
+    ".stats-hero-pill-subtitle { font-size: 12px; color: rgba(236,240,255,0.55); }\n"
+    ".stats-content { margin-top: 20px; }\n"
+    ".stats-card { background-color: rgba(16,22,34,0.9); border: 1px solid rgba(138,108,255,0.22); border-radius: 18px; padding: 18px 20px; box-shadow: 0 16px 40px rgba(6,12,28,0.38); }\n"
+    ".stats-chart-card { padding-bottom: 20px; }\n"
+    ".stats-highlights-card { background-image: linear-gradient(135deg, rgba(61,201,255,0.12), rgba(138,108,255,0.14)); }\n"
+    ".stats-card-title { font-size: 12px; text-transform: uppercase; letter-spacing: 0.12em; color: rgba(236,240,255,0.68); margin-bottom: 6px; }\n"
+    ".stats-card-subtitle { font-size: 12px; color: rgba(236,240,255,0.55); margin-bottom: 6px; }\n"
+    ".stats-card-hint { font-size: 11px; color: rgba(236,240,255,0.4); }\n"
+    ".stats-switch { background-color: rgba(10,14,26,0.85); border-radius: 999px; padding: 4px; border: 1px solid rgba(138,108,255,0.28); }\n"
+    ".stats-switch-button { background-color: transparent; border: none; color: rgba(236,240,255,0.78); padding: 6px 18px; border-radius: 999px; box-shadow: none; }\n"
+    ".stats-switch-button:hover { background-color: rgba(138,108,255,0.18); border: none; }\n"
+    ".stats-switch-active { background-image: linear-gradient(135deg, rgba(138,108,255,0.92), rgba(61,201,255,0.65)); color: #ffffff; box-shadow: 0 8px 22px rgba(138,108,255,0.42); }\n"
+    ".stats-chart-frame { border-radius: 16px; border: 1px solid rgba(138,108,255,0.26); background-color: rgba(10,14,24,0.92); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.04); }\n"
+    ".stats-pill { background-image: linear-gradient(180deg, rgba(255,255,255,0.06), rgba(0,0,0,0.26)); border-radius: 14px; border: 1px solid rgba(138,108,255,0.18); padding: 10px 14px; min-width: 130px; box-shadow: 0 12px 28px rgba(6,12,30,0.32); }\n"
+    ".stats-pill-title { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: rgba(236,240,255,0.6); }\n"
+    ".stats-pill-value { font-size: 20px; font-weight: 600; }\n"
+    ".stats-pill-subtitle { font-size: 12px; color: rgba(236,240,255,0.58); }\n"
+    ".stats-pill-flow { padding-top: 4px; }\n"
+    ".stats-panel { background-color: rgba(16,24,38,0.88); border-radius: 16px; border: 1px solid rgba(138,108,255,0.2); padding: 16px 18px; box-shadow: 0 14px 32px rgba(6,12,26,0.34); }\n"
+    ".stats-panel-title { font-size: 13px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: rgba(236,240,255,0.72); }\n"
+    ".stats-grid { margin-top: 10px; }\n"
+    ".stats-grid-header { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: rgba(236,240,255,0.55); }\n"
+    ".stats-highlight-list { margin-top: 6px; }\n"
+    ".stats-highlight-item { align-items: flex-start; }\n"
+    ".stats-highlight-bullet { font-size: 18px; color: rgba(236,240,255,0.4); margin-top: -2px; }\n"
+    ".stats-highlight-text { font-size: 12px; color: rgba(236,240,255,0.7); }\n"
+    ".stats-actions-card { padding-bottom: 18px; }\n"
+    ".stats-action-button { min-width: 140px; }\n"
         "menu,\n"
         "popover,\n"
         ".popover {\n"
