@@ -49,9 +49,9 @@ typedef struct _CardRow {
     gchar *translated_colors;
     int total_mana_cost;
     gchar *image_url;
-    gchar *added_date; // ISO format: YYYY-MM-DDTHH:MM:SS
-    gchar *price_usd; // Prezzo in USD come stringa
-    int foil; // 0 = non-foil, 1 = foil
+    gchar *added_date;
+    gchar *price_usd;
+    int foil;
 } CardRow;
 
 typedef struct _CardRowClass {
@@ -87,8 +87,6 @@ static void card_row_finalize(GObject *object) {
     G_OBJECT_CLASS(card_row_parent_class)->finalize(object);
 }
 
-// (Focus scheduling helpers defined later)
-
 static void card_row_get_property(GObject *object, guint property_id, GValue *value, GParamSpec *pspec) {
     CardRow *self = (CardRow*)object;
     switch (property_id) {
@@ -114,7 +112,7 @@ static void card_row_get_property(GObject *object, guint property_id, GValue *va
             G_OBJECT_WARN_INVALID_PROPERTY_ID(object, property_id, pspec);
             break;
     }
-    }
+}
 
 static void card_row_class_init(CardRowClass *klass) {
     GObjectClass *object_class = G_OBJECT_CLASS(klass);
@@ -140,20 +138,18 @@ static void card_row_init(CardRow *self) {
     self->mana_cost = NULL;
     self->rarity = NULL;
     self->quantity = 0;
+    self->quantity_display = NULL;
     self->translated_colors = NULL;
     self->total_mana_cost = 0;
     self->image_url = NULL;
     self->added_date = NULL;
     self->price_usd = NULL;
+    self->foil = 0;
 }
 
-// Helper constants for special row ids (separator/header rows shown in lists)
 #define ROW_ID_SEPARATOR_TITLE    -1001
 #define ROW_ID_HEADER             -1002
 
-// Calculate a simple total mana cost from a mana cost string.
-// This is a best-effort parser: it treats numeric symbols as their value
-// and each color symbol or generic symbol as +1. Returns 0 for empty.
 static int calculate_total_mana_cost(const std::string &mana) {
     if (mana.empty()) return 0;
     int total = 0;
@@ -161,31 +157,24 @@ static int calculate_total_mana_cost(const std::string &mana) {
     for (size_t i = 0; i < mana.size(); ++i) {
         char c = mana[i];
         if (std::isdigit((unsigned char)c)) {
-            // accumulate contiguous digits
             num.push_back(c);
-            // if next is non-digit, flush
             if (i + 1 >= mana.size() || !std::isdigit((unsigned char)mana[i+1])) {
                 try { total += std::stoi(num); } catch(...) { }
                 num.clear();
             }
         } else if (std::isalpha((unsigned char)c)) {
-            // letters like R G W count as 1
             total += 1;
         }
-        // ignore braces, slashes, punctuation
     }
     return total;
 }
 
-// Forward-declare accessor for current language so formatters located earlier can use it
 static const std::string& get_current_language();
 
-// Very small datetime formatter — returns the input or a simplified human form.
 static std::string format_datetime(const char* iso) {
     if (!iso) return std::string();
     std::string s = iso;
     if (s.empty()) return s;
-    // Parse ISO-like timestamp: accept YYYY-MM-DDTHH:MM:SS or YYYY-MM-DD HH:MM:SS
     int year = 0, mon = 0, day = 0, hour = 0, minute = 0, second = 0;
     bool parsed = false;
     try {
@@ -198,7 +187,6 @@ static std::string format_datetime(const char* iso) {
             second = std::stoi(s.substr(17,2));
             parsed = true;
         } else if (s.size() >= 16 && s[4] == '-' && s[7] == '-' && (s[10] == 'T' || s[10] == ' ')) {
-            // YYYY-MM-DDTHH:MM (no seconds)
             year = std::stoi(s.substr(0,4));
             mon = std::stoi(s.substr(5,2));
             day = std::stoi(s.substr(8,2));
@@ -210,7 +198,6 @@ static std::string format_datetime(const char* iso) {
     } catch(...) { parsed = false; }
 
     if (!parsed) {
-        // fallback: return original string
         return s;
     }
 
@@ -238,8 +225,8 @@ static std::string format_datetime(const char* iso) {
     const char* months_en[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
 
     char out[128];
-    int wday = lt->tm_wday; // 0=Sun
-    int monidx = lt->tm_mon; // 0-based
+    int wday = lt->tm_wday;
+    int monidx = lt->tm_mon;
     if (get_current_language() == "it") {
         snprintf(out, sizeof(out), "%s %02d %s %04d %02d:%02d:%02d",
                  days_it[wday], lt->tm_mday, months_it[monidx], lt->tm_year + 1900, lt->tm_hour, lt->tm_min, lt->tm_sec);
@@ -250,12 +237,9 @@ static std::string format_datetime(const char* iso) {
     return std::string(out);
 }
 
-// Forward-declare translate_colors (defined later) so helpers above can call it
 static std::string translate_colors(const char* colors);
-// Forward-declare translate_type (defined later) so UI code earlier can use it
 static std::string translate_type(const char* type);
 
-// Factory helper to create and initialize a CardRow instance
 static CardRow* card_row_new(int id, const char* name, const char* type, const char* colors, const char* set_code, const char* mana_cost, const char* rarity, int quantity, const char* image_url, const char* added_date, const char* price_usd, int foil, const char* quantity_display = NULL) {
     CardRow* r = (CardRow*)g_object_new(card_row_get_type(), NULL);
     r->id = id;
@@ -271,7 +255,6 @@ static CardRow* card_row_new(int id, const char* name, const char* type, const c
     r->price_usd = g_strdup(price_usd ? price_usd : "");
     r->foil = foil;
     r->total_mana_cost = calculate_total_mana_cost(r->mana_cost ? r->mana_cost : std::string());
-    // translated_colors uses the helper defined later; store an English/Italian translation
     r->translated_colors = g_strdup(translate_colors(r->colors).c_str());
     if (quantity_display && *quantity_display) r->quantity_display = g_strdup(quantity_display); else {
         char buf[64]; snprintf(buf, sizeof(buf), "%d", quantity);
@@ -279,20 +262,19 @@ static CardRow* card_row_new(int id, const char* name, const char* type, const c
     }
     return r;
 }
-// CSS provider used for separator styling (initialized on demand)
+
 static GtkCssProvider* separator_css_provider = NULL;
 
 static void ensure_separator_css_provider() {
     if (separator_css_provider) return;
     separator_css_provider = gtk_css_provider_new();
-    const char *css = 
+    const char *css =
         ".separator-row { background-color: rgba(255,165,0,1.0); padding: 6px 8px; }\n"
-    ".separator-row { color: #ffffff; }\n"
-    ".header-row { background-color: rgba(245,245,245,1.0); padding: 4px 6px; color: #000000; font-weight: bold; border-bottom: 1px solid rgba(0,0,0,0.06); border-radius: 0px; }\n";
+        ".separator-row { color: #ffffff; }\n"
+        ".header-row { background-color: rgba(245,245,245,1.0); padding: 4px 6px; color: #000000; font-weight: bold; border-bottom: 1px solid rgba(0,0,0,0.06); border-radius: 0px; }\n";
     gtk_css_provider_load_from_data(separator_css_provider, css, -1);
 }
 
-// Translation table: key -> { lang -> translation }
 static std::map<std::string, std::map<std::string, std::string>> translations = {
     {"Nome", {{"it","Nome"}, {"en","Name"}}},
     {"Tipo", {{"it","Tipo"}, {"en","Type"}}},
@@ -322,12 +304,10 @@ static std::map<std::string, std::map<std::string, std::string>> translations = 
     {"Valore totale", {{"it","Valore totale"}, {"en","Total Value"}}}
 };
 
-// Add localized label for the inline remove button used in the detail tendina
 __attribute__((unused)) static void __add_tendina_translations() {
     translations["Rimuovi"] = {{"it","Rimuovi"}, {"en","Remove"}};
 }
 
-// Add translations for new settings labels
 __attribute__((unused)) static void __add_settings_translations() {
     translations["Notifiche"] = {{"it","Notifiche"}, {"en","Notifications"}};
     translations["Preferenze"] = {{"it","Preferenze"}, {"en","Preferences"}};
@@ -335,7 +315,6 @@ __attribute__((unused)) static void __add_settings_translations() {
 
 static std::string current_language = "it";
 
-// Type translations (English -> localized string)
 static std::map<std::string, std::string> type_translations = {
     {"Creature", "Creatura"},
     {"Instant", "Istantaneo"},
@@ -352,7 +331,6 @@ static std::map<std::string, std::string> type_translations = {
     {"Emblem", "Emblema"}
 };
 
-// Reverse lookup: given a localized type string, try to find its English key.
 static std::string english_for_localized_type(const std::string &loc) {
     if (loc.empty()) return "";
     std::string lower_loc = loc;
@@ -366,7 +344,6 @@ static std::string english_for_localized_type(const std::string &loc) {
     return "";
 }
 
-// Provide accessor for earlier functions
 static const std::string& get_current_language() { return current_language; }
 
 // Add translation for the "Add Cards" button
@@ -5617,70 +5594,186 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     // Carica CSS personalizzato
     GtkCssProvider *provider = gtk_css_provider_new();
     gtk_css_provider_load_from_string(provider,
-        "/* Dark, modern palette: deep background, subtle surfaces and a warm accent */\n"
-        ".small-popover { padding: 0px; margin: 0px; border: none; background-color: #222426; color: #e6edf3; }\n"
+        "@define-color bg_base #0f121a;\n"
+        "@define-color bg_surface #151b26;\n"
+        "@define-color bg_panel #1c2432;\n"
+        "@define-color accent_primary #8a6cff;\n"
+        "@define-color accent_secondary #f56fbb;\n"
+        "@define-color accent_tertiary #3dc9ff;\n"
+        "@define-color text_primary #ecf0ff;\n"
+        "@define-color text_muted #9aa7bd;\n"
+        "@define-color outline_color rgba(138,108,255,0.45);\n"
+        ".small-popover { padding: 0; margin: 0; border: 1px solid rgba(255,255,255,0.08); background-color: @bg_panel; color: @text_primary; }\n"
         "window {\n"
-        "    background-color: #121316;\n"
-        "    color: #e6edf3;\n"
+        "    background-color: @bg_base;\n"
+        "    background-image: radial-gradient(circle at 12% 20%, rgba(138,108,255,0.22), transparent 55%),\n"
+        "                      radial-gradient(circle at 88% 10%, rgba(61,201,255,0.12), transparent 50%),\n"
+        "                      radial-gradient(circle at 50% 100%, rgba(245,111,187,0.10), transparent 60%);\n"
+        "    color: @text_primary;\n"
         "    font-family: 'Inter', 'Segoe UI', 'Ubuntu', sans-serif;\n"
         "    font-size: 13px;\n"
         "}\n"
-        "/* Top bar */\n"
+        "headerbar,\n"
         ".topbar {\n"
-        "    padding: 2px 4px;\n"
-        "    min-height: 28px;\n"
+        "    padding: 1px 6px;\n"
+        "    min-height: 24px;\n"
+        "    background-image: linear-gradient(180deg, rgba(28,36,50,0.95), rgba(19,25,36,0.92));\n"
+        "    border-bottom: 1px solid rgba(255,255,255,0.06);\n"
+        "    box-shadow: 0 1px 0 rgba(255,255,255,0.04);\n"
         "}\n"
-        "/* Buttons */\n"
-        "button, menubutton {\n"
-        "    border-radius: 8px;\n"
-        "    padding: 4px 8px;\n"
-        "    background-color: transparent;\n"
-        "    color: #e6edf3;\n"
-        "    border: 1px solid rgba(230,237,243,0.06);\n"
+        "headerbar button,\n"
+        "headerbar menubutton,\n"
+        "button,\n"
+        "menubutton {\n"
+        "    border-radius: 6px;\n"
+        "    padding: 1px 6px;\n"
+        "    background-color: rgba(21,27,38,0.8);\n"
+        "    color: @text_primary;\n"
+        "    border: 1px solid rgba(255,255,255,0.06);\n"
         "    transition: all 0.14s ease;\n"
         "}\n"
-        "button:hover, menubutton:hover {\n"
-        "    background-color: rgba(230,237,243,0.03);\n"
-        "    transform: translateY(-1px);\n"
+        "button:hover,\n"
+        "menubutton:hover {\n"
+        "    background-color: rgba(138,108,255,0.18);\n"
+        "    border-color: outline_color;\n"
+        "    box-shadow: 0 3px 10px rgba(138,108,255,0.25);\n"
         "}\n"
-        "/* Entry */\n"
-        "entry {\n"
-        "    border-radius: 8px;\n"
-        "    padding: 4px 8px;\n"
+        "button:active,\n"
+        "menubutton:active {\n"
+        "    background-color: rgba(138,108,255,0.28);\n"
+        "    border-color: rgba(138,108,255,0.55);\n"
+        "    box-shadow: inset 0 0 0 1px rgba(0,0,0,0.4);\n"
+        "}\n"
+        ".accent-button {\n"
+        "    background-image: linear-gradient(135deg, rgba(138,108,255,0.85), rgba(245,111,187,0.85));\n"
+        "    border-color: rgba(138,108,255,0.55);\n"
+        "}\n"
+        ".accent-button:hover {\n"
+        "    background-image: linear-gradient(135deg, rgba(148,118,255,0.95), rgba(247,125,197,0.95));\n"
+        "    box-shadow: 0 6px 18px rgba(138,108,255,0.45);\n"
+        "}\n"
+        ".ghost-button {\n"
         "    background-color: transparent;\n"
-        "    color: #e6edf3;\n"
-        "    border: 1px solid rgba(230,237,243,0.06);\n"
-        "    transition: all 0.14s ease;\n"
+        "    border-color: rgba(255,255,255,0.08);\n"
         "}\n"
-        "entry:hover {\n"
-        "    background-color: rgba(230,237,243,0.03);\n"
-        "    transform: translateY(-1px);\n"
+        ".ghost-button:hover {\n"
+        "    background-color: rgba(255,255,255,0.05);\n"
         "}\n"
-        "/* Column view / table */\n"
+        ".danger-button {\n"
+        "    color: #ff8097;\n"
+        "    border-color: rgba(255,128,151,0.35);\n"
+        "}\n"
+        ".danger-button:hover {\n"
+        "    background-color: rgba(255,64,115,0.18);\n"
+        "    border-color: rgba(255,128,151,0.6);\n"
+        "}\n"
+        "headerbar entry,\n"
+        "entry,\n"
+        "spinbutton {\n"
+        "    border-radius: 6px;\n"
+        "    padding: 1px 6px;\n"
+        "    background-color: rgba(10,14,22,0.95);\n"
+        "    color: @text_primary;\n"
+        "    border: 1px solid rgba(255,255,255,0.08);\n"
+        "    transition: all 0.16s ease;\n"
+        "}\n"
+        "entry:hover,\n"
+        "spinbutton:hover {\n"
+        "    border-color: outline_color;\n"
+        "    background-color: rgba(28,36,50,0.95);\n"
+        "}\n"
+        "entry:focus,\n"
+        "spinbutton:focus {\n"
+        "    outline: none;\n"
+        "    border-color: rgba(138,108,255,0.75);\n"
+        "    box-shadow: 0 0 0 3px rgba(138,108,255,0.25);\n"
+        "}\n"
+        ".inline-field {\n"
+        "    background-color: rgba(18,23,34,0.95);\n"
+        "}\n"
+        ".inline-toggle {\n"
+        "    padding: 2px 8px;\n"
+        "}\n"
+        ".search-field {\n"
+        "    min-width: 220px;\n"
+        "    background-color: rgba(18,24,36,0.92);\n"
+        "}\n"
+        ".search-field:focus {\n"
+        "    border-color: rgba(61,201,255,0.65);\n"
+        "    box-shadow: 0 0 0 3px rgba(61,201,255,0.18);\n"
+        "}\n"
         "columnview {\n"
-        "    background-color: #17171a;\n"
-        "    border: 1px solid rgba(255,255,255,0.04);\n"
-        "    border-radius: 8px;\n"
-        "    color: #e6edf3;\n"
+        "    background-color: @bg_surface;\n"
+        "    border: 1px solid rgba(255,255,255,0.05);\n"
+        "    border-radius: 10px;\n"
+        "    color: @text_primary;\n"
         "}\n"
         "columnview row {\n"
         "    padding: 8px 12px;\n"
+        "    background-color: transparent;\n"
         "}\n"
         "columnview row:nth-child(even) {\n"
-        "    background-color: #151518;\n"
+        "    background-color: rgba(21,27,38,0.4);\n"
         "}\n"
         "columnview row:hover {\n"
-        "    background-color: #1f2023;\n"
+        "    background-color: rgba(138,108,255,0.18);\n"
         "}\n"
-    "label { color: #e6edf3; }\n"
-    "/* Foil row styling */\n"
-    ".foil { color: #D4AF37; }\n"
-        "scrolledwindow { box-shadow: 0 6px 18px rgba(0,0,0,0.6); border-radius: 8px; }\n"
-        "/* Accent colors: violet + amber for highlights */\n"
-        ".accent { color: #b388ff; }\n"
-        ".accent-bg { background-color: #3a2a4a; border-radius:6px; padding:2px 6px; }\n"
-        "/* Smaller menubutton */\n"
-        "menubutton { padding: 6px 10px; border-radius: 6px; }\n"
+        "columnview row:selected,\n"
+        "columnview row:selected:hover {\n"
+        "    background-image: linear-gradient(135deg, rgba(138,108,255,0.4), rgba(61,201,255,0.28));\n"
+        "    border-radius: 8px;\n"
+        "    color: @text_primary;\n"
+        "}\n"
+        "columnview row:selected label {\n"
+        "    color: @text_primary;\n"
+        "}\n"
+        "scrolledwindow.card-scroller {\n"
+        "    border-radius: 12px;\n"
+        "    box-shadow: 0 18px 40px rgba(5,10,20,0.55);\n"
+        "    background-color: rgba(16,20,28,0.8);\n"
+        "    border: 1px solid rgba(255,255,255,0.05);\n"
+        "}\n"
+        "label { color: @text_primary; }\n"
+        "label.muted { color: @text_muted; }\n"
+        ".stat-label { color: @accent_primary; font-weight: 600; }\n"
+        ".foil { color: #ffd977; text-shadow: 0 0 4px rgba(255,217,119,0.42); }\n"
+        "menu,\n"
+        "popover,\n"
+        ".popover {\n"
+        "    background-color: @bg_panel;\n"
+        "    color: @text_primary;\n"
+        "}\n"
+        "menuitem,\n"
+        "popover modelbutton {\n"
+        "    padding: 6px 12px;\n"
+        "}\n"
+        "menuitem:hover,\n"
+        "popover modelbutton:hover {\n"
+        "    background-color: rgba(138,108,255,0.18);\n"
+        "}\n"
+        "checkbutton,\n"
+        "radiobutton {\n"
+        "    color: @text_primary;\n"
+        "}\n"
+        "separator {\n"
+        "    background-color: rgba(255,255,255,0.08);\n"
+        "}\n"
+        "scrollbar slider {\n"
+        "    background-color: rgba(255,255,255,0.18);\n"
+        "    border-radius: 999px;\n"
+        "}\n"
+        "scrollbar slider:hover {\n"
+        "    background-color: rgba(138,108,255,0.45);\n"
+        "}\n"
+        ".toolbar {\n"
+        "    gap: 6px;\n"
+        "    padding: 1px 0;\n"
+        "}\n"
+        "headerbar button,\n"
+        "headerbar menubutton,\n"
+        "headerbar entry {\n"
+        "    min-height: 22px;\n"
+        "}\n"
     );
     gtk_style_context_add_provider_for_display(
         gdk_display_get_default(),
@@ -5728,6 +5821,7 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     // Box per il nome del database attualmente aperto
     GtkWidget *db_name_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
     GtkWidget *db_name_label = gtk_label_new("Nessun database aperto");
+    gtk_widget_add_css_class(db_name_label, "muted");
     gtk_box_append(GTK_BOX(db_name_box), db_name_label);
 
     // Stato globale dell'applicazione
@@ -5736,7 +5830,9 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     state->db = nullptr;
     state->db_name_label = db_name_label;
     state->total_cards_label = gtk_label_new("Totale carte: 0");
+    gtk_widget_add_css_class(state->total_cards_label, "stat-label");
     state->filter_label = gtk_label_new("");
+    gtk_widget_add_css_class(state->filter_label, "muted");
     state->selected_deck_id = -1;
     state->deck_button = NULL;
     state->deck_label = NULL;
@@ -5756,6 +5852,7 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
 
     // Bottone per aggiungere una nuova carta
     GtkWidget *add_card_button = gtk_button_new_with_label("Nuova Carta");
+    gtk_widget_add_css_class(add_card_button, "accent-button");
     g_signal_connect(add_card_button, "clicked", G_CALLBACK(on_add_card_clicked), window);
     // Hide the legacy "Nuova Carta" button by default so it's not shown on the
     // main Database page (we use inline add controls there). It will be shown
@@ -5764,6 +5861,7 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
 
     // Bottone per refresh delle carte
     GtkWidget *refresh_button = gtk_button_new_with_label("Refresh");
+    gtk_widget_add_css_class(refresh_button, "ghost-button");
     g_signal_connect(refresh_button, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data) {
         GtkWindow* window = GTK_WINDOW(user_data);
         AppState* state = (AppState*)g_object_get_data(G_OBJECT(window), "app_state");
@@ -5802,6 +5900,7 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     GtkWidget *search_entry = gtk_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(search_entry), "Cerca per nome...");
     gtk_widget_set_size_request(search_entry, 200, -1);
+    gtk_widget_add_css_class(search_entry, "search-field");
     g_signal_connect(search_entry, "changed", G_CALLBACK(+[](GtkEditable*, gpointer user_data) {
         GtkWindow* window = GTK_WINDOW(user_data);
         AppState* state = (AppState*)g_object_get_data(G_OBJECT(window), "app_state");
@@ -5837,7 +5936,9 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
 
     // Deck indicator / clear-filter button (hidden when not filtering)
     GtkWidget *deck_button = gtk_button_new_with_label("");
+    gtk_widget_add_css_class(deck_button, "ghost-button");
     GtkWidget *deck_label = gtk_label_new("");
+    gtk_widget_add_css_class(deck_label, "stat-label");
     gtk_widget_set_visible(deck_label, FALSE);
     // Clicking it clears the deck filter
     g_signal_connect(deck_button, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data) {
@@ -5854,6 +5955,7 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     GtkWidget *deck_delete_button = gtk_button_new_with_label("Elimina Deck");
     gtk_widget_set_visible(deck_delete_button, FALSE);
     gtk_widget_set_tooltip_text(deck_delete_button, "Elimina il deck e sposta le carte nella collezione principale");
+    gtk_widget_add_css_class(deck_delete_button, "danger-button");
     g_signal_connect(deck_delete_button, "clicked", G_CALLBACK(on_deck_delete_clicked), window);
     state->deck_delete_button = deck_delete_button;
 
@@ -5864,6 +5966,7 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     gtk_button_set_child(GTK_BUTTON(db_button), db_icon);
     gtk_widget_set_visible(db_button, FALSE);
     gtk_widget_set_tooltip_text(db_button, translate("Database").c_str());
+    gtk_widget_add_css_class(db_button, "ghost-button");
     g_signal_connect(db_button, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data) {
         GtkWindow *window = GTK_WINDOW(user_data);
         AppState* state = (AppState*)g_object_get_data(G_OBJECT(window), "app_state");
@@ -5881,6 +5984,7 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     GtkWidget *close_icon = gtk_image_new_from_icon_name("window-close-symbolic");
     gtk_button_set_child(GTK_BUTTON(close_button), close_icon);
     gtk_widget_set_tooltip_text(close_button, "Chiudi");
+    gtk_widget_add_css_class(close_button, "ghost-button");
     g_signal_connect(close_button, "clicked", G_CALLBACK(+[](GtkButton *, gpointer user_data) {
         GtkApplication *app = GTK_APPLICATION(user_data);
         g_application_quit(G_APPLICATION(app));
@@ -5888,6 +5992,7 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
 
     // Box per i bottoni
     GtkWidget *button_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    gtk_widget_add_css_class(button_box, "toolbar");
     gtk_box_append(GTK_BOX(button_box), file_button);
     gtk_box_append(GTK_BOX(button_box), view_button);
     gtk_box_append(GTK_BOX(button_box), add_card_button);
@@ -5899,15 +6004,18 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     gtk_entry_set_placeholder_text(GTK_ENTRY(inline_entry), "Aggiungi carta...");
     gtk_widget_set_size_request(inline_entry, 180, -1);
     gtk_widget_set_margin_start(inline_entry, 6);
+    gtk_widget_add_css_class(inline_entry, "inline-field");
 
     GtkWidget *inline_spin = gtk_spin_button_new_with_range(1, 100, 1);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(inline_spin), 1);
     gtk_widget_set_size_request(inline_spin, 56, -1);
     gtk_widget_set_margin_start(inline_spin, 8);
     gtk_widget_set_margin_end(inline_spin, 8);
+    gtk_widget_add_css_class(inline_spin, "inline-field");
 
     GtkWidget *inline_foil = gtk_check_button_new_with_label("Foil");
     gtk_widget_set_margin_start(inline_foil, 6);
+    gtk_widget_add_css_class(inline_foil, "inline-toggle");
 
     // Create AddCardContext for inline widgets and connect entry activate
     AddCardContext* inline_ctx = new AddCardContext{inline_entry, inline_spin, state, GTK_WINDOW(window), inline_foil};
@@ -6459,18 +6567,19 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     gtk_widget_set_hexpand(scrolled_window, TRUE);
     gtk_widget_set_vexpand(scrolled_window, TRUE);
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scrolled_window), GTK_WIDGET(column_view));
+    gtk_widget_add_css_class(scrolled_window, "card-scroller");
     state->column_view = column_view;
+
+    // Header bar per un look più moderno
+    GtkWidget *header_bar = gtk_header_bar_new();
+    gtk_widget_add_css_class(header_bar, "topbar");
+    gtk_widget_set_hexpand(button_box, TRUE);
+    gtk_header_bar_set_title_widget(GTK_HEADER_BAR(header_bar), button_box);
+    gtk_header_bar_pack_end(GTK_HEADER_BAR(header_bar), close_button);
+    gtk_window_set_titlebar(GTK_WINDOW(window), header_bar);
 
     // Layout
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-
-    // Box superiore: bottoni a sinistra, chiudi a destra (slim top bar)
-    GtkWidget *top_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    gtk_widget_add_css_class(top_box, "topbar");
-    gtk_box_append(GTK_BOX(top_box), button_box);
-    gtk_widget_set_hexpand(button_box, TRUE);
-    gtk_box_append(GTK_BOX(top_box), close_button);
-    gtk_box_append(GTK_BOX(vbox), top_box);
 
     // Scrolled window con tabella
     gtk_box_append(GTK_BOX(vbox), scrolled_window);
