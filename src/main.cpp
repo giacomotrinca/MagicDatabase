@@ -27,6 +27,7 @@
 #include <atomic>
 
 #include <sstream>
+#include <iomanip>
 // Forward declarations to allow scheduling helpers to be referenced before their definitions.
 struct AppState;
 struct ManaStatsExportCtx;
@@ -65,6 +66,7 @@ typedef struct _CardRow {
     gchar *image_url;
     gchar *added_date;
     gchar *price_usd;
+    gchar *oracle_text;
     int foil;
 } CardRow;
 
@@ -97,6 +99,7 @@ static void card_row_finalize(GObject *object) {
     g_free(self->image_url);
     g_free(self->added_date);
     g_free(self->price_usd);
+    g_free(self->oracle_text);
     g_free(self->quantity_display);
     G_OBJECT_CLASS(card_row_parent_class)->finalize(object);
 }
@@ -158,6 +161,7 @@ static void card_row_init(CardRow *self) {
     self->image_url = NULL;
     self->added_date = NULL;
     self->price_usd = NULL;
+    self->oracle_text = NULL;
     self->foil = 0;
 }
 
@@ -254,7 +258,50 @@ static std::string format_datetime(const char* iso) {
 static std::string translate_colors(const char* colors);
 static std::string translate_type(const char* type);
 
-static CardRow* card_row_new(int id, const char* name, const char* type, const char* colors, const char* set_code, const char* mana_cost, const char* rarity, int quantity, const char* image_url, const char* added_date, const char* price_usd, int foil, const char* quantity_display = NULL) {
+static std::string format_price_display(const char* raw_price) {
+    if (!raw_price) return std::string();
+    std::string price_chip = raw_price;
+    if (price_chip.empty()) return price_chip;
+    bool has_currency_prefix = price_chip[0] == '$';
+    if (!has_currency_prefix && price_chip.size() >= 3) {
+        unsigned char b0 = static_cast<unsigned char>(price_chip[0]);
+        unsigned char b1 = static_cast<unsigned char>(price_chip[1]);
+        unsigned char b2 = static_cast<unsigned char>(price_chip[2]);
+        has_currency_prefix = (b0 == 0xE2 && b1 == 0x82 && b2 == 0xAC);
+    }
+    if (!has_currency_prefix) {
+        price_chip.insert(price_chip.begin(), '$');
+    }
+    return price_chip;
+}
+
+static double parse_price_to_double(const std::string& raw_price) {
+    if (raw_price.empty()) return 0.0;
+    std::string cleaned;
+    cleaned.reserve(raw_price.size());
+    for (char ch : raw_price) {
+        if (!std::isspace(static_cast<unsigned char>(ch))) cleaned.push_back(ch);
+    }
+    if (!cleaned.empty() && (cleaned[0] == '$' || cleaned[0] == '€')) {
+        cleaned.erase(cleaned.begin());
+    }
+    if (cleaned.empty()) return 0.0;
+    try {
+        return std::stod(cleaned);
+    } catch (...) {
+        return 0.0;
+    }
+}
+
+static std::string format_currency_value(double value) {
+    if (std::fabs(value) < 0.0005) value = 0.0;
+    std::ostringstream oss;
+    oss.setf(std::ios::fixed);
+    oss << std::setprecision(2) << value;
+    return std::string("$") + oss.str();
+}
+
+static CardRow* card_row_new(int id, const char* name, const char* type, const char* colors, const char* set_code, const char* mana_cost, const char* rarity, int quantity, const char* image_url, const char* added_date, const char* price_usd, const char* oracle_text, int foil, const char* quantity_display = NULL) {
     CardRow* r = (CardRow*)g_object_new(card_row_get_type(), NULL);
     r->id = id;
     r->name = g_strdup(name ? name : "");
@@ -267,6 +314,7 @@ static CardRow* card_row_new(int id, const char* name, const char* type, const c
     r->image_url = g_strdup(image_url ? image_url : "");
     r->added_date = g_strdup(added_date ? added_date : "");
     r->price_usd = g_strdup(price_usd ? price_usd : "");
+    r->oracle_text = g_strdup(oracle_text ? oracle_text : "");
     r->foil = foil;
     r->total_mana_cost = calculate_total_mana_cost(r->mana_cost ? r->mana_cost : std::string());
     r->translated_colors = g_strdup(translate_colors(r->colors).c_str());
@@ -297,6 +345,9 @@ static std::map<std::string, std::map<std::string, std::string>> translations = 
     {"Rarità", {{"it","Rarità"}, {"en","Rarity"}}},
     {"Data di aggiunta", {{"it","Data di aggiunta"}, {"en","Added Date"}}},
     {"Quantità", {{"it","Quantità"}, {"en","Quantity"}}},
+    {"Espansione", {{"it","Espansione"}, {"en","Set"}}},
+    {"Prezzo", {{"it","Prezzo"}, {"en","Price"}}},
+    {"Descrizione", {{"it","Descrizione"}, {"en","Description"}}},
     {"Nuova Carta", {{"it","Nuova Carta"}, {"en","New Card"}}},
     {"Cerca per nome...", {{"it","Cerca per nome..."}, {"en","Search by name..."}}},
     {"File", {{"it","File"}, {"en","File"}}},
@@ -730,7 +781,7 @@ struct AppState {
     GtkWidget* inline_add_entry;
     GtkWidget* inline_add_spin;
     GtkWidget* inline_add_foil;
-    GtkColumnViewColumn *name_col, *type_col, *colors_col, *mana_col, *rarity_col, *date_col, *qty_col;
+    GtkColumnViewColumn *name_col, *type_col, *colors_col, *mana_col, *rarity_col, *date_col, *qty_col, *price_col;
     GtkWidget* add_card_button;
     GtkWidget* file_button;
     GtkWidget* view_button;
@@ -2011,6 +2062,7 @@ static void update_ui_texts(GtkWindow *window, AppState* state) {
     gtk_column_view_column_set_title(state->rarity_col, translate("Rarità").c_str());
     gtk_column_view_column_set_title(state->date_col, translate("Data di aggiunta").c_str());
     gtk_column_view_column_set_title(state->qty_col, translate("Quantità").c_str());
+    gtk_column_view_column_set_title(state->price_col, translate("Prezzo").c_str());
     // Change add button label when viewing a deck
     if (state->selected_deck_id != -1) {
         gtk_button_set_label(GTK_BUTTON(state->add_card_button), translate("Aggiungi Carte").c_str());
@@ -2020,15 +2072,29 @@ static void update_ui_texts(GtkWindow *window, AppState* state) {
     gtk_menu_button_set_label(GTK_MENU_BUTTON(state->file_button), translate("File").c_str());
     gtk_menu_button_set_label(GTK_MENU_BUTTON(state->view_button), translate("Visualizza").c_str());
     gtk_entry_set_placeholder_text(GTK_ENTRY(state->search_entry), translate("Cerca per nome...").c_str());
-    // Update total label (only show total quantity)
-    char buf[128];
+    // Update total label with quantity and aggregate value (based on main DB contents)
+    char buf[256];
     int total_qty = 0;
+    double total_value = 0.0;
     if (state->db) {
-        state->db->query("SELECT quantity FROM cards", [&](const std::map<std::string, std::string>& row) {
-            total_qty += std::stoi(row.at("quantity"));
+        state->db->query("SELECT quantity, price_usd FROM cards", [&](const std::map<std::string, std::string>& row) {
+            int qty = 0;
+            auto it_qty = row.find("quantity");
+            if (it_qty != row.end()) {
+                try { qty = std::stoi(it_qty->second); } catch (...) { qty = 0; }
+            }
+            total_qty += qty;
+            auto it_price = row.find("price_usd");
+            if (it_price != row.end() && !it_price->second.empty()) {
+                double price = parse_price_to_double(it_price->second);
+                total_value += price * qty;
+            }
         });
     }
-    snprintf(buf, sizeof(buf), "%s: %d", translate("Totale carte").c_str(), total_qty);
+    std::string total_value_str = format_currency_value(total_value);
+    snprintf(buf, sizeof(buf), "%s: %d    %s: %s",
+             translate("Totale carte").c_str(), total_qty,
+             translate("Valore totale").c_str(), total_value_str.c_str());
     gtk_label_set_text(GTK_LABEL(state->total_cards_label), buf);
     // Also rebuild menus so menu labels reflect the selected language
     rebuild_menus_for_language(state);
@@ -3874,6 +3940,14 @@ static std::vector<std::map<std::string, std::string>> load_cards_page(AppState*
             sel_params.push_back(filter);
         }
         select_sql += " GROUP BY key, foil ) ";
+        std::string oracle_value_select;
+        if (g_cards_table_has_oracle_text) {
+            oracle_value_select =
+                " (SELECT COALESCE(oracle_text,'') FROM cards c2 WHERE c2.canonical_name = agg.key AND c2.foil = agg.foil AND c2.added_date = agg.latest_date LIMIT 1) AS oracle_text,";
+        } else {
+            oracle_value_select = " '' AS oracle_text,";
+        }
+
         select_sql +=
             "SELECT "
             " (SELECT id FROM cards c2 WHERE c2.canonical_name = agg.key AND c2.foil = agg.foil AND c2.added_date = agg.latest_date LIMIT 1) AS id,"
@@ -3884,7 +3958,8 @@ static std::vector<std::map<std::string, std::string>> load_cards_page(AppState*
             " (SELECT COALESCE(localized_type,'') FROM cards c2 WHERE c2.canonical_name = agg.key AND c2.foil = agg.foil AND c2.added_date = agg.latest_date LIMIT 1) AS localized_type,"
             " (SELECT COALESCE(colors,'') FROM cards c2 WHERE c2.canonical_name = agg.key AND c2.foil = agg.foil AND c2.added_date = agg.latest_date LIMIT 1) AS colors,"
             " (SELECT COALESCE(set_code,'') FROM cards c2 WHERE c2.canonical_name = agg.key AND c2.foil = agg.foil AND c2.added_date = agg.latest_date LIMIT 1) AS set_code,"
-            " (SELECT COALESCE(mana_cost,'') FROM cards c2 WHERE c2.canonical_name = agg.key AND c2.foil = agg.foil AND c2.added_date = agg.latest_date LIMIT 1) AS mana_cost,"
+            " (SELECT COALESCE(mana_cost,'') FROM cards c2 WHERE c2.canonical_name = agg.key AND c2.foil = agg.foil AND c2.added_date = agg.latest_date LIMIT 1) AS mana_cost," +
+            oracle_value_select +
             " (SELECT COALESCE(rarity,'') FROM cards c2 WHERE c2.canonical_name = agg.key AND c2.foil = agg.foil AND c2.added_date = agg.latest_date LIMIT 1) AS rarity,"
             " agg.quantity_total AS quantity,"
             " (SELECT COALESCE(image_url,'') FROM cards c2 WHERE c2.canonical_name = agg.key AND c2.foil = agg.foil AND c2.added_date = agg.latest_date LIMIT 1) AS image_url,"
@@ -4122,6 +4197,8 @@ void refresh_card_list(AppState* state) {
     int main_count = 0;
     int side_count = 0;
     double total_value = 0.0;
+    double main_value = 0.0;
+    double side_value = 0.0;
     if (state->selected_deck_id == -1) {
         // Main DB view: behave as before
         for (const auto& row : cards) {
@@ -4232,6 +4309,7 @@ void refresh_card_list(AppState* state) {
                                          row.at("image_url").c_str(),
                                          row.count("added_date") ? row.at("added_date").c_str() : "",
                                          row.count("price_usd") ? row.at("price_usd").c_str() : "",
+                                         row.count("oracle_text") ? row.at("oracle_text").c_str() : "",
                                          foil,
                                          qty_display.c_str());
             g_list_store_append(state->card_store, crow);
@@ -4246,10 +4324,8 @@ void refresh_card_list(AppState* state) {
                 }
                 total_quantity += qty;
                 if (row.count("price_usd") && !row.at("price_usd").empty()) {
-                    try {
-                        double price = std::stod(row.at("price_usd"));
-                        total_value += price * qty;
-                    } catch (...) {}
+                    double price = parse_price_to_double(row.at("price_usd"));
+                    total_value += price * qty;
                 }
             } catch (...) {}
         }
@@ -4275,16 +4351,22 @@ void refresh_card_list(AppState* state) {
             if (row.count("foil")) {
                 try { foil = std::stoi(row.at("foil")); } catch(...) { foil = 0; }
             }
-            CardRow* crow = card_row_new(std::stoi(row.at("id")), display_name.c_str(), display_type.c_str(), row.count("colors") ? row.at("colors").c_str() : "", row.count("set_code") ? row.at("set_code").c_str() : "", row.count("mana_cost") ? row.at("mana_cost").c_str() : "", row.count("rarity") ? row.at("rarity").c_str() : "", std::stoi(row.at("quantity")), row.count("image_url") ? row.at("image_url").c_str() : "", row.count("added_date") ? row.at("added_date").c_str() : "", row.count("price_usd") ? row.at("price_usd").c_str() : "", foil);
+            CardRow* crow = card_row_new(std::stoi(row.at("id")), display_name.c_str(), display_type.c_str(), row.count("colors") ? row.at("colors").c_str() : "", row.count("set_code") ? row.at("set_code").c_str() : "", row.count("mana_cost") ? row.at("mana_cost").c_str() : "", row.count("rarity") ? row.at("rarity").c_str() : "", std::stoi(row.at("quantity")), row.count("image_url") ? row.at("image_url").c_str() : "", row.count("added_date") ? row.at("added_date").c_str() : "", row.count("price_usd") ? row.at("price_usd").c_str() : "", row.count("oracle_text") ? row.at("oracle_text").c_str() : "", foil);
             g_list_store_append(state->card_store, crow);
             g_object_unref(crow);
-            try { main_count += std::stoi(row.at("quantity")); } catch(...) {}
+            int qty = 0;
+            try { qty = std::stoi(row.at("quantity")); } catch(...) { qty = 0; }
+            main_count += qty;
+            if (row.count("price_usd") && !row.at("price_usd").empty()) {
+                double price = parse_price_to_double(row.at("price_usd"));
+                main_value += price * qty;
+            }
         }
         // If sideboard rows exist, append a separator and then side rows
         if (!side_rows.empty()) {
             std::string sep_label = translate("Sideboard");
             // Separator visual row (visual-only title row)
-            CardRow* sep = card_row_new(ROW_ID_SEPARATOR_TITLE, sep_label.c_str(), "", "", "", "", "", 0, "", "", "", 0);
+            CardRow* sep = card_row_new(ROW_ID_SEPARATOR_TITLE, sep_label.c_str(), "", "", "", "", "", 0, "", "", "", "", 0);
             g_list_store_append(state->card_store, sep);
             // Also add separator style to the list item widget when rendered via factories
             g_object_unref(sep);
@@ -4298,7 +4380,7 @@ void refresh_card_list(AppState* state) {
             header_line += translate("Rarità"); header_line += " | ";
             header_line += translate("Data di aggiunta"); header_line += " | ";
             header_line += translate("Quantità");
-            CardRow* hdr = card_row_new(ROW_ID_HEADER, header_line.c_str(), "", "", "", "", "", 0, "", "", "", 0);
+            CardRow* hdr = card_row_new(ROW_ID_HEADER, header_line.c_str(), "", "", "", "", "", 0, "", "", "", "", 0);
             g_list_store_append(state->card_store, hdr);
             g_object_unref(hdr);
             for (const auto& row : side_rows) {
@@ -4311,23 +4393,39 @@ void refresh_card_list(AppState* state) {
                 if (row.count("foil")) {
                     try { foil = std::stoi(row.at("foil")); } catch(...) { foil = 0; }
                 }
-                CardRow* crow = card_row_new(std::stoi(row.at("id")), display_name.c_str(), display_type.c_str(), row.count("colors") ? row.at("colors").c_str() : "", row.count("set_code") ? row.at("set_code").c_str() : "", row.count("mana_cost") ? row.at("mana_cost").c_str() : "", row.count("rarity") ? row.at("rarity").c_str() : "", std::stoi(row.at("quantity")), row.count("image_url") ? row.at("image_url").c_str() : "", row.count("added_date") ? row.at("added_date").c_str() : "", row.count("price_usd") ? row.at("price_usd").c_str() : "", foil);
+                CardRow* crow = card_row_new(std::stoi(row.at("id")), display_name.c_str(), display_type.c_str(), row.count("colors") ? row.at("colors").c_str() : "", row.count("set_code") ? row.at("set_code").c_str() : "", row.count("mana_cost") ? row.at("mana_cost").c_str() : "", row.count("rarity") ? row.at("rarity").c_str() : "", std::stoi(row.at("quantity")), row.count("image_url") ? row.at("image_url").c_str() : "", row.count("added_date") ? row.at("added_date").c_str() : "", row.count("price_usd") ? row.at("price_usd").c_str() : "", row.count("oracle_text") ? row.at("oracle_text").c_str() : "", foil);
                 g_list_store_append(state->card_store, crow);
                 g_object_unref(crow);
-                try { side_count += std::stoi(row.at("quantity")); } catch(...) {}
+                int qty = 0;
+                try { qty = std::stoi(row.at("quantity")); } catch(...) { qty = 0; }
+                side_count += qty;
+                if (row.count("price_usd") && !row.at("price_usd").empty()) {
+                    double price = parse_price_to_double(row.at("price_usd"));
+                    side_value += price * qty;
+                }
             }
         }
     }
     // Update total cards label
     char buf[256];
+    const std::string total_label = translate("Valore totale");
     if (state->selected_deck_id == -1) {
-        // Main database: show overall total (accumulated in total_quantity)
-        snprintf(buf, sizeof(buf), "%s: %d", translate("Totale carte").c_str(), total_quantity);
+        // Main database: show overall total quantity and aggregated value
+        std::string total_value_str = format_currency_value(total_value);
+        snprintf(buf, sizeof(buf), "%s: %d    %s: %s",
+                 translate("Totale carte").c_str(), total_quantity,
+                 total_label.c_str(), total_value_str.c_str());
     } else {
-        // Deck view: show main deck count and sideboard count separately
-        snprintf(buf, sizeof(buf), "%s: %d    %s: %d", translate("Deck").c_str(), main_count, translate("Sideboard").c_str(), side_count);
+        // Deck view: show main deck and sideboard counts with their respective totals
+        std::string main_value_str = format_currency_value(main_value);
+        std::string side_value_str = format_currency_value(side_value);
+        snprintf(buf, sizeof(buf), "%s: %d (%s: %s)    %s: %d (%s: %s)",
+                 translate("Deck").c_str(), main_count, total_label.c_str(), main_value_str.c_str(),
+                 translate("Sideboard").c_str(), side_count, total_label.c_str(), side_value_str.c_str());
     }
     gtk_label_set_text(GTK_LABEL(state->total_cards_label), buf);
+    int debug_total_quantity = (state->selected_deck_id == -1) ? total_quantity : (main_count + side_count);
+    double debug_total_value = (state->selected_deck_id == -1) ? total_value : (main_value + side_value);
     // Update filter summary label
     std::string fsummary;
     if (!state->filter_colors.empty()) {
@@ -4369,7 +4467,7 @@ void refresh_card_list(AppState* state) {
     if (fsummary.empty()) fsummary = "";
     gtk_label_set_text(GTK_LABEL(state->filter_label), fsummary.c_str());
     // Debug log to help track down cases where UI shows zero
-    std::cout << "DEBUG: totals computed -> quantity=" << total_quantity << ", value=$" << total_value << std::endl;
+    std::cout << "DEBUG: totals computed -> quantity=" << debug_total_quantity << ", value=$" << debug_total_value << std::endl;
     // Update the columnview model
     // GtkSelectionModel *selection = GTK_SELECTION_MODEL(gtk_single_selection_new(G_LIST_MODEL(state->card_store)));
     // gtk_column_view_set_model(state->column_view, selection);
@@ -6335,53 +6433,192 @@ static void name_factory_setup_cb(GtkListItemFactory *factory, GtkListItem *item
     gtk_revealer_set_transition_duration(GTK_REVEALER(revealer), 260);
     gtk_revealer_set_transition_type(GTK_REVEALER(revealer), GTK_REVEALER_TRANSITION_TYPE_SLIDE_DOWN);
 
-    GtkWidget *detail_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    GtkWidget *detail_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 16);
     gtk_widget_add_css_class(detail_box, "detail-panel");
-    gtk_widget_set_margin_start(detail_box, 8);
-    gtk_widget_set_margin_end(detail_box, 8);
-    gtk_widget_set_margin_top(detail_box, 6);
-    gtk_widget_set_margin_bottom(detail_box, 6);
+    gtk_widget_set_margin_start(detail_box, 14);
+    gtk_widget_set_margin_end(detail_box, 14);
+    gtk_widget_set_margin_top(detail_box, 12);
+    gtk_widget_set_margin_bottom(detail_box, 14);
 
-    /* Left: picture area */
+    GtkWidget *header_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    gtk_widget_add_css_class(header_row, "detail-header");
+    gtk_box_append(GTK_BOX(detail_box), header_row);
+
+    GtkWidget *title_label = gtk_label_new("");
+    gtk_widget_add_css_class(title_label, "detail-title");
+    gtk_label_set_xalign(GTK_LABEL(title_label), 0.0);
+    gtk_widget_set_hexpand(title_label, TRUE);
+    gtk_box_append(GTK_BOX(header_row), title_label);
+
+    GtkWidget *qty_label = gtk_label_new("");
+    gtk_widget_add_css_class(qty_label, "detail-chip");
+    gtk_widget_add_css_class(qty_label, "detail-qty-chip");
+    gtk_label_set_xalign(GTK_LABEL(qty_label), 0.5);
+    gtk_box_append(GTK_BOX(header_row), qty_label);
+
+    GtkWidget *content_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 18);
+    gtk_widget_add_css_class(content_row, "detail-content");
+    gtk_box_append(GTK_BOX(detail_box), content_row);
+
+    GtkWidget *preview_column = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+    gtk_widget_add_css_class(preview_column, "detail-preview");
+    gtk_widget_set_valign(preview_column, GTK_ALIGN_START);
+    gtk_box_append(GTK_BOX(content_row), preview_column);
+
+    GtkWidget *art_frame = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_add_css_class(art_frame, "detail-art-frame");
+    gtk_widget_set_size_request(art_frame, 200, 280);
+    gtk_widget_set_hexpand(art_frame, FALSE);
+    gtk_widget_set_vexpand(art_frame, FALSE);
+    gtk_widget_set_overflow(art_frame, GTK_OVERFLOW_HIDDEN);
+    gtk_box_append(GTK_BOX(preview_column), art_frame);
+
     GtkWidget *picture = gtk_picture_new();
     gtk_picture_set_content_fit(GTK_PICTURE(picture), GTK_CONTENT_FIT_CONTAIN);
-    gtk_widget_set_size_request(picture, 200, 280); // approximate card aspect
-    gtk_widget_set_hexpand(picture, FALSE);
-    gtk_widget_set_vexpand(picture, FALSE);
-    gtk_box_append(GTK_BOX(detail_box), picture);
-    /* Small Remove button just to the right of the image */
+    gtk_picture_set_can_shrink(GTK_PICTURE(picture), TRUE);
+    gtk_widget_add_css_class(picture, "detail-art");
+    gtk_widget_set_hexpand(picture, TRUE);
+    gtk_widget_set_vexpand(picture, TRUE);
+    gtk_widget_set_valign(picture, GTK_ALIGN_FILL);
+    gtk_widget_set_halign(picture, GTK_ALIGN_FILL);
+    gtk_widget_set_size_request(picture, 200, 280);
+    gtk_box_append(GTK_BOX(art_frame), picture);
+
+    GtkWidget *action_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_add_css_class(action_row, "detail-actions");
+    gtk_widget_set_halign(action_row, GTK_ALIGN_FILL);
+    gtk_box_append(GTK_BOX(preview_column), action_row);
+
     GtkWidget *remove_btn = gtk_button_new_with_label(translate("Rimuovi").c_str());
     gtk_widget_add_css_class(remove_btn, "danger-button");
     gtk_widget_add_css_class(remove_btn, "compact-button");
-    gtk_widget_set_size_request(remove_btn, 92, -1);
-    gtk_widget_set_valign(remove_btn, GTK_ALIGN_START);
-    gtk_widget_set_halign(remove_btn, GTK_ALIGN_START);
-    gtk_box_append(GTK_BOX(detail_box), remove_btn);
+    gtk_widget_set_hexpand(remove_btn, TRUE);
+    gtk_widget_set_valign(remove_btn, GTK_ALIGN_CENTER);
+    gtk_widget_set_halign(remove_btn, GTK_ALIGN_FILL);
+    gtk_box_append(GTK_BOX(action_row), remove_btn);
 
-    /* Middle: info vbox */
-    GtkWidget *info_vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    GtkWidget *info_vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_widget_add_css_class(info_vbox, "detail-info");
     gtk_widget_set_hexpand(info_vbox, TRUE);
     gtk_widget_set_vexpand(info_vbox, FALSE);
-    GtkWidget *title_label = gtk_label_new(""); gtk_label_set_xalign(GTK_LABEL(title_label), 0.0); gtk_widget_add_css_class(title_label, "detail-title");
-    GtkWidget *type_label = gtk_label_new(""); gtk_label_set_xalign(GTK_LABEL(type_label), 0.0); gtk_widget_add_css_class(type_label, "detail-meta");
-    GtkWidget *colors_label = gtk_label_new(""); gtk_label_set_xalign(GTK_LABEL(colors_label), 0.0); gtk_widget_add_css_class(colors_label, "detail-meta");
-    GtkWidget *rarity_label = gtk_label_new(""); gtk_label_set_xalign(GTK_LABEL(rarity_label), 0.0); gtk_widget_add_css_class(rarity_label, "detail-meta");
-    GtkWidget *set_label = gtk_label_new(""); gtk_label_set_xalign(GTK_LABEL(set_label), 0.0); gtk_widget_add_css_class(set_label, "detail-meta");
-    GtkWidget *mana_label = gtk_label_new(""); gtk_label_set_xalign(GTK_LABEL(mana_label), 0.0); gtk_widget_add_css_class(mana_label, "detail-meta");
-    /* Oracle / rules text (wrapping, may be long) */
-    GtkWidget *oracle_label = gtk_label_new(""); gtk_label_set_xalign(GTK_LABEL(oracle_label), 0.0); gtk_widget_add_css_class(oracle_label, "detail-text"); gtk_label_set_wrap(GTK_LABEL(oracle_label), TRUE);
-    GtkWidget *qty_label = gtk_label_new(""); gtk_label_set_xalign(GTK_LABEL(qty_label), 0.0); gtk_widget_add_css_class(qty_label, "detail-meta");
-    GtkWidget *deck_label = gtk_label_new(""); gtk_label_set_xalign(GTK_LABEL(deck_label), 0.0); gtk_widget_add_css_class(deck_label, "detail-meta");
-    gtk_box_append(GTK_BOX(info_vbox), title_label);
-    gtk_box_append(GTK_BOX(info_vbox), type_label);
-    gtk_box_append(GTK_BOX(info_vbox), colors_label);
-    gtk_box_append(GTK_BOX(info_vbox), rarity_label);
-    gtk_box_append(GTK_BOX(info_vbox), set_label);
-    gtk_box_append(GTK_BOX(info_vbox), mana_label);
-    gtk_box_append(GTK_BOX(info_vbox), oracle_label);
-    gtk_box_append(GTK_BOX(info_vbox), qty_label);
-    gtk_box_append(GTK_BOX(info_vbox), deck_label);
-    gtk_box_append(GTK_BOX(detail_box), info_vbox);
+    gtk_box_append(GTK_BOX(content_row), info_vbox);
+
+    GtkWidget *meta_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_box_append(GTK_BOX(info_vbox), meta_box);
+
+    GtkWidget *type_label = gtk_label_new("");
+    gtk_widget_add_css_class(type_label, "detail-meta-line");
+    gtk_label_set_xalign(GTK_LABEL(type_label), 0.0);
+    gtk_box_append(GTK_BOX(meta_box), type_label);
+
+    GtkWidget *colors_label = gtk_label_new("");
+    gtk_widget_add_css_class(colors_label, "detail-meta-line");
+    gtk_label_set_xalign(GTK_LABEL(colors_label), 0.0);
+    gtk_box_append(GTK_BOX(meta_box), colors_label);
+
+    GtkWidget *stat_grid = gtk_grid_new();
+    gtk_widget_add_css_class(stat_grid, "detail-stat-grid");
+    gtk_grid_set_row_spacing(GTK_GRID(stat_grid), 6);
+    gtk_grid_set_column_spacing(GTK_GRID(stat_grid), 12);
+    gtk_box_append(GTK_BOX(info_vbox), stat_grid);
+
+    auto make_stat_caption = [&](const char *key, int row_index) {
+        GtkWidget *caption = gtk_label_new(translate(key).c_str());
+        gtk_widget_add_css_class(caption, "detail-stat-name");
+        gtk_label_set_xalign(GTK_LABEL(caption), 0.0);
+        gtk_grid_attach(GTK_GRID(stat_grid), caption, 0, row_index, 1, 1);
+    };
+
+    GtkWidget *rarity_label = gtk_label_new("");
+    gtk_widget_add_css_class(rarity_label, "detail-stat-value");
+    gtk_label_set_xalign(GTK_LABEL(rarity_label), 0.0);
+
+    GtkWidget *set_label = gtk_label_new("");
+    gtk_widget_add_css_class(set_label, "detail-stat-value");
+    gtk_label_set_xalign(GTK_LABEL(set_label), 0.0);
+
+    GtkWidget *mana_label = gtk_label_new("");
+    gtk_widget_add_css_class(mana_label, "detail-stat-value");
+    gtk_label_set_xalign(GTK_LABEL(mana_label), 0.0);
+
+    GtkWidget *price_label = gtk_label_new("");
+    gtk_widget_add_css_class(price_label, "detail-stat-value");
+    gtk_widget_add_css_class(price_label, "detail-price-chip");
+    gtk_label_set_xalign(GTK_LABEL(price_label), 0.0);
+
+    GtkWidget *date_label = gtk_label_new("");
+    gtk_widget_add_css_class(date_label, "detail-stat-value");
+    gtk_label_set_xalign(GTK_LABEL(date_label), 0.0);
+
+    GtkWidget *deck_label = gtk_label_new("");
+    gtk_widget_add_css_class(deck_label, "detail-stat-value");
+    gtk_label_set_xalign(GTK_LABEL(deck_label), 0.0);
+    gtk_label_set_wrap(GTK_LABEL(deck_label), TRUE);
+    gtk_label_set_wrap_mode(GTK_LABEL(deck_label), PANGO_WRAP_WORD_CHAR);
+
+    int stat_row = 0;
+    make_stat_caption("Rarità", stat_row);
+    gtk_grid_attach(GTK_GRID(stat_grid), rarity_label, 1, stat_row, 1, 1);
+    stat_row++;
+    make_stat_caption("Espansione", stat_row);
+    gtk_grid_attach(GTK_GRID(stat_grid), set_label, 1, stat_row, 1, 1);
+    stat_row++;
+    make_stat_caption("Costo Mana", stat_row);
+    gtk_grid_attach(GTK_GRID(stat_grid), mana_label, 1, stat_row, 1, 1);
+    stat_row++;
+    make_stat_caption("Prezzo", stat_row);
+    gtk_grid_attach(GTK_GRID(stat_grid), price_label, 1, stat_row, 1, 1);
+    stat_row++;
+    make_stat_caption("Data di aggiunta", stat_row);
+    gtk_grid_attach(GTK_GRID(stat_grid), date_label, 1, stat_row, 1, 1);
+    stat_row++;
+    make_stat_caption("Deck", stat_row);
+    gtk_grid_attach(GTK_GRID(stat_grid), deck_label, 1, stat_row, 1, 1);
+
+    GtkWidget *oracle_section = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_widget_add_css_class(oracle_section, "detail-section");
+    gtk_widget_set_margin_top(oracle_section, 12);
+    gtk_box_append(GTK_BOX(info_vbox), oracle_section);
+
+    GtkWidget *oracle_title = gtk_label_new(translate("Descrizione").c_str());
+    gtk_widget_add_css_class(oracle_title, "detail-section-title");
+    gtk_label_set_xalign(GTK_LABEL(oracle_title), 0.0);
+    gtk_box_append(GTK_BOX(oracle_section), oracle_title);
+
+    GtkWidget *oracle_scroll = gtk_scrolled_window_new();
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(oracle_scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(oracle_scroll), 90);
+    gtk_scrolled_window_set_max_content_height(GTK_SCROLLED_WINDOW(oracle_scroll), 240);
+    gtk_widget_add_css_class(oracle_scroll, "detail-oracle-scroll");
+    gtk_widget_set_hexpand(oracle_scroll, TRUE);
+    gtk_box_append(GTK_BOX(oracle_section), oracle_scroll);
+
+    GtkWidget *oracle_container = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_add_css_class(oracle_container, "detail-oracle-container");
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(oracle_scroll), oracle_container);
+
+    GtkWidget *oracle_label = gtk_label_new("");
+    gtk_widget_add_css_class(oracle_label, "detail-text");
+    gtk_label_set_xalign(GTK_LABEL(oracle_label), 0.0);
+    gtk_label_set_wrap(GTK_LABEL(oracle_label), TRUE);
+    gtk_label_set_wrap_mode(GTK_LABEL(oracle_label), PANGO_WRAP_WORD_CHAR);
+    gtk_box_append(GTK_BOX(oracle_container), oracle_label);
+
+    g_object_set_data(G_OBJECT(detail_box), "picture", picture);
+    g_object_set_data(G_OBJECT(detail_box), "remove_btn", remove_btn);
+    g_object_set_data(G_OBJECT(detail_box), "title_label", title_label);
+    g_object_set_data(G_OBJECT(detail_box), "type_label", type_label);
+    g_object_set_data(G_OBJECT(detail_box), "colors_label", colors_label);
+    g_object_set_data(G_OBJECT(detail_box), "rarity_label", rarity_label);
+    g_object_set_data(G_OBJECT(detail_box), "set_label", set_label);
+    g_object_set_data(G_OBJECT(detail_box), "mana_label", mana_label);
+    g_object_set_data(G_OBJECT(detail_box), "price_label", price_label);
+    g_object_set_data(G_OBJECT(detail_box), "date_label", date_label);
+    g_object_set_data(G_OBJECT(detail_box), "qty_label", qty_label);
+    g_object_set_data(G_OBJECT(detail_box), "deck_label", deck_label);
+    g_object_set_data(G_OBJECT(detail_box), "oracle_label", oracle_label);
+    g_object_set_data(G_OBJECT(detail_box), "oracle_scroll", oracle_scroll);
+    g_object_set_data(G_OBJECT(detail_box), "oracle_section", oracle_section);
 
     gtk_revealer_set_child(GTK_REVEALER(revealer), detail_box);
 
@@ -6431,28 +6668,23 @@ static void name_factory_bind_cb(GtkListItemFactory *factory, GtkListItem *item,
     if (!visible_box) return;
     GtkWidget *name_label = gtk_widget_get_first_child(visible_box);
     GtkWidget *meta_label = name_label ? gtk_widget_get_next_sibling(name_label) : NULL;
-    /* Detail widgets: picture + info labels are children of the detail_box (second child of outer_vbox) */
     GtkWidget *revealer = gtk_widget_get_next_sibling(visible_box);
     GtkWidget *detail_box = revealer ? gtk_revealer_get_child(GTK_REVEALER(revealer)) : NULL;
-    GtkWidget *picture = NULL, *info_vbox = NULL, *title_label = NULL, *type_label = NULL, *colors_label = NULL, *rarity_label = NULL, *set_label = NULL, *mana_label = NULL, *oracle_label = NULL, *qty_label = NULL, *deck_label = NULL, *remove_btn = NULL;
-    if (detail_box) {
-        /* detail_box children: picture, remove_btn, info_vbox */
-        picture = gtk_widget_get_first_child(detail_box);
-        remove_btn = picture ? gtk_widget_get_next_sibling(picture) : NULL;
-        info_vbox = remove_btn ? gtk_widget_get_next_sibling(remove_btn) : NULL;
-        if (info_vbox) {
-            title_label = gtk_widget_get_first_child(info_vbox);
-            type_label = title_label ? gtk_widget_get_next_sibling(title_label) : NULL;
-            colors_label = type_label ? gtk_widget_get_next_sibling(type_label) : NULL;
-            rarity_label = colors_label ? gtk_widget_get_next_sibling(colors_label) : NULL;
-            set_label = rarity_label ? gtk_widget_get_next_sibling(rarity_label) : NULL;
-            mana_label = set_label ? gtk_widget_get_next_sibling(set_label) : NULL;
-            oracle_label = mana_label ? gtk_widget_get_next_sibling(mana_label) : NULL;
-            qty_label = oracle_label ? gtk_widget_get_next_sibling(oracle_label) : NULL;
-            deck_label = qty_label ? gtk_widget_get_next_sibling(qty_label) : NULL;
-            /* remove_btn already is the middle child (picture -> remove_btn -> info_vbox) */
-        }
-    }
+    GtkWidget *picture = detail_box ? (GtkWidget*)g_object_get_data(G_OBJECT(detail_box), "picture") : NULL;
+    GtkWidget *remove_btn = detail_box ? (GtkWidget*)g_object_get_data(G_OBJECT(detail_box), "remove_btn") : NULL;
+    GtkWidget *title_label = detail_box ? (GtkWidget*)g_object_get_data(G_OBJECT(detail_box), "title_label") : NULL;
+    GtkWidget *type_label = detail_box ? (GtkWidget*)g_object_get_data(G_OBJECT(detail_box), "type_label") : NULL;
+    GtkWidget *colors_label = detail_box ? (GtkWidget*)g_object_get_data(G_OBJECT(detail_box), "colors_label") : NULL;
+    GtkWidget *rarity_label = detail_box ? (GtkWidget*)g_object_get_data(G_OBJECT(detail_box), "rarity_label") : NULL;
+    GtkWidget *set_label = detail_box ? (GtkWidget*)g_object_get_data(G_OBJECT(detail_box), "set_label") : NULL;
+    GtkWidget *mana_label = detail_box ? (GtkWidget*)g_object_get_data(G_OBJECT(detail_box), "mana_label") : NULL;
+    GtkWidget *price_label = detail_box ? (GtkWidget*)g_object_get_data(G_OBJECT(detail_box), "price_label") : NULL;
+    GtkWidget *date_label = detail_box ? (GtkWidget*)g_object_get_data(G_OBJECT(detail_box), "date_label") : NULL;
+    GtkWidget *qty_label = detail_box ? (GtkWidget*)g_object_get_data(G_OBJECT(detail_box), "qty_label") : NULL;
+    GtkWidget *deck_label = detail_box ? (GtkWidget*)g_object_get_data(G_OBJECT(detail_box), "deck_label") : NULL;
+    GtkWidget *oracle_label = detail_box ? (GtkWidget*)g_object_get_data(G_OBJECT(detail_box), "oracle_label") : NULL;
+    GtkWidget *oracle_scroll = detail_box ? (GtkWidget*)g_object_get_data(G_OBJECT(detail_box), "oracle_scroll") : NULL;
+    GtkWidget *oracle_section = detail_box ? (GtkWidget*)g_object_get_data(G_OBJECT(detail_box), "oracle_section") : NULL;
     if (!row) {
         if (name_label) gtk_label_set_text(GTK_LABEL(name_label), "");
         if (meta_label) gtk_label_set_text(GTK_LABEL(meta_label), "");
@@ -6490,12 +6722,23 @@ static void name_factory_bind_cb(GtkListItemFactory *factory, GtkListItem *item,
         return;
     }
     // Normal row: populate name and meta (type + set)
-    if (name_label) gtk_label_set_text(GTK_LABEL(name_label), row->name ? row->name : "");
+    const char* raw_name = row->name ? row->name : "";
+    if (name_label) gtk_label_set_text(GTK_LABEL(name_label), raw_name);
+
+    std::string type_text = translate_type(row->type ? row->type : "");
+    std::string set_code = row->set_code ? row->set_code : "";
+    std::transform(set_code.begin(), set_code.end(), set_code.begin(), [](unsigned char c){ return std::toupper(c); });
+
     std::string meta;
-    if (row->type && row->set_code) {
-        meta = std::string(row->type) + " • " + (row->set_code ? row->set_code : "");
-    } else if (row->type) meta = row->type;
-    if (meta_label) gtk_label_set_text(GTK_LABEL(meta_label), meta.c_str());
+    if (!type_text.empty()) meta = type_text;
+    if (!set_code.empty()) {
+        if (!meta.empty()) meta += " • ";
+        meta += set_code;
+    }
+    if (meta_label) {
+        gtk_label_set_text(GTK_LABEL(meta_label), meta.c_str());
+        gtk_widget_set_visible(meta_label, !meta.empty());
+    }
     /* Remove any visual-only classes that may have been applied when this ListItem was reused */
     gtk_widget_remove_css_class(outer, "separator-row");
     gtk_widget_remove_css_class(outer, "header-row");
@@ -6506,13 +6749,74 @@ static void name_factory_bind_cb(GtkListItemFactory *factory, GtkListItem *item,
         if (name_label) gtk_widget_remove_css_class(name_label, "foil");
     }
     // Populate detail panel (if present)
-    if (title_label) gtk_label_set_text(GTK_LABEL(title_label), row->name ? row->name : "");
-    if (type_label) gtk_label_set_text(GTK_LABEL(type_label), row->type ? row->type : "");
-    if (colors_label) gtk_label_set_text(GTK_LABEL(colors_label), row->translated_colors ? row->translated_colors : "");
-    if (rarity_label) gtk_label_set_text(GTK_LABEL(rarity_label), translate_rarity(row->rarity).c_str());
-    if (set_label) gtk_label_set_text(GTK_LABEL(set_label), row->set_code ? row->set_code : "");
-    if (mana_label) gtk_label_set_text(GTK_LABEL(mana_label), row->mana_cost ? row->mana_cost : "");
-    if (qty_label) gtk_label_set_text(GTK_LABEL(qty_label), row->quantity_display ? row->quantity_display : std::to_string(row->quantity).c_str());
+    if (title_label) gtk_label_set_text(GTK_LABEL(title_label), raw_name);
+
+    if (remove_btn) gtk_button_set_label(GTK_BUTTON(remove_btn), translate("Rimuovi").c_str());
+
+    if (type_label) {
+        gtk_label_set_text(GTK_LABEL(type_label), type_text.c_str());
+        gtk_widget_set_visible(type_label, !type_text.empty());
+    }
+
+    std::string colors_text = row->translated_colors ? row->translated_colors : translate_colors(row->colors);
+    if (colors_label) {
+        gtk_label_set_text(GTK_LABEL(colors_label), colors_text.c_str());
+        gtk_widget_set_visible(colors_label, !colors_text.empty());
+    }
+
+    std::string rarity_text = translate_rarity(row->rarity);
+    if (rarity_label) {
+        gtk_label_set_text(GTK_LABEL(rarity_label), rarity_text.c_str());
+        gtk_widget_set_visible(rarity_label, !rarity_text.empty());
+    }
+
+    if (set_label) {
+        gtk_label_set_text(GTK_LABEL(set_label), set_code.c_str());
+        gtk_widget_set_visible(set_label, !set_code.empty());
+    }
+
+    std::string mana_text = row->mana_cost ? row->mana_cost : "";
+    if (mana_label) {
+        gtk_label_set_text(GTK_LABEL(mana_label), mana_text.c_str());
+        gtk_widget_set_visible(mana_label, !mana_text.empty());
+    }
+
+    if (price_label) {
+        std::string price_chip = format_price_display(row->price_usd);
+        if (!price_chip.empty()) {
+            gtk_label_set_text(GTK_LABEL(price_label), price_chip.c_str());
+            gtk_widget_set_visible(price_label, TRUE);
+        } else {
+            gtk_label_set_text(GTK_LABEL(price_label), "");
+            gtk_widget_set_visible(price_label, FALSE);
+        }
+    }
+
+    if (date_label) {
+        std::string date_text;
+        if (row->added_date && row->added_date[0]) {
+            date_text = format_datetime(row->added_date);
+            if (date_text.empty()) date_text = row->added_date;
+        }
+        if (date_text.empty()) date_text = "-";
+        gtk_label_set_text(GTK_LABEL(date_label), date_text.c_str());
+    }
+
+    if (qty_label) {
+        std::string qty_text = row->quantity_display ? row->quantity_display : std::to_string(row->quantity);
+        gtk_label_set_text(GTK_LABEL(qty_label), qty_text.c_str());
+        gtk_widget_set_visible(qty_label, !qty_text.empty());
+    }
+
+    if (oracle_label && oracle_section) {
+        std::string oracle_text = row->oracle_text ? row->oracle_text : "";
+        oracle_text.erase(std::remove(oracle_text.begin(), oracle_text.end(), '\r'), oracle_text.end());
+        gtk_label_set_text(GTK_LABEL(oracle_label), oracle_text.c_str());
+        bool has_oracle = !oracle_text.empty();
+        gtk_widget_set_visible(oracle_label, has_oracle);
+        gtk_widget_set_visible(oracle_section, has_oracle);
+        if (oracle_scroll) gtk_widget_set_visible(oracle_scroll, has_oracle);
+    }
 
     /* Ensure the CardRow object stores a reference to the detail revealer so
      * gestures coming from other column ListItem objects can find and toggle it.
@@ -6524,6 +6828,7 @@ static void name_factory_bind_cb(GtkListItemFactory *factory, GtkListItem *item,
 
     /* Deck membership: query DB for decks that contain cards with same name */
     if (deck_label) {
+        gtk_widget_set_visible(deck_label, TRUE);
         gtk_label_set_text(GTK_LABEL(deck_label), translate("Non in alcun mazzo").c_str());
         /* Try to find the AppState to access DB */
         GtkWidget *colv = gtk_widget_get_ancestor(outer, GTK_TYPE_COLUMN_VIEW);
@@ -6795,6 +7100,22 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     "    border-radius: 12px;\n"
     "    box-shadow: inset 0 0 0 1px rgba(0,0,0,0.35), 0 14px 28px rgba(6,10,18,0.55);\n"
     "}\n"
+    ".detail-content { align-items: flex-start; }\n"
+    ".detail-preview { min-width: 210px; }\n"
+    ".detail-art-frame { border-radius: 16px; background-image: radial-gradient(circle at 30% 20%, rgba(138,108,255,0.32), transparent 70%), linear-gradient(180deg, rgba(24,30,45,0.95), rgba(12,18,30,0.9)); border: 1px solid rgba(138,108,255,0.22); box-shadow: 0 18px 40px rgba(5,10,25,0.35); }\n"
+    ".detail-art { background-color: rgba(8,12,20,0.9); }\n"
+    ".detail-actions { padding-top: 8px; }\n"
+    ".detail-info { padding-top: 4px; }\n"
+    ".detail-meta-line { font-size: 12px; color: @text_muted; }\n"
+    ".detail-chip { background-color: rgba(138,108,255,0.18); color: @text_primary; border-radius: 999px; padding: 2px 10px; font-size: 12px; letter-spacing: 0.4px; }\n"
+    ".detail-qty-chip { background-color: rgba(61,201,255,0.18); font-weight: 600; }\n"
+    ".detail-stat-grid { margin-top: 4px; }\n"
+    ".detail-stat-name { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: rgba(154,167,189,0.85); }\n"
+    ".detail-stat-value { font-size: 12px; color: @text_primary; }\n"
+    ".detail-section { margin-top: 10px; }\n"
+    ".detail-section-title { font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: rgba(154,167,189,0.9); }\n"
+    ".detail-oracle-scroll { border-radius: 10px; border: 1px solid rgba(138,108,255,0.22); background-color: rgba(14,20,32,0.88); }\n"
+    ".detail-oracle-container { padding: 8px 10px; }\n"
     ".detail-title { font-size: 15px; font-weight: 600; color: @text_primary; }\n"
     ".detail-meta { font-size: 12px; color: @text_muted; }\n"
     ".detail-text { font-size: 12px; line-height: 1.4; color: @text_primary; opacity: 0.88; }\n"
@@ -6833,10 +7154,27 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         "scrollbar slider:hover {\n"
         "    background-color: rgba(138,108,255,0.45);\n"
         "}\n"
-        ".toolbar {\n"
-        "    gap: 6px;\n"
-        "    padding: 1px 0;\n"
-        "}\n"
+    ".toolbar {\n"
+    "    padding: 6px 12px;\n"
+    "    border-radius: 18px;\n"
+    "    background-color: rgba(22, 24, 37, 0.86);\n"
+    "    border: 1px solid rgba(255,255,255,0.05);\n"
+    "    box-shadow: 0 12px 32px rgba(6, 10, 24, 0.45);\n"
+    "}\n"
+    ".toolbar button,\n"
+    ".toolbar menubutton,\n"
+    ".toolbar entry {\n"
+    "    min-height: 32px;\n"
+    "}\n"
+    ".toolbar .inline-field {\n"
+    "    min-height: 32px;\n"
+    "}\n"
+    ".toolbar .inline-toggle {\n"
+    "    padding: 6px 12px;\n"
+    "}\n"
+    ".toolbar .search-field {\n"
+    "    min-width: 220px;\n"
+    "}\n"
         "headerbar button,\n"
         "headerbar menubutton,\n"
         "headerbar entry {\n"
@@ -6916,6 +7254,7 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     state->stats_placeholder = NULL;
     state->stats_ctx = NULL;
     state->has_oracle_text_column = false;
+    state->name_col = state->type_col = state->colors_col = state->mana_col = state->rarity_col = state->date_col = state->qty_col = state->price_col = NULL;
     state->filter_colors.clear();
     state->filter_rarities.clear();
     state->filter_types.clear();
@@ -7036,14 +7375,33 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         g_application_quit(G_APPLICATION(app));
     }), app);
 
-    // Box per i bottoni
-    GtkWidget *button_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
-    gtk_widget_add_css_class(button_box, "toolbar");
-    gtk_box_append(GTK_BOX(button_box), file_button);
-    gtk_box_append(GTK_BOX(button_box), view_button);
-    gtk_box_append(GTK_BOX(button_box), add_card_button);
-    gtk_box_append(GTK_BOX(button_box), refresh_button);
-    gtk_box_append(GTK_BOX(button_box), search_entry);
+    // Toolbar container with left/center/right groups for a cleaner layout
+    GtkWidget *toolbar = gtk_center_box_new();
+    gtk_widget_add_css_class(toolbar, "toolbar");
+    gtk_widget_set_valign(toolbar, GTK_ALIGN_CENTER);
+    gtk_widget_set_hexpand(toolbar, TRUE);
+
+    GtkWidget *toolbar_left = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    gtk_widget_add_css_class(toolbar_left, "toolbar-group");
+    gtk_center_box_set_start_widget(GTK_CENTER_BOX(toolbar), toolbar_left);
+
+    GtkWidget *toolbar_center = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_widget_add_css_class(toolbar_center, "toolbar-group");
+    gtk_widget_set_hexpand(toolbar_center, TRUE);
+    gtk_center_box_set_center_widget(GTK_CENTER_BOX(toolbar), toolbar_center);
+
+    GtkWidget *toolbar_right = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    gtk_widget_add_css_class(toolbar_right, "toolbar-group");
+    gtk_center_box_set_end_widget(GTK_CENTER_BOX(toolbar), toolbar_right);
+
+    gtk_box_append(GTK_BOX(toolbar_left), file_button);
+    gtk_box_append(GTK_BOX(toolbar_left), view_button);
+
+    gtk_widget_set_hexpand(search_entry, TRUE);
+    gtk_box_append(GTK_BOX(toolbar_center), search_entry);
+
+    gtk_box_append(GTK_BOX(toolbar_right), add_card_button);
+    gtk_box_append(GTK_BOX(toolbar_right), refresh_button);
     // Inline add controls (shown in main DB view). These replace the old
     // modal add dialog for quick additions: entry + quantity spin + foil.
     GtkWidget *inline_entry = gtk_entry_new();
@@ -7115,19 +7473,19 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
             }
             return FALSE;
         }), inline_ctx);
-        gtk_widget_add_controller(button_box, bb_key);
+    gtk_widget_add_controller(toolbar_right, bb_key);
     }
 
     // Append inline widgets to the button box (hidden when viewing a deck)
-    gtk_box_append(GTK_BOX(button_box), inline_entry);
-    gtk_box_append(GTK_BOX(button_box), inline_spin);
-    gtk_box_append(GTK_BOX(button_box), inline_foil);
+    gtk_box_append(GTK_BOX(toolbar_right), inline_entry);
+    gtk_box_append(GTK_BOX(toolbar_right), inline_spin);
+    gtk_box_append(GTK_BOX(toolbar_right), inline_foil);
 
     state->inline_add_entry = inline_entry;
     state->inline_add_spin = inline_spin;
     state->inline_add_foil = inline_foil;
-    if (deck_delete_button) gtk_box_append(GTK_BOX(button_box), deck_delete_button);
-    if (db_button) gtk_box_append(GTK_BOX(button_box), db_button);
+    if (deck_delete_button) gtk_box_append(GTK_BOX(toolbar_right), deck_delete_button);
+    if (db_button) gtk_box_append(GTK_BOX(toolbar_right), db_button);
 
     // Tabella carte (GtkColumnView)
     state->card_store = g_list_store_new(card_row_get_type());
@@ -7564,6 +7922,63 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     gtk_column_view_column_set_resizable(qty_col, FALSE);
     gtk_column_view_append_column(column_view, qty_col);
     state->qty_col = qty_col;
+
+    // Colonna Prezzo (USD)
+    GtkListItemFactory *price_factory = gtk_signal_list_item_factory_new();
+    g_signal_connect(price_factory, "setup", G_CALLBACK(+[](GtkListItemFactory *, GtkListItem *item, gpointer) {
+        GtkWidget *label = gtk_label_new("");
+        gtk_label_set_xalign(GTK_LABEL(label), 0.5);
+        gtk_label_set_ellipsize(GTK_LABEL(label), PANGO_ELLIPSIZE_END);
+        gtk_list_item_set_child(item, label);
+        GtkGesture *dbl = gtk_gesture_click_new();
+        gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(dbl), GDK_BUTTON_PRIMARY);
+        g_signal_connect(dbl, "pressed", G_CALLBACK(on_row_double_click), item);
+        gtk_widget_add_controller(label, GTK_EVENT_CONTROLLER(dbl));
+        GtkGesture *rclk = gtk_gesture_click_new();
+        gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(rclk), GDK_BUTTON_SECONDARY);
+        g_signal_connect(rclk, "pressed", G_CALLBACK(on_row_right_click), item);
+        gtk_widget_add_controller(label, GTK_EVENT_CONTROLLER(rclk));
+    }), NULL);
+    g_signal_connect(price_factory, "bind", G_CALLBACK(+[](GtkListItemFactory *, GtkListItem *item, gpointer) {
+        CardRow *row = (CardRow*)gtk_list_item_get_item(item);
+        GtkWidget *label = gtk_list_item_get_child(item);
+        if (!row) {
+            gtk_label_set_text(GTK_LABEL(label), "");
+            gtk_list_item_set_selectable(item, FALSE);
+            return;
+        }
+        if (row->id == ROW_ID_SEPARATOR_TITLE) {
+            gtk_label_set_text(GTK_LABEL(label), "");
+            gtk_list_item_set_selectable(item, FALSE);
+            return;
+        }
+        if (row->id == ROW_ID_HEADER) {
+            std::string hdr = translate("Prezzo");
+            std::string markup = "<span weight='bold'>" + hdr + "</span>";
+            gtk_label_set_markup(GTK_LABEL(label), markup.c_str());
+            gtk_label_set_xalign(GTK_LABEL(label), 0.5);
+            gtk_list_item_set_selectable(item, FALSE);
+            return;
+        }
+        std::string price_chip = format_price_display(row->price_usd);
+        if (row->foil) gtk_widget_add_css_class(label, "foil"); else gtk_widget_remove_css_class(label, "foil");
+        if (!price_chip.empty()) {
+            gtk_label_set_text(GTK_LABEL(label), price_chip.c_str());
+            gtk_widget_set_visible(label, TRUE);
+        } else {
+            gtk_label_set_text(GTK_LABEL(label), "-");
+            gtk_widget_set_visible(label, TRUE);
+        }
+        GtkGesture *gesture = gtk_gesture_click_new();
+        gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(gesture), GDK_BUTTON_SECONDARY);
+        g_signal_connect(gesture, "pressed", G_CALLBACK(on_row_right_click), item);
+        gtk_widget_add_controller(label, GTK_EVENT_CONTROLLER(gesture));
+    }), NULL);
+    GtkColumnViewColumn *price_col = gtk_column_view_column_new("Prezzo", price_factory);
+    gtk_column_view_column_set_fixed_width(price_col, 90);
+    gtk_column_view_column_set_resizable(price_col, FALSE);
+    gtk_column_view_append_column(column_view, price_col);
+    state->price_col = price_col;
     // Menu per ordinamento
     GMenu *name_menu = g_menu_new();
     g_menu_append(name_menu, "Ordina Crescente", "app.sort.name.asc");
@@ -7606,6 +8021,12 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     g_menu_append(qty_menu, "Ordina Decrescente", "app.sort.qty.desc");
     gtk_column_view_column_set_header_menu(qty_col, G_MENU_MODEL(qty_menu));
     g_object_unref(qty_menu);
+
+    GMenu *price_menu = g_menu_new();
+    g_menu_append(price_menu, "Ordina Crescente", "app.sort.price.asc");
+    g_menu_append(price_menu, "Ordina Decrescente", "app.sort.price.desc");
+    gtk_column_view_column_set_header_menu(price_col, G_MENU_MODEL(price_menu));
+    g_object_unref(price_menu);
     // gtk_column_view_column_set_sorter(qty_col, GTK_SORTER(gtk_numeric_sorter_new(gtk_property_expression_new(G_TYPE_INT, card_row_get_type(), "quantity"))));
 
     state->selection = GTK_SELECTION_MODEL(gtk_column_view_get_model(column_view));
@@ -7619,8 +8040,7 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     // Header bar per un look più moderno
     GtkWidget *header_bar = gtk_header_bar_new();
     gtk_widget_add_css_class(header_bar, "topbar");
-    gtk_widget_set_hexpand(button_box, TRUE);
-    gtk_header_bar_set_title_widget(GTK_HEADER_BAR(header_bar), button_box);
+    gtk_header_bar_set_title_widget(GTK_HEADER_BAR(header_bar), toolbar);
     gtk_header_bar_pack_end(GTK_HEADER_BAR(header_bar), close_button);
     gtk_window_set_titlebar(GTK_WINDOW(window), header_bar);
 
@@ -7985,6 +8405,22 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         sort_card_list(state, "quantity", false);
     }), window);
     g_action_map_add_action(G_ACTION_MAP(app), G_ACTION(sort_qty_desc));
+
+    GSimpleAction *sort_price_asc = g_simple_action_new("sort.price.asc", NULL);
+    g_signal_connect(sort_price_asc, "activate", G_CALLBACK(+[](GSimpleAction *, GVariant *, gpointer user_data) {
+        GtkWindow *window = GTK_WINDOW(user_data);
+        AppState* state = (AppState*)g_object_get_data(G_OBJECT(window), "app_state");
+        sort_card_list(state, "price_usd", true);
+    }), window);
+    g_action_map_add_action(G_ACTION_MAP(app), G_ACTION(sort_price_asc));
+
+    GSimpleAction *sort_price_desc = g_simple_action_new("sort.price.desc", NULL);
+    g_signal_connect(sort_price_desc, "activate", G_CALLBACK(+[](GSimpleAction *, GVariant *, gpointer user_data) {
+        GtkWindow *window = GTK_WINDOW(user_data);
+        AppState* state = (AppState*)g_object_get_data(G_OBJECT(window), "app_state");
+        sort_card_list(state, "price_usd", false);
+    }), window);
+    g_action_map_add_action(G_ACTION_MAP(app), G_ACTION(sort_price_desc));
     // Azione per aggiungere carta
     GSimpleAction *add_card_action = g_simple_action_new("add_card", NULL);
     g_signal_connect(add_card_action, "activate", G_CALLBACK(on_add_card_action), window);
