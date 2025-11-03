@@ -14,6 +14,7 @@ struct ScryfallCard {
     std::string colors;
     std::string oracle_text;
     std::string set_name;
+    std::string set_code;
     std::string mana_cost;
     std::string rarity;
     std::string image_url;

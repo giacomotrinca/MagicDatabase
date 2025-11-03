@@ -265,11 +265,30 @@ Database::Database(const std::string& db_path) : db(nullptr) {
                     std::cerr << "Errore creazione tabella deck_snapshots: " << (errx ? errx : (char*)"unknown") << std::endl;
                     if (errx) sqlite3_free(errx);
                 }
-                const char* create_snapshot_rows = "CREATE TABLE IF NOT EXISTS deck_snapshot_rows (id INTEGER PRIMARY KEY, snapshot_id INTEGER, original_card_id INTEGER, english_name TEXT, localized_name TEXT, type TEXT, colors TEXT, set_code TEXT, mana_cost TEXT, rarity TEXT, quantity INTEGER, foil INTEGER, sideboard INTEGER)";
+                const char* create_snapshot_rows = "CREATE TABLE IF NOT EXISTS deck_snapshot_rows (id INTEGER PRIMARY KEY, snapshot_id INTEGER, original_card_id INTEGER, english_name TEXT, localized_name TEXT, type TEXT, colors TEXT, set_code TEXT, mana_cost TEXT, rarity TEXT, quantity INTEGER, foil INTEGER, sideboard INTEGER, oracle_text TEXT)";
                 errx = nullptr;
                 if (sqlite3_exec(db, create_snapshot_rows, nullptr, nullptr, &errx) != SQLITE_OK) {
                     std::cerr << "Errore creazione tabella deck_snapshot_rows: " << (errx ? errx : (char*)"unknown") << std::endl;
                     if (errx) sqlite3_free(errx);
+                }
+                bool has_snapshot_oracle = false;
+                sqlite3_stmt* snap_pi = nullptr;
+                if (sqlite3_prepare_v2(db, "PRAGMA table_info(deck_snapshot_rows)", -1, &snap_pi, nullptr) == SQLITE_OK) {
+                    while (sqlite3_step(snap_pi) == SQLITE_ROW) {
+                        const unsigned char* colname = sqlite3_column_text(snap_pi, 1);
+                        if (colname && strcmp((const char*)colname, "oracle_text") == 0) {
+                            has_snapshot_oracle = true;
+                            break;
+                        }
+                    }
+                    sqlite3_finalize(snap_pi);
+                }
+                if (!has_snapshot_oracle) {
+                    char* serr = nullptr;
+                    if (sqlite3_exec(db, "ALTER TABLE deck_snapshot_rows ADD COLUMN oracle_text TEXT", nullptr, nullptr, &serr) != SQLITE_OK) {
+                        std::cerr << "Errore alter table aggiunta oracle_text su deck_snapshot_rows: " << (serr ? serr : (char*)"unknown") << std::endl;
+                        if (serr) sqlite3_free(serr);
+                    }
                 }
                 // Tags and notes
                 const char* create_card_tags = "CREATE TABLE IF NOT EXISTS card_tags (id INTEGER PRIMARY KEY, card_id INTEGER, tag TEXT)";
@@ -881,14 +900,14 @@ bool Database::create_snapshot(int deck_id, const std::string& name, int& out_sn
     if (rc != SQLITE_DONE) { sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr); return false; }
     int snap_id = (int)sqlite3_last_insert_rowid(db);
     // Copy current deck rows into deck_snapshot_rows
-    const char* sel = "SELECT id, english_name, localized_name, type, colors, set_code, mana_cost, rarity, quantity, foil, sideboard FROM cards WHERE deck_id = ?";
+    const char* sel = "SELECT id, english_name, localized_name, type, colors, set_code, mana_cost, rarity, quantity, foil, sideboard, oracle_text FROM cards WHERE deck_id = ?";
     sqlite3_stmt* psel = nullptr;
     if (sqlite3_prepare_v2(db, sel, -1, &psel, nullptr) != SQLITE_OK) {
         sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
         return false;
     }
     sqlite3_bind_int(psel, 1, deck_id);
-    const char* ins_row = "INSERT INTO deck_snapshot_rows (snapshot_id, original_card_id, english_name, localized_name, type, colors, set_code, mana_cost, rarity, quantity, foil, sideboard) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+    const char* ins_row = "INSERT INTO deck_snapshot_rows (snapshot_id, original_card_id, english_name, localized_name, type, colors, set_code, mana_cost, rarity, quantity, foil, sideboard, oracle_text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
     sqlite3_stmt* pins = nullptr;
     if (sqlite3_prepare_v2(db, ins_row, -1, &pins, nullptr) != SQLITE_OK) {
         sqlite3_finalize(psel);
@@ -906,7 +925,8 @@ bool Database::create_snapshot(int deck_id, const std::string& name, int& out_sn
         const unsigned char* rar = sqlite3_column_text(psel, 7);
         int qty = sqlite3_column_int(psel, 8);
         int foil = sqlite3_column_int(psel, 9);
-        int side = sqlite3_column_int(psel, 10);
+    int side = sqlite3_column_int(psel, 10);
+    const unsigned char* oracle = sqlite3_column_text(psel, 11);
     sqlite3_bind_int(pins, 1, snap_id);
     sqlite3_bind_int(pins, 2, cid);
     const char* en_s = en ? reinterpret_cast<const char*>(en) : "";
@@ -925,7 +945,9 @@ bool Database::create_snapshot(int deck_id, const std::string& name, int& out_sn
     sqlite3_bind_text(pins, 9, rar_s, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(pins, 10, qty);
         sqlite3_bind_int(pins, 11, foil);
-        sqlite3_bind_int(pins, 12, side);
+    sqlite3_bind_int(pins, 12, side);
+    const char* oracle_s = oracle ? reinterpret_cast<const char*>(oracle) : "";
+    sqlite3_bind_text(pins, 13, oracle_s, -1, SQLITE_TRANSIENT);
         rc = sqlite3_step(pins);
         sqlite3_reset(pins);
         if (rc != SQLITE_DONE) {
@@ -961,7 +983,7 @@ bool Database::list_snapshots(int deck_id, const std::function<void(const std::m
 }
 
 bool Database::get_snapshot_rows(int snapshot_id, const std::function<void(const std::map<std::string,std::string>&)>& callback) {
-    const char* sql = "SELECT id, original_card_id, english_name, localized_name, type, colors, set_code, mana_cost, rarity, quantity, foil, sideboard FROM deck_snapshot_rows WHERE snapshot_id = ?";
+    const char* sql = "SELECT id, original_card_id, english_name, localized_name, type, colors, set_code, mana_cost, rarity, quantity, foil, sideboard, oracle_text FROM deck_snapshot_rows WHERE snapshot_id = ?";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) return false;
     sqlite3_bind_int(stmt, 1, snapshot_id);
@@ -974,9 +996,11 @@ bool Database::get_snapshot_rows(int snapshot_id, const std::function<void(const
             const unsigned char* txt = sqlite3_column_text(stmt, i+2);
             row[cols[i]] = txt ? (const char*)txt : "";
         }
-        row["quantity"] = std::to_string(sqlite3_column_int(stmt, 9));
-        row["foil"] = std::to_string(sqlite3_column_int(stmt, 10));
-        row["sideboard"] = std::to_string(sqlite3_column_int(stmt, 11));
+    row["quantity"] = std::to_string(sqlite3_column_int(stmt, 9));
+    row["foil"] = std::to_string(sqlite3_column_int(stmt, 10));
+    row["sideboard"] = std::to_string(sqlite3_column_int(stmt, 11));
+    const unsigned char* oracle = sqlite3_column_text(stmt, 12);
+    row["oracle_text"] = oracle ? (const char*)oracle : "";
         callback(row);
     }
     sqlite3_finalize(stmt);
@@ -1008,7 +1032,7 @@ bool Database::restore_snapshot(int snapshot_id) {
     sqlite3_stmt* pins = nullptr;
     if (sqlite3_prepare_v2(db, ins, -1, &pins, nullptr) != SQLITE_OK) { sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr); return false; }
     // iterate snapshot rows
-    const char* sel = "SELECT english_name, localized_name, type, colors, set_code, mana_cost, rarity, quantity, foil, sideboard FROM deck_snapshot_rows WHERE snapshot_id = ?";
+    const char* sel = "SELECT english_name, localized_name, type, colors, set_code, mana_cost, rarity, quantity, foil, sideboard, oracle_text FROM deck_snapshot_rows WHERE snapshot_id = ?";
     sqlite3_stmt* ssel = nullptr;
     if (sqlite3_prepare_v2(db, sel, -1, &ssel, nullptr) != SQLITE_OK) { sqlite3_finalize(pins); sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr); return false; }
     sqlite3_bind_int(ssel, 1, snapshot_id);
@@ -1022,7 +1046,8 @@ bool Database::restore_snapshot(int snapshot_id) {
         const unsigned char* rar = sqlite3_column_text(ssel, 6);
         int qty = sqlite3_column_int(ssel, 7);
         int foil = sqlite3_column_int(ssel, 8);
-        int side = sqlite3_column_int(ssel, 9);
+    int side = sqlite3_column_int(ssel, 9);
+    const unsigned char* oracle = sqlite3_column_text(ssel, 10);
     const char* en_s = en ? reinterpret_cast<const char*>(en) : "";
     const char* ln_s = ln ? reinterpret_cast<const char*>(ln) : "";
     const char* ty_s = ty ? reinterpret_cast<const char*>(ty) : "";
@@ -1058,7 +1083,8 @@ bool Database::restore_snapshot(int snapshot_id) {
         sqlite3_bind_text(pins, 14, "", -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(pins, 15, foil);
     sqlite3_bind_int(pins, 16, side);
-    sqlite3_bind_text(pins, 17, "", -1, SQLITE_TRANSIENT);
+    const char* oracle_s = oracle ? reinterpret_cast<const char*>(oracle) : "";
+    sqlite3_bind_text(pins, 17, oracle_s, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(pins, 18, deck_id);
         int rc = sqlite3_step(pins);
         sqlite3_reset(pins);

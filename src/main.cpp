@@ -24,7 +24,9 @@
 #include <cstdio>
 #include <cmath>
 #include <algorithm>
+#include <atomic>
 
+#include <sstream>
 // Forward declarations to allow scheduling helpers to be referenced before their definitions.
 struct AppState;
 struct ManaStatsExportCtx;
@@ -32,6 +34,15 @@ static void schedule_focus_retries(GtkWidget* entry, AppState* state);
 static void schedule_focus_retries_custom(GtkWidget* entry, int tries, int interval_ms);
 // Forward-declare thumbnail prefetcher (defined later) so callers earlier in the file can use it
 static void prefetch_thumbnails_async(const std::vector<std::map<std::string,std::string>>& rows);
+    static void on_refresh_clicked(GtkButton* button, gpointer user_data);
+    struct RefreshDialogContext;
+    struct RefreshProgressPayload;
+    struct RefreshFinalPayload;
+    static gboolean refresh_dialog_progress_cb(gpointer user_data);
+    static gboolean refresh_dialog_finish_cb(gpointer user_data);
+    static void refresh_dialog_cancel(GtkButton* button, gpointer user_data);
+    static void start_refresh_cards_async(GtkWindow* window, AppState* state);
+    static std::vector<std::map<std::string, std::string>> load_cards_from_db(Database* db, const std::string& filter, int deck_filter, bool only_no_deck);
 
 // Struct per dialog widgets
 typedef struct {
@@ -723,6 +734,7 @@ struct AppState {
     GtkWidget* add_card_button;
     GtkWidget* file_button;
     GtkWidget* view_button;
+    GtkWidget* refresh_button;
     int selected_deck_id;
     GtkWidget* deck_button;
     GtkWidget* deck_label;
@@ -816,6 +828,36 @@ struct ManaStatsExportCtx {
     std::map<std::string,int> color_source_targets;
     std::map<std::string,int> pip_counts;
     double total_pips = 0.0;
+};
+
+struct RefreshDialogContext {
+    AppState* state = nullptr;
+    GtkWidget* dialog = nullptr;
+    GtkWidget* spinner = nullptr;
+    GtkProgressBar* progress = nullptr;
+    GtkLabel* summary_label = nullptr;
+    GtkLabel* detail_label = nullptr;
+    GtkWidget* cancel_button = nullptr;
+    GtkWidget* refresh_button = nullptr;
+    std::atomic<bool> cancel_requested{false};
+    std::vector<std::map<std::string,std::string>> cards;
+    int updated_count = 0;
+    int processed_count = 0;
+};
+
+struct RefreshProgressPayload {
+    RefreshDialogContext* ctx;
+    double fraction;
+    std::string summary;
+    std::string detail;
+};
+
+struct RefreshFinalPayload {
+    RefreshDialogContext* ctx;
+    bool cancelled;
+    int updated;
+    int processed;
+    int total;
 };
 
 static void destroy_mana_stats_context(ManaStatsExportCtx* ctx) {
@@ -967,13 +1009,298 @@ static GtkWidget* create_styled_dialog(GtkWindow* parent, int width = -1, int he
     return dialog;
 }
 
+static gboolean refresh_dialog_progress_cb(gpointer user_data) {
+    auto payload = static_cast<RefreshProgressPayload*>(user_data);
+    if (!payload || !payload->ctx) return G_SOURCE_REMOVE;
+    auto ctx = payload->ctx;
+    if (ctx->progress && GTK_IS_PROGRESS_BAR(ctx->progress)) {
+        double fraction = std::clamp(payload->fraction, 0.0, 1.0);
+        gtk_progress_bar_set_fraction(ctx->progress, fraction);
+        int percent = static_cast<int>(std::round(fraction * 100.0));
+        if (percent < 0) percent = 0;
+        if (percent > 100) percent = 100;
+        std::string pct = std::to_string(percent) + "%";
+        gtk_progress_bar_set_text(ctx->progress, pct.c_str());
+    }
+    if (ctx->summary_label && GTK_IS_LABEL(ctx->summary_label)) {
+        gtk_label_set_text(ctx->summary_label, payload->summary.c_str());
+    }
+    if (ctx->detail_label && GTK_IS_LABEL(ctx->detail_label)) {
+        gtk_label_set_text(ctx->detail_label, payload->detail.c_str());
+    }
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean refresh_dialog_finish_cb(gpointer user_data) {
+    auto payload = static_cast<RefreshFinalPayload*>(user_data);
+    if (!payload || !payload->ctx) return G_SOURCE_REMOVE;
+    auto ctx = payload->ctx;
+    double fraction = payload->total > 0 ? static_cast<double>(payload->processed) / payload->total : 1.0;
+    fraction = std::clamp(fraction, 0.0, 1.0);
+    if (!payload->cancelled) fraction = 1.0;
+    if (ctx->progress && GTK_IS_PROGRESS_BAR(ctx->progress)) {
+        gtk_progress_bar_set_fraction(ctx->progress, fraction);
+        int percent = static_cast<int>(std::round(fraction * 100.0));
+        if (percent < 0) percent = 0;
+        if (percent > 100) percent = 100;
+        std::string pct = std::to_string(percent) + "%";
+        gtk_progress_bar_set_text(ctx->progress, pct.c_str());
+    }
+    if (ctx->spinner && GTK_IS_SPINNER(ctx->spinner)) {
+        gtk_spinner_stop(GTK_SPINNER(ctx->spinner));
+    }
+    if (ctx->cancel_button && GTK_IS_WIDGET(ctx->cancel_button)) {
+        gtk_widget_set_sensitive(ctx->cancel_button, FALSE);
+    }
+    if (ctx->summary_label && GTK_IS_LABEL(ctx->summary_label)) {
+        std::ostringstream summary;
+        if (payload->cancelled) {
+            summary << "Refresh annullato";
+        } else {
+            summary << "Aggiornamento completato";
+        }
+        summary << " • " << payload->processed << "/" << payload->total;
+        gtk_label_set_text(ctx->summary_label, summary.str().c_str());
+    }
+    if (ctx->detail_label && GTK_IS_LABEL(ctx->detail_label)) {
+        std::ostringstream detail;
+        if (payload->cancelled) {
+            detail << "Aggiornate " << payload->updated << " carte prima dell'annullamento.";
+        } else {
+            detail << "Aggiornate " << payload->updated << " carte su " << payload->total << ".";
+        }
+        gtk_label_set_text(ctx->detail_label, detail.str().c_str());
+    }
+    if (ctx->refresh_button && GTK_IS_WIDGET(ctx->refresh_button)) {
+        gtk_widget_set_sensitive(ctx->refresh_button, TRUE);
+    }
+    if (ctx->state) {
+        refresh_card_list(ctx->state);
+    }
+    g_timeout_add(420, +[](gpointer data) -> gboolean {
+        auto ctx = static_cast<RefreshDialogContext*>(data);
+        if (ctx) {
+            if (ctx->dialog && GTK_IS_WINDOW(ctx->dialog)) {
+                gtk_window_destroy(GTK_WINDOW(ctx->dialog));
+            }
+            ctx->dialog = nullptr;
+            delete ctx;
+        }
+        return G_SOURCE_REMOVE;
+    }, ctx);
+    payload->ctx = nullptr;
+    return G_SOURCE_REMOVE;
+}
+
+static void refresh_dialog_cancel(GtkButton*, gpointer user_data) {
+    auto ctx = static_cast<RefreshDialogContext*>(user_data);
+    if (!ctx) return;
+    ctx->cancel_requested.store(true);
+    if (ctx->cancel_button && GTK_IS_WIDGET(ctx->cancel_button)) {
+        gtk_widget_set_sensitive(ctx->cancel_button, FALSE);
+    }
+    if (ctx->detail_label && GTK_IS_LABEL(ctx->detail_label)) {
+        gtk_label_set_text(ctx->detail_label, "Annullamento in corso...");
+    }
+}
+
+static void start_refresh_cards_async(GtkWindow* window, AppState* state) {
+    if (!window || !state || !state->db) return;
+    auto cards = load_cards_from_db(state->db, std::string(""), state->selected_deck_id, state->filter_no_deck);
+    if (cards.empty()) {
+        GtkAlertDialog* alert = gtk_alert_dialog_new("%s", "Nessuna carta da aggiornare.");
+        gtk_alert_dialog_show(alert, window);
+        g_object_unref(alert);
+        return;
+    }
+
+    auto* ctx = new RefreshDialogContext();
+    ctx->state = state;
+    ctx->cards = std::move(cards);
+    ctx->refresh_button = state->refresh_button;
+
+    GtkWidget* dialog = create_styled_dialog(window, 440, 220);
+    gtk_window_set_title(GTK_WINDOW(dialog), "Aggiornamento carte");
+    gtk_window_set_resizable(GTK_WINDOW(dialog), FALSE);
+    gtk_window_set_decorated(GTK_WINDOW(dialog), FALSE);
+
+    GtkWidget* content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14);
+    gtk_widget_add_css_class(content, "refresh-dialog-content");
+    gtk_window_set_child(GTK_WINDOW(dialog), content);
+
+    GtkWidget* header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    gtk_box_append(GTK_BOX(content), header);
+
+    GtkWidget* spinner = gtk_spinner_new();
+    gtk_widget_add_css_class(spinner, "accent-spinner");
+    gtk_spinner_start(GTK_SPINNER(spinner));
+    gtk_box_append(GTK_BOX(header), spinner);
+
+    GtkWidget* title = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(title), "<span weight=\"bold\" size=\"large\">Aggiornamento carte</span>");
+    gtk_label_set_xalign(GTK_LABEL(title), 0.0);
+    gtk_widget_add_css_class(title, "refresh-dialog-title");
+    gtk_box_append(GTK_BOX(header), title);
+
+    GtkWidget* summary = gtk_label_new("");
+    gtk_label_set_xalign(GTK_LABEL(summary), 0.0);
+    gtk_widget_add_css_class(summary, "refresh-dialog-subtitle");
+    gtk_box_append(GTK_BOX(content), summary);
+
+    GtkWidget* progress = gtk_progress_bar_new();
+    gtk_widget_add_css_class(progress, "accent-progress");
+    gtk_widget_set_hexpand(progress, TRUE);
+    gtk_progress_bar_set_show_text(GTK_PROGRESS_BAR(progress), TRUE);
+    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(progress), 0.0);
+    gtk_progress_bar_set_text(GTK_PROGRESS_BAR(progress), "0%");
+    gtk_box_append(GTK_BOX(content), progress);
+
+    GtkWidget* detail = gtk_label_new("");
+    gtk_label_set_xalign(GTK_LABEL(detail), 0.0);
+    gtk_label_set_wrap(GTK_LABEL(detail), TRUE);
+    gtk_widget_add_css_class(detail, "refresh-dialog-detail");
+    gtk_box_append(GTK_BOX(content), detail);
+
+    GtkWidget* buttons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_halign(buttons, GTK_ALIGN_END);
+    GtkWidget* cancel_btn = gtk_button_new_with_label("Annulla");
+    gtk_widget_add_css_class(cancel_btn, "ghost-button");
+    gtk_box_append(GTK_BOX(buttons), cancel_btn);
+    gtk_box_append(GTK_BOX(content), buttons);
+
+    ctx->dialog = dialog;
+    ctx->spinner = spinner;
+    ctx->progress = GTK_PROGRESS_BAR(progress);
+    ctx->summary_label = GTK_LABEL(summary);
+    ctx->detail_label = GTK_LABEL(detail);
+    ctx->cancel_button = cancel_btn;
+
+    std::ostringstream initial_summary;
+    initial_summary << "0 / " << ctx->cards.size() << " carte elaborate";
+    gtk_label_set_text(GTK_LABEL(summary), initial_summary.str().c_str());
+    gtk_label_set_text(GTK_LABEL(detail), "Preparazione in corso...");
+
+    g_signal_connect(cancel_btn, "clicked", G_CALLBACK(refresh_dialog_cancel), ctx);
+
+    if (state->refresh_button && GTK_IS_WIDGET(state->refresh_button)) {
+        gtk_widget_set_sensitive(state->refresh_button, FALSE);
+    }
+
+    gtk_window_present(GTK_WINDOW(dialog));
+
+    std::thread([ctx]() {
+        const int total = static_cast<int>(ctx->cards.size());
+        int processed = 0;
+        for (const auto& row : ctx->cards) {
+            if (ctx->cancel_requested.load()) break;
+
+            std::string search_name;
+            auto it_en = row.find("english_name");
+            if (it_en != row.end()) search_name = it_en->second;
+            if (search_name.empty()) {
+                auto it_name = row.find("name");
+                if (it_name != row.end()) search_name = it_name->second;
+            }
+            if (search_name.empty()) {
+                processed++;
+                ctx->processed_count = processed;
+                auto* payload = new RefreshProgressPayload{ctx, total > 0 ? static_cast<double>(processed) / total : 1.0, std::to_string(processed) + " / " + std::to_string(total) + " carte elaborate", "Nessun nome disponibile"};
+                g_idle_add_full(G_PRIORITY_DEFAULT, refresh_dialog_progress_cb, payload, [](gpointer data){ delete static_cast<RefreshProgressPayload*>(data); });
+                continue;
+            }
+
+            auto results = search_cards_from_scryfall(search_name);
+            const std::string row_set = row.count("set_code") ? row.at("set_code") : std::string();
+            ScryfallCard* found = nullptr;
+            for (auto& card : results) {
+                if (!row_set.empty()) {
+                    std::string card_code = card.set_code;
+                    if (!card_code.empty()) {
+                        std::string row_code_upper = row_set;
+                        std::string card_code_upper = card_code;
+                        std::transform(row_code_upper.begin(), row_code_upper.end(), row_code_upper.begin(), ::toupper);
+                        std::transform(card_code_upper.begin(), card_code_upper.end(), card_code_upper.begin(), ::toupper);
+                        if (row_code_upper == card_code_upper) {
+                            found = &card;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!found && !results.empty()) {
+                found = &results.front();
+            }
+
+            bool success = false;
+            if (found && ctx->state && ctx->state->db) {
+                int card_id = 0;
+                auto it_id = row.find("id");
+                if (it_id != row.end()) {
+                    try { card_id = std::stoi(it_id->second); } catch(...) { card_id = 0; }
+                }
+                if (card_id > 0) {
+                    success = ctx->state->db->update_card_info(card_id,
+                        found->english_name,
+                        found->localized_name,
+                        found->type,
+                        found->localized_type,
+                        found->colors,
+                        found->mana_cost,
+                        found->rarity,
+                        found->image_url,
+                        found->price_usd,
+                        found->oracle_text);
+                }
+            }
+            if (success) ctx->updated_count++;
+
+            processed++;
+            ctx->processed_count = processed;
+
+            double fraction = total > 0 ? static_cast<double>(processed) / total : 1.0;
+            std::ostringstream summary;
+            summary << processed << " / " << total << " carte elaborate";
+            std::string detail;
+            if (ctx->cancel_requested.load()) {
+                detail = "Annullamento in corso...";
+            } else if (found) {
+                const std::string& display_name = !found->localized_name.empty() ? found->localized_name : found->english_name;
+                detail = std::string("Ultima carta: ") + display_name;
+                if (!success) detail += " (errore)";
+            } else {
+                detail = std::string("Nessuna corrispondenza per: ") + search_name;
+            }
+
+            auto* payload = new RefreshProgressPayload{ctx, fraction, summary.str(), detail};
+            g_idle_add_full(G_PRIORITY_DEFAULT, refresh_dialog_progress_cb, payload, [](gpointer data){ delete static_cast<RefreshProgressPayload*>(data); });
+
+            if (ctx->cancel_requested.load()) {
+                break;
+            }
+        }
+
+        int total_cards = static_cast<int>(ctx->cards.size());
+        ctx->cards.clear();
+        auto* final_payload = new RefreshFinalPayload{ctx, ctx->cancel_requested.load(), ctx->updated_count, ctx->processed_count, total_cards};
+        g_idle_add_full(G_PRIORITY_DEFAULT, refresh_dialog_finish_cb, final_payload, [](gpointer data){ delete static_cast<RefreshFinalPayload*>(data); });
+    }).detach();
+}
+
+static void on_refresh_clicked(GtkButton* button, gpointer user_data) {
+    GtkWindow* window = GTK_WINDOW(user_data);
+    if (!window) return;
+    AppState* state = (AppState*)g_object_get_data(G_OBJECT(window), "app_state");
+    if (!state || !state->db) return;
+    // Store the button pointer for re-enabling if not already registered
+    if (!state->refresh_button) {
+        state->refresh_button = GTK_WIDGET(button);
+    }
+    start_refresh_cards_async(window, state);
+}
+
 // Export helper: queries cards (optionally filtered by deck) and writes a TXT file.
 // If 'deck' is true, deck_id must be provided and file is named <deckname>_data.txt
 // Otherwise file is data/tot_database.txt
-// Forward-declare load_cards_from_db with the new only_no_deck parameter so
-// this export helper (which appears earlier in the file) can call it.
-static std::vector<std::map<std::string, std::string>> load_cards_from_db(Database* db, const std::string& filter, int deck_filter, bool only_no_deck);
-
 // format: "bilingual" (default formatted TXT + TSVs), "tsv_en", "tsv_it", "csv_en", "csv_it"
 static bool export_cards_to_txt(AppState* state, bool deck, int deck_id, const std::string& lang, const std::string& format = "bilingual") {
     if (!state || !state->db) return false;
@@ -4218,7 +4545,7 @@ static void on_add_card_ok_clicked(GtkButton *button, gpointer user_data) {
                 g_object_get(G_OBJECT(ctx->foil_checkbox), "active", &f, NULL);
                 foil = f ? 1 : 0;
             }
-            bool success = state->db->insert_card(card.english_name, card.localized_name, card.type, card.localized_type, card.colors, card.set_name, card.mana_cost, card.rarity, quantity, card.image_url, card.price_usd, card.oracle_text, -1, foil);
+            bool success = state->db->insert_card(card.english_name, card.localized_name, card.type, card.localized_type, card.colors, card.set_code, card.mana_cost, card.rarity, quantity, card.image_url, card.price_usd, card.oracle_text, -1, foil);
             std::cout << "Inserted card: " << card.english_name << " in set " << card.set_name << " qty " << quantity << " success: " << success << std::endl;
             if (success) {
                 refresh_card_list(state);
@@ -4382,7 +4709,7 @@ static void on_add_card_ok_clicked(GtkButton *button, gpointer user_data) {
                     g_object_get(G_OBJECT(sctx->original_ctx->foil_checkbox), "active", &f, NULL);
                     foil = f ? 1 : 0;
                 }
-                bool success = sctx->state->db->insert_card(card.english_name, card.localized_name, card.type, card.localized_type, card.colors, card.set_name, card.mana_cost, card.rarity, sctx->quantity, card.image_url, card.price_usd, card.oracle_text, -1, foil);
+                bool success = sctx->state->db->insert_card(card.english_name, card.localized_name, card.type, card.localized_type, card.colors, card.set_code, card.mana_cost, card.rarity, sctx->quantity, card.image_url, card.price_usd, card.oracle_text, -1, foil);
                 std::cout << "Inserted card: " << card.english_name << " in set " << card.set_name << " qty " << sctx->quantity << " success: " << success << std::endl;
                 if (success) {
                     refresh_card_list(sctx->state);
@@ -6579,6 +6906,7 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     state->deck_label = NULL;
     state->deck_delete_button = NULL;
     state->db_button = NULL;
+    state->refresh_button = NULL;
     state->search_debounce_id = 0;
     state->main_window = window;
     state->main_stack = NULL;
@@ -6611,39 +6939,8 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     // Bottone per refresh delle carte
     GtkWidget *refresh_button = gtk_button_new_with_label("Refresh");
     gtk_widget_add_css_class(refresh_button, "ghost-button");
-    g_signal_connect(refresh_button, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data) {
-        GtkWindow* window = GTK_WINDOW(user_data);
-        AppState* state = (AppState*)g_object_get_data(G_OBJECT(window), "app_state");
-        if (!state || !state->db) return;
-    // Load all cards (respecting current deck filter)
-    auto cards = load_cards_from_db(state->db, std::string(""), state->selected_deck_id, state->filter_no_deck);
-        int updated = 0;
-        for (const auto& row : cards) {
-            std::string search_name = row.at("english_name");
-            if (search_name.empty()) {
-                search_name = row.at("name");  // Fallback to original name if english_name is empty
-            }
-            if (search_name.empty()) continue;
-            auto results = search_cards_from_scryfall(search_name);
-            // Find the one with matching set_code
-            ScryfallCard* found = nullptr;
-            for (auto& card : results) {
-                if (card.set_name == row.at("set_code")) {
-                    found = &card;
-                    break;
-                }
-            }
-            if (found) {
-                bool success = state->db->update_card_info(std::stoi(row.at("id")), found->english_name, found->localized_name, found->type, found->localized_type, found->colors, found->mana_cost, found->rarity, found->image_url, found->price_usd, found->oracle_text);
-                if (success) updated++;
-                std::cout << "Updated card " << search_name << " success: " << success << std::endl;
-            } else {
-                std::cout << "Card " << search_name << " not found in Scryfall" << std::endl;
-            }
-        }
-        std::cout << "Refreshed " << updated << " cards" << std::endl;
-        refresh_card_list(state);
-    }), window);
+    g_signal_connect(refresh_button, "clicked", G_CALLBACK(on_refresh_clicked), window);
+    state->refresh_button = refresh_button;
 
     // Campo di ricerca
     GtkWidget *search_entry = gtk_entry_new();

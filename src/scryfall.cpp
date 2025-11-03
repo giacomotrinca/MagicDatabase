@@ -219,6 +219,7 @@ static std::vector<ScryfallCard> perform_search(const std::string& query, bool r
             }
 
             result.set_name = card.value("set_name", "");
+            result.set_code = card.value("set", "");
             result.mana_cost = card.value("mana_cost", "");
             result.rarity = card.value("rarity", "");
 
