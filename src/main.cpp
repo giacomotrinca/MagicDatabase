@@ -22,10 +22,12 @@
 #include <chrono>
 #include <cstring>
 #include <cstdio>
+#include <cmath>
 #include <algorithm>
 
 // Forward declarations to allow scheduling helpers to be referenced before their definitions.
 struct AppState;
+struct ManaStatsExportCtx;
 static void schedule_focus_retries(GtkWidget* entry, AppState* state);
 static void schedule_focus_retries_custom(GtkWidget* entry, int tries, int interval_ms);
 // Forward-declare thumbnail prefetcher (defined later) so callers earlier in the file can use it
@@ -750,7 +752,140 @@ struct AppState {
     GtkWidget* view_all_toggle;
     // Debounce timer id for search entry changes (0 = none)
     guint search_debounce_id;
+    // Main window layout widgets
+    GtkWidget* main_window;
+    GtkWidget* main_stack;
+    GtkWidget* cards_page;
+    GtkWidget* stats_page;
+    GtkWidget* stats_container;
+    GtkWidget* stats_placeholder;
+    ManaStatsExportCtx* stats_ctx;
+    bool has_oracle_text_column;
 };
+
+static bool g_cards_table_has_oracle_text = false;
+
+static void update_cards_schema_flags(AppState* state) {
+    if (!state) return;
+    bool has_oracle = false;
+    if (state->db) {
+        state->db->query("PRAGMA table_info(cards);", [&](const std::map<std::string,std::string>& row){
+            auto it = row.find("name");
+            if (it != row.end() && it->second == "oracle_text") has_oracle = true;
+        });
+    }
+    state->has_oracle_text_column = has_oracle;
+    g_cards_table_has_oracle_text = has_oracle;
+}
+
+struct ManaStatsExportCtx {
+    GtkWidget* da = nullptr;
+    GtkWindow* parent = nullptr;
+    cairo_surface_t* surf = nullptr;
+    cairo_surface_t* surf_total = nullptr;
+    cairo_surface_t* surf_type = nullptr;
+    cairo_surface_t* surf_color = nullptr;
+    int w = 0;
+    int h = 0;
+    std::map<int,int> buckets;
+    int total = 0;
+    int cap = 0;
+    std::string deck_name;
+    std::map<int, std::vector<std::pair<std::string,int>>> bucket_details;
+    std::map<std::string,int> color_counts;
+    double avg = 0.0;
+    int median = 0;
+    int mode_bucket = 0;
+    int mode_count = 0;
+    int max_cost = 0;
+    int land_cards = 0;
+    int spells_count = 0;
+    double avg_total_cmc = 0.0;
+    double avg_non_land_cmc = 0.0;
+    double avg_creature_cmc = 0.0;
+    double avg_non_creature_cmc = 0.0;
+    int recommended_lands = 0;
+    int land_delta = 0;
+    int removal_spells = 0;
+    int board_wipes = 0;
+    int ramp_spells = 0;
+    int card_draw_spells = 0;
+    std::map<int,int> curve_targets;
+    std::map<int,int> curve_actual_summary;
+    std::map<std::string,int> color_sources;
+    std::map<std::string,int> color_source_targets;
+    std::map<std::string,int> pip_counts;
+    double total_pips = 0.0;
+};
+
+static void destroy_mana_stats_context(ManaStatsExportCtx* ctx) {
+    if (!ctx) return;
+    std::set<cairo_surface_t*> surfaces;
+    if (ctx->surf_total) surfaces.insert(ctx->surf_total);
+    if (ctx->surf_type) surfaces.insert(ctx->surf_type);
+    if (ctx->surf_color) surfaces.insert(ctx->surf_color);
+    for (auto* surface : surfaces) cairo_surface_destroy(surface);
+    delete ctx;
+}
+
+static void stats_clear(AppState* state, bool restore_placeholder) {
+    if (!state) return;
+    if (state->stats_ctx) {
+        destroy_mana_stats_context(state->stats_ctx);
+        state->stats_ctx = nullptr;
+    }
+    if (!state->stats_container) return;
+    GtkWidget* child = gtk_widget_get_first_child(state->stats_container);
+    while (child) {
+        gtk_widget_unparent(child);
+        child = gtk_widget_get_first_child(state->stats_container);
+    }
+    state->stats_placeholder = nullptr;
+    if (restore_placeholder) {
+        GtkWidget* placeholder = gtk_label_new("Seleziona \"Curva Mana\" per visualizzare le statistiche del deck.");
+        gtk_label_set_wrap(GTK_LABEL(placeholder), TRUE);
+        gtk_label_set_xalign(GTK_LABEL(placeholder), 0.0);
+        gtk_widget_set_margin_top(placeholder, 24);
+        gtk_widget_set_margin_bottom(placeholder, 24);
+        gtk_widget_set_margin_start(placeholder, 32);
+        gtk_widget_set_margin_end(placeholder, 32);
+        gtk_widget_add_css_class(placeholder, "muted");
+        gtk_box_append(GTK_BOX(state->stats_container), placeholder);
+        state->stats_placeholder = placeholder;
+    }
+}
+
+static void stats_set_surface(ManaStatsExportCtx* ctx, cairo_surface_t* surf) {
+    if (!ctx || !ctx->da) return;
+    ctx->surf = surf;
+    g_object_set_data(G_OBJECT(ctx->da), "mana_surface", surf);
+    gtk_widget_queue_draw(ctx->da);
+}
+
+static void on_stats_back_clicked(GtkButton*, gpointer user_data) {
+    AppState* state = (AppState*)user_data;
+    if (!state) return;
+    stats_clear(state, true);
+    if (state->main_stack) gtk_stack_set_visible_child_name(GTK_STACK(state->main_stack), "cards");
+}
+
+static void on_stats_surface_total(GtkButton*, gpointer user_data) {
+    ManaStatsExportCtx* ctx = (ManaStatsExportCtx*)user_data;
+    if (!ctx) return;
+    stats_set_surface(ctx, ctx->surf_total ? ctx->surf_total : ctx->surf);
+}
+
+static void on_stats_surface_type(GtkButton*, gpointer user_data) {
+    ManaStatsExportCtx* ctx = (ManaStatsExportCtx*)user_data;
+    if (!ctx || !ctx->surf_type) return;
+    stats_set_surface(ctx, ctx->surf_type);
+}
+
+static void on_stats_surface_color(GtkButton*, gpointer user_data) {
+    ManaStatsExportCtx* ctx = (ManaStatsExportCtx*)user_data;
+    if (!ctx || !ctx->surf_color) return;
+    stats_set_surface(ctx, ctx->surf_color);
+}
 
 // Schedule focus retries using the app-configured retries/interval.
 static void schedule_focus_retries(GtkWidget* entry, AppState* state) {
@@ -2100,9 +2235,13 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
     if (!state || !state->db) return;
     int deck_id = -1;
     if (parameter && g_variant_is_of_type(parameter, G_VARIANT_TYPE_INT32)) deck_id = g_variant_get_int32(parameter);
-    if (deck_id == -1) deck_id = state->selected_deck_id;
+    if (deck_id <= 0) {
+        if (state->selected_deck_id > 0) deck_id = state->selected_deck_id;
+        else deck_id = -1;
+    }
     std::map<int,int> counts;
     int total_cards = 0;
+    const int cap = 10;
     // detailed info per bucket: cost -> list of (name, qty)
     std::map<int, std::vector<std::pair<std::string,int>>> bucket_details;
     std::map<std::string,int> color_counts;
@@ -2119,22 +2258,57 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
     int count_creature_cards = 0;
     double sum_non_creature_cmc = 0.0;
     int count_non_creature_cards = 0;
-    auto accumulate_card_stats = [&](const std::string& type_val, int qty, int cost) {
+    const int INF_TURN = 99;
+    std::map<std::string,int> color_sources = {
+        {"W",0},{"U",0},{"B",0},{"R",0},{"G",0},{"C",0}
+    };
+    std::map<std::string,int> pip_counts = {
+        {"W",0},{"U",0},{"B",0},{"R",0},{"G",0},{"C",0}
+    };
+    std::map<std::string,int> pip_single_turn = {
+        {"W",INF_TURN},{"U",INF_TURN},{"B",INF_TURN},{"R",INF_TURN},{"G",INF_TURN},{"C",INF_TURN}
+    };
+    std::map<std::string,int> pip_double_turn = pip_single_turn;
+    std::map<std::string,int> pip_triple_turn = pip_single_turn;
+    std::vector<std::string> type_keys = {"Creature","Instant","Sorcery","Enchantment","Artifact","Planeswalker","Other"};
+    std::map<std::string, std::map<int,int>> series_by_type;
+    for (const auto &key : type_keys) series_by_type[key] = std::map<int,int>();
+    std::vector<std::string> color_keys = {"W","U","B","R","G","C"};
+    std::map<std::string, std::map<int,int>> series_by_color;
+    for (const auto &key : color_keys) series_by_color[key] = std::map<int,int>();
+    int removal_spells = 0;
+    int ramp_spells = 0;
+    int card_draw_spells = 0;
+    int board_wipes = 0;
+    struct CardRoleFlags {
+        bool is_land = false;
+        bool is_creature = false;
+        bool is_planeswalker = false;
+        bool is_instant = false;
+        bool is_sorcery = false;
+        bool is_enchantment = false;
+        bool is_artifact = false;
+    };
+
+    auto classify_card = [&](const std::string& type_val) {
+        CardRoleFlags info;
         std::string lower = type_val;
         lower.reserve(type_val.size());
         std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-        bool is_land = lower.find("land") != std::string::npos;
-        bool is_creature = lower.find("creature") != std::string::npos;
-        bool is_planeswalker = lower.find("planeswalker") != std::string::npos;
-        bool is_instant = lower.find("instant") != std::string::npos || lower.find("istantaneo") != std::string::npos;
-        bool is_sorcery = lower.find("sorcery") != std::string::npos || lower.find("stregoneria") != std::string::npos;
-        bool is_enchantment = lower.find("enchantment") != std::string::npos || lower.find("incantesimo") != std::string::npos;
-        bool is_artifact = lower.find("artifact") != std::string::npos || lower.find("artefatto") != std::string::npos;
-        bool assigned = false;
+        info.is_land = lower.find("land") != std::string::npos || lower.find("terra") != std::string::npos;
+        info.is_creature = lower.find("creature") != std::string::npos || lower.find("creatura") != std::string::npos;
+        info.is_planeswalker = lower.find("planeswalker") != std::string::npos;
+        info.is_instant = lower.find("instant") != std::string::npos || lower.find("istantaneo") != std::string::npos;
+        info.is_sorcery = lower.find("sorcery") != std::string::npos || lower.find("stregoneria") != std::string::npos;
+        info.is_enchantment = lower.find("enchantment") != std::string::npos || lower.find("incantesimo") != std::string::npos;
+        info.is_artifact = lower.find("artifact") != std::string::npos || lower.find("artefatto") != std::string::npos;
+        return info;
+    };
 
+    auto accumulate_card_stats = [&](const CardRoleFlags& info, int qty, int cost) {
         sum_all_cmc += cost * qty;
 
-        if (is_land) {
+        if (info.is_land) {
             land_cards += qty;
             type_summary["Land"] += qty;
             return;
@@ -2143,7 +2317,8 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
         sum_non_land_cmc += cost * qty;
         count_non_land_cards += qty;
 
-        if (is_creature) {
+        bool assigned = false;
+        if (info.is_creature) {
             creature_cards += qty;
             sum_creature_cmc += cost * qty;
             count_creature_cards += qty;
@@ -2155,23 +2330,23 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
             count_non_creature_cards += qty;
         }
 
-        if (!assigned && is_planeswalker) {
+        if (!assigned && info.is_planeswalker) {
             type_summary["Planeswalker"] += qty;
             assigned = true;
         }
-        if (!assigned && is_instant) {
+        if (!assigned && info.is_instant) {
             type_summary["Instant"] += qty;
             assigned = true;
         }
-        if (!assigned && is_sorcery) {
+        if (!assigned && info.is_sorcery) {
             type_summary["Sorcery"] += qty;
             assigned = true;
         }
-        if (!assigned && is_enchantment) {
+        if (!assigned && info.is_enchantment) {
             type_summary["Enchantment"] += qty;
             assigned = true;
         }
-        if (!assigned && is_artifact) {
+        if (!assigned && info.is_artifact) {
             type_summary["Artifact"] += qty;
             assigned = true;
         }
@@ -2204,6 +2379,179 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
             norm = std::string(1, norm[0]);
         }
         color_counts[norm] += qty;
+        return norm;
+    };
+    auto normalize_color_symbol = [](char ch) -> std::string {
+        char up = std::toupper((unsigned char)ch);
+        switch (up) {
+            case 'W': case 'U': case 'B': case 'R': case 'G': return std::string(1, up);
+            case 'C': return std::string("C");
+            case 'S': return std::string("C");
+            default: return std::string();
+        }
+    };
+    auto update_type_series = [&](const CardRoleFlags& info, int bucket, int qty) {
+        if (qty <= 0) return;
+        if (bucket < 0) bucket = 0;
+        if (info.is_land) return;
+        bool matched = false;
+        if (info.is_creature) { series_by_type["Creature"][bucket] += qty; matched = true; }
+        if (info.is_instant) { series_by_type["Instant"][bucket] += qty; matched = true; }
+        if (info.is_sorcery) { series_by_type["Sorcery"][bucket] += qty; matched = true; }
+        if (info.is_enchantment) { series_by_type["Enchantment"][bucket] += qty; matched = true; }
+        if (info.is_artifact) { series_by_type["Artifact"][bucket] += qty; matched = true; }
+        if (info.is_planeswalker) { series_by_type["Planeswalker"][bucket] += qty; matched = true; }
+        if (!matched) series_by_type["Other"][bucket] += qty;
+    };
+    auto append_color_series_from_token = [&](const std::string& token, int bucket, int qty) {
+        if (qty <= 0 || token.empty()) return false;
+        bool appended = false;
+        for (char ch : token) {
+            std::string sym = normalize_color_symbol(ch);
+            if (!sym.empty()) {
+                series_by_color[sym][bucket] += qty;
+                appended = true;
+            }
+        }
+        return appended;
+    };
+    auto to_lower_copy = [](std::string s) {
+        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c){ return std::tolower(c); });
+        return s;
+    };
+    auto to_upper_copy = [](std::string s) {
+        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c){ return std::toupper(c); });
+        return s;
+    };
+    auto contains_any = [](const std::string& haystack, const std::vector<std::string>& needles) {
+        for (const auto& needle : needles) {
+            if (!needle.empty() && haystack.find(needle) != std::string::npos) return true;
+        }
+        return false;
+    };
+    auto parse_mana_symbols = [&](const std::string& mana) {
+        std::map<std::string,int> out;
+        if (mana.empty()) return out;
+        std::string token;
+        bool inside = false;
+        bool saw_braces = false;
+        auto flush = [&](const std::string& raw) {
+            for (char ch : raw) {
+                std::string symbol = normalize_color_symbol(ch);
+                if (!symbol.empty()) out[symbol] += 1;
+            }
+        };
+        for (char ch : mana) {
+            if (ch == '{') {
+                inside = true;
+                saw_braces = true;
+                token.clear();
+            } else if (ch == '}') {
+                flush(token);
+                token.clear();
+                inside = false;
+            } else if (inside) {
+                token.push_back(ch);
+            } else if (!saw_braces) {
+                flush(std::string(1, ch));
+            }
+        }
+        if (inside && !token.empty()) flush(token);
+        return out;
+    };
+    auto note_color_source = [&](const std::string& color, int qty) {
+        if (qty <= 0 || color.empty()) return;
+        std::string normalized = color.size() == 1 ? normalize_color_symbol(color[0]) : normalize_color_symbol(color.front());
+        if (normalized.empty()) return;
+        if (!color_sources.count(normalized)) {
+            color_sources[normalized] = 0;
+            pip_counts[normalized] = 0;
+            pip_single_turn[normalized] = INF_TURN;
+            pip_double_turn[normalized] = INF_TURN;
+            pip_triple_turn[normalized] = INF_TURN;
+        }
+        color_sources[normalized] += qty;
+    };
+    auto register_land_sources_from_row = [&](const std::map<std::string,std::string>& row, const CardRoleFlags& info, int qty, const std::string& type_line, const std::string& oracle_text) {
+        if (!info.is_land || qty <= 0) return;
+        std::set<std::string> produced;
+        std::string colors_raw = row.count("colors") ? row.at("colors") : "";
+        if (!colors_raw.empty()) {
+            try {
+                auto parsed = nlohmann::json::parse(colors_raw);
+                if (parsed.is_array()) {
+                    for (auto &el : parsed) {
+                        if (el.is_string()) {
+                            std::string token = el.get<std::string>();
+                            for (char ch : token) {
+                                std::string sym = normalize_color_symbol(ch);
+                                if (!sym.empty()) produced.insert(sym);
+                            }
+                        }
+                    }
+                }
+            } catch (...) {
+                for (char ch : colors_raw) {
+                    std::string sym = normalize_color_symbol(ch);
+                    if (!sym.empty()) produced.insert(sym);
+                }
+            }
+        }
+        if (produced.empty()) {
+            std::string type_upper = to_upper_copy(type_line);
+            auto match_type = [&](const std::vector<std::string>& needles, const std::string& sym) {
+                for (const auto& needle : needles) {
+                    if (!needle.empty() && type_upper.find(needle) != std::string::npos) {
+                        produced.insert(sym);
+                        break;
+                    }
+                }
+            };
+            match_type({"PLAINS","PIANURA"}, "W");
+            match_type({"ISLAND","ISOLA"}, "U");
+            match_type({"SWAMP","PALUDE"}, "B");
+            match_type({"MOUNTAIN","MONTAGNA"}, "R");
+            match_type({"FOREST","FORESTA"}, "G");
+        }
+        if (produced.empty()) {
+            std::string text_upper = to_upper_copy(oracle_text);
+            auto match_symbol = [&](char symbol, const std::string& sym) {
+                std::string needle = std::string("{") + symbol + "}";
+                if (text_upper.find(needle) != std::string::npos) produced.insert(sym);
+            };
+            match_symbol('W', "W");
+            match_symbol('U', "U");
+            match_symbol('B', "B");
+            match_symbol('R', "R");
+            match_symbol('G', "G");
+            if (contains_any(text_upper, {"ANY COLOR", "QUALSIASI COLORE", "QUALUNQUE COLORE"})) {
+                produced.insert("W"); produced.insert("U"); produced.insert("B"); produced.insert("R"); produced.insert("G");
+            }
+        }
+        if (produced.empty()) produced.insert("C");
+        for (const auto& sym : produced) note_color_source(sym, qty);
+    };
+    auto analyze_oracle_roles = [&](const std::string& oracle_text, const CardRoleFlags& info, int qty) {
+        if (qty <= 0 || oracle_text.empty()) return;
+        if (info.is_land) return;
+        std::string text_lower = to_lower_copy(oracle_text);
+        bool boardwipe = contains_any(text_lower, {"destroy all creatures", "destroy all permanents", "tutte le creature", "ogni creatura", "each creature", "all creatures"});
+        bool removal_target = contains_any(text_lower, {"destroy target", "distruggi", "exile target", "esilia", "fight target", "lotta con", "damage to target", "infligge", "-x/-x", "sacrifica la creatura bersaglio"});
+        bool mentions_target = contains_any(text_lower, {"target creature", "creatura bersaglio", "target planeswalker", "planeswalker bersaglio", "target permanent", "permanente bersaglio", "any target", "bersaglio qualsiasi"});
+        if (boardwipe) {
+            board_wipes += qty;
+            removal_spells += qty;
+        } else if (removal_target && mentions_target) {
+            removal_spells += qty;
+        }
+        bool ramp = contains_any(text_lower, {"add {", "aggiungi {", "search your library for a land", "search your library for up to one land", "cerca nel tuo grimorio una carta terra", "cerca nel tuo grimorio fino a una carta terra", "put a land card", "metti una carta terra", "create a treasure", "crea una pedina tesoro", "mana of any color", "mana di qualsiasi colore", "mana di un qualsiasi colore"});
+        if (ramp) {
+            ramp_spells += qty;
+        }
+        bool draw = contains_any(text_lower, {"draw a card", "draw two cards", "draw three cards", "pesca una carta", "pesca due carte", "pesca tre carte", "pesca una carta per"});
+        if (draw) {
+            card_draw_spells += qty;
+        }
     };
     if (deck_id == -1) {
         // Build counts from the current filtered main view (use aggregated loader and apply UI filters)
@@ -2268,6 +2616,7 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
             std::string mana = row.count("mana_cost") ? row.at("mana_cost") : "";
             int cost = calculate_total_mana_cost(mana);
             if (cost < 0) cost = 0;
+            int bucket = cost >= cap ? cap : cost;
             counts[cost] += qty;
             total_cards += qty;
             std::string cname = "";
@@ -2280,26 +2629,64 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
                 if (!ctype.empty()) ctype += " ";
                 ctype += row.at("localized_type");
             }
-            accumulate_card_stats(ctype, qty, cost);
+            CardRoleFlags info = classify_card(ctype);
+            std::string oracle_text = row.count("oracle_text") ? row.at("oracle_text") : "";
+            register_land_sources_from_row(row, info, qty, ctype, oracle_text);
+            accumulate_card_stats(info, qty, cost);
+            update_type_series(info, bucket, qty);
+            if (!info.is_land) {
+                auto pip_map = parse_mana_symbols(mana);
+                int turn = cost > 0 ? cost : 1;
+                for (auto &pip : pip_map) {
+                    if (!pip_single_turn.count(pip.first)) {
+                        pip_single_turn[pip.first] = INF_TURN;
+                        pip_double_turn[pip.first] = INF_TURN;
+                        pip_triple_turn[pip.first] = INF_TURN;
+                    }
+                    pip_counts[pip.first] += pip.second * qty;
+                    if (pip.second >= 1) pip_single_turn[pip.first] = std::min(pip_single_turn[pip.first], turn);
+                    if (pip.second >= 2) pip_double_turn[pip.first] = std::min(pip_double_turn[pip.first], turn);
+                    if (pip.second >= 3) pip_triple_turn[pip.first] = std::min(pip_triple_turn[pip.first], turn);
+                }
+            }
+            analyze_oracle_roles(oracle_text, info, qty);
             // colors
             std::string cols = row.count("colors") ? row.at("colors") : "";
+            bool appended_color = false;
             if (!cols.empty()) {
                 try {
                     auto j = nlohmann::json::parse(cols);
-                    if (j.is_array()) for (auto &c : j) register_color(c.get<std::string>(), qty);
+                    if (j.is_array()) {
+                        for (auto &c : j) {
+                            if (!c.is_string()) continue;
+                            std::string normalized = register_color(c.get<std::string>(), qty);
+                            appended_color = append_color_series_from_token(normalized, bucket, qty) || appended_color;
+                        }
+                    }
                 } catch(...) {
-                    for (char ch : cols) if (std::isalpha((unsigned char)ch)) register_color(std::string(1,ch), qty);
+                    for (char ch : cols) {
+                        if (!std::isalpha((unsigned char)ch)) continue;
+                        std::string normalized = register_color(std::string(1, ch), qty);
+                        appended_color = append_color_series_from_token(normalized, bucket, qty) || appended_color;
+                    }
                 }
+            }
+            if (!appended_color) {
+                std::string normalized = register_color("C", qty);
+                append_color_series_from_token(normalized, bucket, qty);
             }
         }
     } else {
         // Query DB for mana_cost, name, quantity and colors in this deck
-        state->db->query("SELECT english_name, localized_name, name, localized_type, type, mana_cost, quantity, colors FROM cards WHERE deck_id = ?", [&](const std::map<std::string,std::string>& row){
+    std::string oracle_field = state->has_oracle_text_column ? "oracle_text" : "'' AS oracle_text";
+    std::string deck_sql = "SELECT english_name, localized_name, name, localized_type, type, mana_cost, " + oracle_field + ", quantity, colors FROM cards WHERE deck_id = ?";
+    state->db->query(deck_sql, [&](const std::map<std::string,std::string>& row){
             std::string mana = row.count("mana_cost") ? row.at("mana_cost") : "";
             int qty = 1;
             try { if (row.count("quantity") && !row.at("quantity").empty()) qty = std::stoi(row.at("quantity")); } catch(...) { qty = 1; }
             int cost = calculate_total_mana_cost(mana);
             if (cost < 0) cost = 0;
+            int bucket = cost >= cap ? cap : cost;
             counts[cost] += qty;
             total_cards += qty;
             // name preference: localized, english, raw name
@@ -2313,30 +2700,56 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
                 if (!ctype.empty()) ctype += " ";
                 ctype += row.at("localized_type");
             }
-            accumulate_card_stats(ctype, qty, cost);
+            CardRoleFlags info = classify_card(ctype);
+            std::string oracle_text = row.count("oracle_text") ? row.at("oracle_text") : "";
+            register_land_sources_from_row(row, info, qty, ctype, oracle_text);
+            accumulate_card_stats(info, qty, cost);
+            update_type_series(info, bucket, qty);
+            if (!info.is_land) {
+                auto pip_map = parse_mana_symbols(mana);
+                int turn = cost > 0 ? cost : 1;
+                for (auto &pip : pip_map) {
+                    if (!pip_single_turn.count(pip.first)) {
+                        pip_single_turn[pip.first] = INF_TURN;
+                        pip_double_turn[pip.first] = INF_TURN;
+                        pip_triple_turn[pip.first] = INF_TURN;
+                    }
+                    pip_counts[pip.first] += pip.second * qty;
+                    if (pip.second >= 1) pip_single_turn[pip.first] = std::min(pip_single_turn[pip.first], turn);
+                    if (pip.second >= 2) pip_double_turn[pip.first] = std::min(pip_double_turn[pip.first], turn);
+                    if (pip.second >= 3) pip_triple_turn[pip.first] = std::min(pip_triple_turn[pip.first], turn);
+                }
+            }
+            analyze_oracle_roles(oracle_text, info, qty);
             // colors parsing: either JSON array or compact codes
             std::string cols = row.count("colors") ? row.at("colors") : "";
+            bool appended_color = false;
             if (!cols.empty()) {
                 try {
                     auto j = nlohmann::json::parse(cols);
                     if (j.is_array()) {
                         for (auto &c : j) {
-                            register_color(c.get<std::string>(), qty);
+                            if (!c.is_string()) continue;
+                            std::string normalized = register_color(c.get<std::string>(), qty);
+                            appended_color = append_color_series_from_token(normalized, bucket, qty) || appended_color;
                         }
                     }
                 } catch(...) {
                     // fallback: treat as sequence of letters (e.g., WUBRG or "WU")
                     for (char ch : cols) {
-                        if (std::isalpha((unsigned char)ch)) {
-                            register_color(std::string(1, ch), qty);
-                        }
+                        if (!std::isalpha((unsigned char)ch)) continue;
+                        std::string normalized = register_color(std::string(1, ch), qty);
+                        appended_color = append_color_series_from_token(normalized, bucket, qty) || appended_color;
                     }
                 }
+            }
+            if (!appended_color) {
+                std::string normalized = register_color("C", qty);
+                append_color_series_from_token(normalized, bucket, qty);
             }
         }, std::vector<std::string>{std::to_string(deck_id)});
     }
     // cap bucket at 10
-    int cap = 10;
     // Normalize counts into capped buckets and merge detailed lists accordingly
     std::map<int,int> buckets;
     std::map<int, std::vector<std::pair<std::string,int>>> buckets_details_capped;
@@ -2358,144 +2771,14 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
             deck_name = r.at("name");
         }, std::vector<std::string>{std::to_string(deck_id)});
     }
+    std::cout << "DEBUG: mana_curve deck_id=" << deck_id << " total_cards=" << total_cards
+              << " counts_size=" << counts.size() << " buckets_size=" << buckets.size()
+              << " series_type=" << series_by_type.size() << " series_color=" << series_by_color.size() << std::endl;
+
     // create multi-series: Total, By Type, By Color
     int w = 800, h = 400;
     std::map<std::string, std::map<int,int>> series_total;
     series_total["Totale"] = buckets;
-
-    // by-type series (common MTG types)
-    // Note: 'Land' intentionally omitted per request
-    std::vector<std::string> type_keys = {"Creature","Instant","Sorcery","Enchantment","Artifact","Planeswalker","Other"};
-    std::map<std::string, std::map<int,int>> series_by_type;
-    for (auto &k : type_keys) series_by_type[k] = std::map<int,int>();
-
-    // by-color series
-    std::vector<std::string> color_keys = {"W","U","B","R","G","C"};
-    std::map<std::string, std::map<int,int>> series_by_color;
-    for (auto &c : color_keys) series_by_color[c] = std::map<int,int>();
-
-    // Recompute per-card contributions to type/color series using bucket_details (if available)
-    // We need to iterate original bucket_details (we have bucket_details map<int, vector<pair<string,int>>>)
-    // but bucket_details contains names only; instead we should iterate the rows again where possible.
-    // Simpler: use DB to enumerate the same rows originally considered above (deck vs main view path)
-    if (deck_id == -1) {
-        std::string filter = "";
-        if (state->search_entry) {
-            const char* text = gtk_editable_get_text(GTK_EDITABLE(state->search_entry));
-            filter = text ? text : "";
-        }
-        auto rows = load_cards_from_db(state->db, filter, -1, state->filter_no_deck);
-        for (const auto &row : rows) {
-            // apply same UI filters as earlier
-            if (!state->filter_colors.empty()) {
-                std::set<std::string> card_colors;
-                if (row.count("colors") && !row.at("colors").empty()) {
-                    try {
-                        auto j = nlohmann::json::parse(row.at("colors"));
-                        if (j.is_array()) for (auto &el : j) if (el.is_string()) card_colors.insert(el.get<std::string>());
-                    } catch (...) {
-                        std::string tmp = row.at("colors");
-                        for (char ch : tmp) if (!isspace((unsigned char)ch)) card_colors.insert(std::string(1,ch));
-                    }
-                }
-                if (card_colors != state->filter_colors) continue;
-            }
-            if (!state->filter_rarities.empty()) {
-                std::string card_rarity = row.count("rarity") ? row.at("rarity") : "";
-                std::transform(card_rarity.begin(), card_rarity.end(), card_rarity.begin(), ::tolower);
-                if (state->filter_rarities.count(card_rarity) == 0) continue;
-            }
-            if (!state->filter_types.empty()) {
-                std::string card_type_en = row.count("type") ? row.at("type") : "";
-                std::string card_type_local = row.count("localized_type") && !row.at("localized_type").empty() ? row.at("localized_type") : card_type_en;
-                auto lower = [](std::string s) { std::transform(s.begin(), s.end(), s.begin(), ::tolower); return s; };
-                std::string cte = lower(card_type_en);
-                std::string ctl = lower(card_type_local);
-                bool matched = false;
-                for (const auto &fk : state->filter_types) {
-                    std::string prev_lang = current_language;
-                    current_language = "it";
-                    std::string fk_it = translate_type(fk.c_str());
-                    current_language = prev_lang;
-                    std::string fk_en_l = lower(fk);
-                    std::string fk_it_l = lower(fk_it);
-                    if ((cte.find(fk_en_l) != std::string::npos) || (ctl.find(fk_en_l) != std::string::npos) || (cte.find(fk_it_l) != std::string::npos) || (ctl.find(fk_it_l) != std::string::npos)) { matched = true; break; }
-                }
-                if (!matched) continue;
-            }
-            if (state->filter_foil != -1) {
-                int foil = 0;
-                if (row.count("foil")) try { foil = std::stoi(row.at("foil")); } catch(...) { foil = 0; }
-                if (state->filter_foil != foil) continue;
-            }
-            int qty = 0;
-            if (row.count("quantity_total")) {
-                try { qty = std::stoi(row.at("quantity_total")); } catch(...) { qty = 0; }
-            } else if (row.count("quantity")) {
-                try { qty = std::stoi(row.at("quantity")); } catch(...) { qty = 0; }
-            } else qty = 1;
-            std::string mana = row.count("mana_cost") ? row.at("mana_cost") : "";
-            int cost = calculate_total_mana_cost(mana);
-            if (cost < 0) cost = 0;
-            int b = cost >= cap ? cap : cost;
-            // types: check presence of keywords
-            std::string ctype = row.count("type") ? row.at("type") : "";
-            for (auto &tk : type_keys) {
-                std::string lowered = tk;
-                std::transform(lowered.begin(), lowered.end(), lowered.begin(), ::tolower);
-                std::string ctype_l = ctype; std::transform(ctype_l.begin(), ctype_l.end(), ctype_l.begin(), ::tolower);
-                if (ctype_l.find(lowered) != std::string::npos) {
-                    series_by_type[tk][b] += qty;
-                }
-            }
-            // if no type matched, count as Other
-            bool anyt=false; for (auto &tk : type_keys) if (!series_by_type[tk].empty() && series_by_type[tk].count(b)) { anyt=true; break; }
-            if (!anyt) series_by_type["Other"][b] += qty;
-            // colors
-            std::string cols = row.count("colors") ? row.at("colors") : "";
-            if (!cols.empty()) {
-                try {
-                    auto j = nlohmann::json::parse(cols);
-                    if (j.is_array()) for (auto &c : j) {
-                        std::string cc = c.get<std::string>();
-                        if (series_by_color.count(cc) == 0) series_by_color[cc] = std::map<int,int>();
-                        series_by_color[cc][b] += qty;
-                    }
-                } catch(...) {
-                    for (char ch : cols) if (std::isalpha((unsigned char)ch)) {
-                        std::string s(1,ch);
-                        if (series_by_color.count(s) == 0) series_by_color[s] = std::map<int,int>();
-                        series_by_color[s][b] += qty;
-                    }
-                }
-            } else {
-                series_by_color["C"][b] += qty;
-            }
-        }
-    } else {
-        // deck-specific: query the cards we already iterated above
-        state->db->query("SELECT type, mana_cost, quantity, colors FROM cards WHERE deck_id = ?", [&](const std::map<std::string,std::string>& row){
-            int qty = 1;
-            try { if (row.count("quantity") && !row.at("quantity").empty()) qty = std::stoi(row.at("quantity")); } catch(...) { qty = 1; }
-            std::string mana = row.count("mana_cost") ? row.at("mana_cost") : "";
-            int cost = calculate_total_mana_cost(mana); if (cost < 0) cost = 0; int b = cost >= cap ? cap : cost;
-            std::string ctype = row.count("type") ? row.at("type") : "";
-            for (auto &tk : type_keys) {
-                std::string lowered = tk; std::transform(lowered.begin(), lowered.end(), lowered.begin(), ::tolower);
-                std::string ctype_l = ctype; std::transform(ctype_l.begin(), ctype_l.end(), ctype_l.begin(), ::tolower);
-                if (ctype_l.find(lowered) != std::string::npos) series_by_type[tk][b] += qty;
-            }
-            bool anyt=false; for (auto &tk : type_keys) if (!series_by_type[tk].empty() && series_by_type[tk].count(b)) { anyt=true; break; }
-            if (!anyt) series_by_type["Other"][b] += qty;
-            std::string cols = row.count("colors") ? row.at("colors") : "";
-            if (!cols.empty()) {
-                try {
-                    auto j = nlohmann::json::parse(cols);
-                    if (j.is_array()) for (auto &c : j) { std::string cc = c.get<std::string>(); if (series_by_color.count(cc) == 0) series_by_color[cc] = std::map<int,int>(); series_by_color[cc][b] += qty; }
-                } catch(...) { for (char ch : cols) if (std::isalpha((unsigned char)ch)) { std::string s(1,ch); if (series_by_color.count(s) == 0) series_by_color[s] = std::map<int,int>(); series_by_color[s][b] += qty; } }
-            } else { series_by_color["C"][b] += qty; }
-        }, std::vector<std::string>{std::to_string(deck_id)});
-    }
 
     // Remove any empty series (no counts) so we don't plot unused types/colors
     std::vector<std::string> erase_keys;
@@ -2530,118 +2813,397 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
     } catch(...) {
         std::cout << "DEBUG: failed to write debug PNG" << std::endl;
     }
-    // create pixbuf from surface and show in dialog with export buttons and stats
-    GdkPixbuf* pb = gdk_pixbuf_get_from_surface(surf_total, 0, 0, w, h);
-    std::cout << "DEBUG: create_mana_surface -> surf=" << (void*)surf_total << " size=" << w << "x" << h << " pb=" << (void*)pb << std::endl;
-    GtkWidget* dialog = create_styled_dialog(parent, w+360, h+120);
-    gtk_window_set_title(GTK_WINDOW(dialog), "Curva Mana");
-    GtkWidget* hmain = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
-    gtk_window_set_child(GTK_WINDOW(dialog), hmain);
-    // Left: image preview inside a scroller (allows large previews and zoom later)
-    GtkWidget* scroller = gtk_scrolled_window_new();
-    gtk_widget_set_hexpand(scroller, TRUE);
-    gtk_widget_set_vexpand(scroller, TRUE);
-    // Wrap the scroller in a frame with nicer margins
-    GtkWidget* frame = gtk_frame_new(NULL);
-    gtk_widget_set_margin_start(frame, 12);
-    gtk_widget_set_margin_end(frame, 12);
-    gtk_widget_set_margin_top(frame, 12);
-    gtk_widget_set_margin_bottom(frame, 12);
-    gtk_box_append(GTK_BOX(hmain), frame);
 
-    // Controls above the chart: Totale / Tipo / Colore
-    GtkWidget* top_controls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    gtk_widget_set_margin_bottom(top_controls, 8);
-    GtkWidget* btn_tot = gtk_button_new_with_label("Totale");
-    GtkWidget* btn_type = gtk_button_new_with_label("Tipo");
-    GtkWidget* btn_color = gtk_button_new_with_label("Colore");
-    // make the top control buttons compact
-    gtk_widget_set_size_request(btn_tot, 92, -1);
-    gtk_widget_set_size_request(btn_type, 92, -1);
-    gtk_widget_set_size_request(btn_color, 92, -1);
-    gtk_box_append(GTK_BOX(top_controls), btn_tot);
-    gtk_box_append(GTK_BOX(top_controls), btn_type);
-    gtk_box_append(GTK_BOX(top_controls), btn_color);
-    // Create a drawing area to render our surfaces
-    GtkWidget* da = gtk_drawing_area_new();
-    g_object_set_data(G_OBJECT(da), "mana_surface", surf_total);
-    // store other surfaces on the widget so callbacks can swap them
-    g_object_set_data(G_OBJECT(da), "mana_surface_type", surf_type);
-    g_object_set_data(G_OBJECT(da), "mana_surface_color", surf_color);
-    gtk_widget_set_size_request(da, w, h);
-    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(da), (GtkDrawingAreaDrawFunc)on_mana_area_draw, NULL, NULL);
-    // compose left area: controls + scroller containing da
-    GtkWidget* left_v = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
-    gtk_box_append(GTK_BOX(left_v), top_controls);
-    gtk_box_append(GTK_BOX(left_v), scroller);
-    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroller), da);
-    gtk_frame_set_child(GTK_FRAME(frame), left_v);
-    gtk_widget_queue_draw(da);
-    // Right: stats and controls
-    GtkWidget* right = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
-    gtk_box_append(GTK_BOX(hmain), right);
-    // Stats computation
     double avg = 0.0;
     int max_cost = 0;
-    int mode_bucket = 0; int mode_count = 0;
+    int mode_bucket = 0;
+    int mode_count = 0;
     for (auto &p : buckets) {
-        int cost = p.first; int cnt = p.second;
+        int cost = p.first;
+        int cnt = p.second;
         avg += cost * (double)cnt;
         if (cost > max_cost) max_cost = cost;
-        if (cnt > mode_count) { mode_count = cnt; mode_bucket = cost; }
+        if (cnt > mode_count) {
+            mode_count = cnt;
+            mode_bucket = cost;
+        }
     }
     if (total_cards > 0) avg /= (double)total_cards;
-    // median calculation
+
     int median = 0;
     if (total_cards > 0) {
         int half = (total_cards + 1) / 2;
         int acc = 0;
         for (auto &p : buckets) {
             acc += p.second;
-            if (acc >= half) { median = p.first; break; }
-        }
-    }
-    // Summary: build a friendly, markup-formatted stats panel (remove raw distribution line per request)
-    {
-        std::string stats;
-        char tmp[256];
-        stats += "<big><b>Statistiche</b></big>\n";
-        snprintf(tmp, sizeof(tmp), "<b>Totale carte:</b> %d\n", total_cards);
-        stats += tmp;
-        snprintf(tmp, sizeof(tmp), "<b>Costo medio:</b> %.2f\n", avg);
-        stats += tmp;
-        snprintf(tmp, sizeof(tmp), "<b>Mediana:</b> %d\n", median);
-        stats += tmp;
-        snprintf(tmp, sizeof(tmp), "<b>Moda:</b> %d (%d carte)\n", mode_bucket, mode_count);
-        stats += tmp;
-        snprintf(tmp, sizeof(tmp), "<b>Max bucket:</b> %d\n", max_cost);
-        stats += tmp;
-        // NOTE: 'Distribuzione' line removed as requested
-        // Color breakdown
-        if (!color_counts.empty()) {
-            stats += "\n\n<b>Colori:</b> ";
-            bool firstc = true;
-            for (auto &cc : color_counts) {
-                char t[64]; snprintf(t, sizeof(t), "%s:%d", cc.first.c_str(), cc.second);
-                if (!firstc) stats += ", ";
-                stats += t;
-                firstc = false;
+            if (acc >= half) {
+                median = p.first;
+                break;
             }
         }
-        GtkWidget* stats_label = gtk_label_new(NULL);
-        gtk_label_set_markup(GTK_LABEL(stats_label), stats.c_str());
-        gtk_label_set_xalign(GTK_LABEL(stats_label), 0.0);
-        gtk_label_set_wrap(GTK_LABEL(stats_label), TRUE);
-        gtk_widget_set_size_request(stats_label, 320, -1);
-        gtk_box_append(GTK_BOX(right), stats_label);
     }
-    // Buttons: export png/pdf and export stats
+
+    int spells_count = total_cards - land_cards;
+    if (spells_count < 0) spells_count = 0;
+    double avg_total_cmc = total_cards > 0 ? (sum_all_cmc / (double)total_cards) : 0.0;
+    double avg_non_land_cmc = count_non_land_cards > 0 ? (sum_non_land_cmc / (double)count_non_land_cards) : 0.0;
+    double avg_creature_cmc = count_creature_cards > 0 ? (sum_creature_cmc / (double)count_creature_cards) : 0.0;
+    double avg_non_creature_cmc = count_non_creature_cards > 0 ? (sum_non_creature_cmc / (double)count_non_creature_cards) : 0.0;
+    double creature_ratio = total_cards > 0 ? (double)creature_cards / (double)total_cards : 0.0;
+    double non_creature_ratio = total_cards > 0 ? (double)non_creature_spells / (double)total_cards : 0.0;
+    double land_ratio = total_cards > 0 ? (double)land_cards / (double)total_cards : 0.0;
+    double recommended_land_ratio = (total_cards >= 90) ? 0.37 : (total_cards >= 70 ? 0.38 : 0.40);
+    int recommended_lands = total_cards > 0 ? (int)std::round(total_cards * recommended_land_ratio) : 0;
+    int land_delta = land_cards - recommended_lands;
+
+    auto compute_curve_targets = [&](int spell_total, int deck_total) {
+        std::map<int,int> targets;
+        if (spell_total <= 0) {
+            targets[0] = targets[1] = targets[2] = targets[3] = targets[4] = targets[5] = targets[6] = 0;
+            return targets;
+        }
+        bool commander_profile = deck_total >= 90;
+        std::vector<std::pair<int,double>> ratios = commander_profile ?
+            std::vector<std::pair<int,double>>{{1,0.18},{2,0.20},{3,0.19},{4,0.16},{5,0.14},{6,0.13}} :
+            std::vector<std::pair<int,double>>{{1,0.24},{2,0.22},{3,0.18},{4,0.16},{5,0.12},{6,0.08}};
+        int assigned = 0;
+        for (size_t i = 0; i < ratios.size(); ++i) {
+            int bucket = ratios[i].first;
+            int value = 0;
+            if (i + 1 == ratios.size()) {
+                value = std::max(0, spell_total - assigned);
+            } else {
+                value = (int)std::round(spell_total * ratios[i].second);
+                assigned += value;
+            }
+            targets[bucket] = value;
+        }
+        targets[0] = 0;
+        return targets;
+    };
+
+    std::map<int,int> curve_targets = compute_curve_targets(spells_count, total_cards);
+    std::map<int,int> curve_actual_summary;
+    auto get_bucket_count = [&](int bucket) {
+        if (bucket == 6) {
+            int sum = 0;
+            for (int b = 6; b <= cap; ++b) {
+                auto it = buckets.find(b);
+                if (it != buckets.end()) sum += it->second;
+            }
+            return sum;
+        }
+        auto it = buckets.find(bucket);
+        return it != buckets.end() ? it->second : 0;
+    };
+    int bucket_keys[] = {0,1,2,3,4,5,6};
+    for (int bucket : bucket_keys) {
+        curve_actual_summary[bucket] = get_bucket_count(bucket);
+        if (!curve_targets.count(bucket)) curve_targets[bucket] = 0;
+    }
+
+    std::set<std::string> color_key_set;
+    for (const auto &kv : color_sources) if (!kv.first.empty()) color_key_set.insert(kv.first);
+    for (const auto &kv : pip_counts) if (!kv.first.empty()) color_key_set.insert(kv.first);
+    if (color_key_set.empty()) color_key_set.insert("C");
+
+    auto lookup_requirement = [&](int turn, const std::vector<std::pair<int,int>>& table) {
+        if (table.empty()) return 0;
+        if (turn <= 0) return table.front().second;
+        for (const auto &entry : table) {
+            if (turn <= entry.first) return entry.second;
+        }
+        return table.back().second;
+    };
+    std::vector<std::pair<int,int>> single_table = {{1,14},{2,12},{3,11},{4,10},{5,9}};
+    std::vector<std::pair<int,int>> double_table = {{2,20},{3,17},{4,15},{5,14}};
+    std::vector<std::pair<int,int>> triple_table = {{3,23},{4,21},{5,19}};
+    std::map<std::string,int> color_source_targets;
+    for (const auto &color : color_key_set) {
+        if (color == "C") {
+            color_source_targets[color] = 0;
+            continue;
+        }
+        int best = 0;
+        int single_turn = pip_single_turn.count(color) ? pip_single_turn[color] : INF_TURN;
+        int double_turn_req = pip_double_turn.count(color) ? pip_double_turn[color] : INF_TURN;
+        int triple_turn_req = pip_triple_turn.count(color) ? pip_triple_turn[color] : INF_TURN;
+        if (single_turn < INF_TURN) best = std::max(best, lookup_requirement(std::max(1, single_turn), single_table));
+        if (double_turn_req < INF_TURN) best = std::max(best, lookup_requirement(std::max(1, double_turn_req), double_table));
+        if (triple_turn_req < INF_TURN) best = std::max(best, lookup_requirement(std::max(1, triple_turn_req), triple_table));
+        color_source_targets[color] = best;
+    }
+
+    double total_pips = 0.0;
+    for (const auto &kv : pip_counts) total_pips += kv.second;
+    // Instead of a dialog, render the mana curve inside the main window stack.
+    if (!state->stats_container || !state->main_stack) {
+        std::cout << "WARN: stats container not available, skipping inline mana curve view" << std::endl;
+        if (surf_total) cairo_surface_destroy(surf_total);
+        if (surf_type) cairo_surface_destroy(surf_type);
+        if (surf_color) cairo_surface_destroy(surf_color);
+        return;
+    }
+
+    stats_clear(state, false);
+
+    GtkWidget* container = state->stats_container;
+    std::string header_title = deck_name.empty() ? std::string("Curva Mana") : deck_name + " • Curva Mana";
+
+    GtkWidget* header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_hexpand(header, TRUE);
+    gtk_widget_set_margin_bottom(header, 12);
+    gtk_box_append(GTK_BOX(container), header);
+
+    GtkWidget* back_btn = gtk_button_new_with_label("← Database");
+    gtk_widget_add_css_class(back_btn, "ghost-button");
+    g_signal_connect(back_btn, "clicked", G_CALLBACK(on_stats_back_clicked), state);
+    gtk_box_append(GTK_BOX(header), back_btn);
+
+    GtkWidget* title_lbl = gtk_label_new(header_title.c_str());
+    gtk_label_set_xalign(GTK_LABEL(title_lbl), 0.0);
+    gtk_widget_set_hexpand(title_lbl, TRUE);
+    gtk_box_append(GTK_BOX(header), title_lbl);
+
+    std::string info_text = "Carte: " + std::to_string(total_cards);
+    GtkWidget* info_lbl = gtk_label_new(info_text.c_str());
+    gtk_widget_add_css_class(info_lbl, "muted");
+    gtk_box_append(GTK_BOX(header), info_lbl);
+
+    GtkWidget* hmain = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 16);
+    gtk_widget_set_hexpand(hmain, TRUE);
+    gtk_widget_set_vexpand(hmain, TRUE);
+    gtk_box_append(GTK_BOX(container), hmain);
+
+    GtkWidget* left_v = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_widget_set_hexpand(left_v, TRUE);
+    gtk_widget_set_vexpand(left_v, TRUE);
+    gtk_box_append(GTK_BOX(hmain), left_v);
+
+    GtkWidget* top_controls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_widget_set_margin_bottom(top_controls, 8);
+    GtkWidget* btn_tot = gtk_button_new_with_label("Totale");
+    GtkWidget* btn_type = gtk_button_new_with_label("Tipo");
+    GtkWidget* btn_color = gtk_button_new_with_label("Colore");
+    gtk_widget_set_size_request(btn_tot, 92, -1);
+    gtk_widget_set_size_request(btn_type, 92, -1);
+    gtk_widget_set_size_request(btn_color, 92, -1);
+    gtk_box_append(GTK_BOX(top_controls), btn_tot);
+    gtk_box_append(GTK_BOX(top_controls), btn_type);
+    gtk_box_append(GTK_BOX(top_controls), btn_color);
+    gtk_box_append(GTK_BOX(left_v), top_controls);
+
+    GtkWidget* chart_frame = gtk_frame_new(NULL);
+    gtk_widget_add_css_class(chart_frame, "stats-chart-frame");
+    gtk_widget_set_hexpand(chart_frame, TRUE);
+    gtk_widget_set_vexpand(chart_frame, TRUE);
+    gtk_box_append(GTK_BOX(left_v), chart_frame);
+
+    GtkWidget* da = gtk_drawing_area_new();
+    gtk_widget_set_hexpand(da, TRUE);
+    gtk_widget_set_vexpand(da, TRUE);
+    gtk_widget_set_size_request(da, w, h);
+    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(da), (GtkDrawingAreaDrawFunc)on_mana_area_draw, NULL, NULL);
+    gtk_frame_set_child(GTK_FRAME(chart_frame), da);
+
+    GtkWidget* right = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_hexpand(right, TRUE);
+    gtk_widget_set_vexpand(right, TRUE);
+    gtk_box_append(GTK_BOX(hmain), right);
+
+    auto format_double = [](double value) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%.2f", value);
+        return std::string(buf);
+    };
+    auto format_percent = [](double value) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%.0f%%", value * 100.0);
+        return std::string(buf);
+    };
+    auto format_delta_text = [](int delta) {
+        if (delta == 0) return std::string("Δ 0");
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "Δ %s%d", delta > 0 ? "+" : "", delta);
+        return std::string(buf);
+    };
+    auto create_stats_pill = [&](const std::string& title, const std::string& value, const std::string& subtitle) {
+        GtkWidget* pill = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+        gtk_widget_add_css_class(pill, "stats-pill");
+        gtk_widget_set_margin_end(pill, 8);
+        gtk_widget_set_margin_bottom(pill, 8);
+        GtkWidget* title_label = gtk_label_new(title.c_str());
+        gtk_widget_add_css_class(title_label, "stats-pill-title");
+        gtk_label_set_xalign(GTK_LABEL(title_label), 0.0);
+        gtk_box_append(GTK_BOX(pill), title_label);
+        GtkWidget* value_label = gtk_label_new(value.c_str());
+        gtk_widget_add_css_class(value_label, "stats-pill-value");
+        gtk_label_set_xalign(GTK_LABEL(value_label), 0.0);
+        gtk_box_append(GTK_BOX(pill), value_label);
+        if (!subtitle.empty()) {
+            GtkWidget* subtitle_label = gtk_label_new(subtitle.c_str());
+            gtk_widget_add_css_class(subtitle_label, "stats-pill-subtitle");
+            gtk_label_set_wrap(GTK_LABEL(subtitle_label), TRUE);
+            gtk_label_set_xalign(GTK_LABEL(subtitle_label), 0.0);
+            gtk_box_append(GTK_BOX(pill), subtitle_label);
+        }
+        return pill;
+    };
+
+    GtkWidget* summary_flow = gtk_flow_box_new();
+    gtk_flow_box_set_selection_mode(GTK_FLOW_BOX(summary_flow), GTK_SELECTION_NONE);
+    gtk_widget_add_css_class(summary_flow, "stats-pill-flow");
+    gtk_widget_set_margin_bottom(summary_flow, 8);
+    gtk_box_append(GTK_BOX(right), summary_flow);
+    auto append_pill = [&](GtkWidget* pill) {
+        gtk_flow_box_insert(GTK_FLOW_BOX(summary_flow), pill, -1);
+    };
+
+    append_pill(create_stats_pill("Totale", std::to_string(total_cards), deck_name.empty() ? std::string() : deck_name));
+    std::string land_sub = format_percent(land_ratio) + " • target " + std::to_string(recommended_lands) + " (" + format_delta_text(land_delta) + ")";
+    append_pill(create_stats_pill("Terre", std::to_string(land_cards), land_sub));
+    std::string spells_sub = std::string("avg ") + format_double(avg_non_land_cmc) + " • " + format_percent(1.0 - land_ratio);
+    append_pill(create_stats_pill("Magie", std::to_string(spells_count), spells_sub));
+    std::string creature_sub = std::string("avg ") + format_double(avg_creature_cmc) + " • " + format_percent(creature_ratio);
+    append_pill(create_stats_pill("Creature", std::to_string(creature_cards), creature_sub));
+    std::string non_creature_sub = std::string("avg ") + format_double(avg_non_creature_cmc) + " • " + format_percent(non_creature_ratio);
+    append_pill(create_stats_pill("Non Creature", std::to_string(non_creature_spells), non_creature_sub));
+    double removal_share = spells_count > 0 ? (double)removal_spells / (double)spells_count : 0.0;
+    double ramp_share = spells_count > 0 ? (double)ramp_spells / (double)spells_count : 0.0;
+    double draw_share = spells_count > 0 ? (double)card_draw_spells / (double)spells_count : 0.0;
+    std::string removal_sub = format_percent(removal_share);
+    if (board_wipes > 0) removal_sub += std::string(" • wipe ") + std::to_string(board_wipes);
+    append_pill(create_stats_pill("Rimozioni", std::to_string(removal_spells), removal_sub));
+    std::string ramp_sub = format_percent(ramp_share);
+    append_pill(create_stats_pill("Ramp", std::to_string(ramp_spells), ramp_sub));
+    std::string draw_sub = format_percent(draw_share);
+    append_pill(create_stats_pill("Pescate", std::to_string(card_draw_spells), draw_sub));
+
+    auto style_delta_label = [&](GtkWidget* lbl, int delta) {
+        if (delta > 0) gtk_widget_add_css_class(lbl, "trend-up");
+        else if (delta < 0) gtk_widget_add_css_class(lbl, "trend-down");
+        else gtk_widget_add_css_class(lbl, "trend-neutral");
+    };
+
+    GtkWidget* curve_panel = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_widget_add_css_class(curve_panel, "stats-panel");
+    gtk_widget_set_margin_bottom(curve_panel, 12);
+    GtkWidget* curve_title = gtk_label_new("Curva vs target");
+    gtk_widget_add_css_class(curve_title, "stats-panel-title");
+    gtk_label_set_xalign(GTK_LABEL(curve_title), 0.0);
+    gtk_box_append(GTK_BOX(curve_panel), curve_title);
+    GtkWidget* curve_grid = gtk_grid_new();
+    gtk_grid_set_column_spacing(GTK_GRID(curve_grid), 16);
+    gtk_grid_set_row_spacing(GTK_GRID(curve_grid), 4);
+    gtk_widget_add_css_class(curve_grid, "stats-grid");
+    gtk_box_append(GTK_BOX(curve_panel), curve_grid);
+    GtkWidget* curve_hdr0 = gtk_label_new("Costo");
+    GtkWidget* curve_hdr1 = gtk_label_new("Reale");
+    GtkWidget* curve_hdr2 = gtk_label_new("Target");
+    GtkWidget* curve_hdr3 = gtk_label_new("Δ");
+    GtkWidget* headers[] = {curve_hdr0, curve_hdr1, curve_hdr2, curve_hdr3};
+    for (int i = 0; i < 4; ++i) {
+        gtk_widget_add_css_class(headers[i], "stats-grid-header");
+        gtk_label_set_xalign(GTK_LABEL(headers[i]), 0.0);
+        gtk_grid_attach(GTK_GRID(curve_grid), headers[i], i, 0, 1, 1);
+    }
+    int curve_row = 1;
+    for (int bucket : bucket_keys) {
+        int actual = curve_actual_summary[bucket];
+        int target = curve_targets.count(bucket) ? curve_targets[bucket] : 0;
+        int delta = actual - target;
+        std::string bucket_label = bucket == 6 ? ">=6" : std::to_string(bucket);
+        GtkWidget* lbl_bucket = gtk_label_new(bucket_label.c_str());
+        gtk_label_set_xalign(GTK_LABEL(lbl_bucket), 0.0);
+        gtk_grid_attach(GTK_GRID(curve_grid), lbl_bucket, 0, curve_row, 1, 1);
+        GtkWidget* lbl_actual = gtk_label_new(std::to_string(actual).c_str());
+        gtk_label_set_xalign(GTK_LABEL(lbl_actual), 0.0);
+        gtk_grid_attach(GTK_GRID(curve_grid), lbl_actual, 1, curve_row, 1, 1);
+        GtkWidget* lbl_target = gtk_label_new(std::to_string(target).c_str());
+        gtk_label_set_xalign(GTK_LABEL(lbl_target), 0.0);
+        gtk_grid_attach(GTK_GRID(curve_grid), lbl_target, 2, curve_row, 1, 1);
+        GtkWidget* lbl_delta = gtk_label_new(format_delta_text(delta).c_str());
+        gtk_label_set_xalign(GTK_LABEL(lbl_delta), 0.0);
+        style_delta_label(lbl_delta, delta);
+        gtk_grid_attach(GTK_GRID(curve_grid), lbl_delta, 3, curve_row, 1, 1);
+        curve_row++;
+    }
+    gtk_box_append(GTK_BOX(right), curve_panel);
+
+    GtkWidget* color_panel = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_widget_add_css_class(color_panel, "stats-panel");
+    GtkWidget* color_title = gtk_label_new("Fonti di colore");
+    gtk_widget_add_css_class(color_title, "stats-panel-title");
+    gtk_label_set_xalign(GTK_LABEL(color_title), 0.0);
+    gtk_box_append(GTK_BOX(color_panel), color_title);
+    GtkWidget* color_grid = gtk_grid_new();
+    gtk_grid_set_column_spacing(GTK_GRID(color_grid), 16);
+    gtk_grid_set_row_spacing(GTK_GRID(color_grid), 4);
+    gtk_widget_add_css_class(color_grid, "stats-grid");
+    gtk_box_append(GTK_BOX(color_panel), color_grid);
+    GtkWidget* color_hdr0 = gtk_label_new("Colore");
+    GtkWidget* color_hdr1 = gtk_label_new("Fonti");
+    GtkWidget* color_hdr2 = gtk_label_new("Consigliate");
+    GtkWidget* color_hdr3 = gtk_label_new("Δ");
+    GtkWidget* color_hdr4 = gtk_label_new("Share");
+    GtkWidget* color_headers[] = {color_hdr0, color_hdr1, color_hdr2, color_hdr3, color_hdr4};
+    for (int i = 0; i < 5; ++i) {
+        gtk_widget_add_css_class(color_headers[i], "stats-grid-header");
+        gtk_label_set_xalign(GTK_LABEL(color_headers[i]), 0.0);
+        gtk_grid_attach(GTK_GRID(color_grid), color_headers[i], i, 0, 1, 1);
+    }
+    auto get_or_zero = [](const std::map<std::string,int>& m, const std::string& key) {
+        auto it = m.find(key);
+        return it != m.end() ? it->second : 0;
+    };
+    std::vector<std::string> ordered_colors = {"W","U","B","R","G","C"};
+    for (const auto &kv : color_key_set) {
+        if (std::find(ordered_colors.begin(), ordered_colors.end(), kv) == ordered_colors.end()) {
+            ordered_colors.push_back(kv);
+        }
+    }
+    int color_row = 1;
+    for (const auto &color : ordered_colors) {
+        int sources = get_or_zero(color_sources, color);
+        int pips = get_or_zero(pip_counts, color);
+        if (sources == 0 && pips == 0) continue;
+        int needed = color_source_targets.count(color) ? color_source_targets[color] : 0;
+        int delta = sources - needed;
+        double share_sources = land_cards > 0 ? (double)sources / (double)land_cards : 0.0;
+        double share_pips = total_pips > 0 ? (double)pips / total_pips : 0.0;
+        int share_delta = (int)std::round((share_sources - share_pips) * 100.0);
+        std::string share_text = format_percent(share_sources) + " vs " + format_percent(share_pips);
+        GtkWidget* lbl_color = gtk_label_new(color.c_str());
+        gtk_label_set_xalign(GTK_LABEL(lbl_color), 0.0);
+        gtk_grid_attach(GTK_GRID(color_grid), lbl_color, 0, color_row, 1, 1);
+        GtkWidget* lbl_sources = gtk_label_new(std::to_string(sources).c_str());
+        gtk_label_set_xalign(GTK_LABEL(lbl_sources), 0.0);
+        gtk_grid_attach(GTK_GRID(color_grid), lbl_sources, 1, color_row, 1, 1);
+        GtkWidget* lbl_needed = gtk_label_new(std::to_string(needed).c_str());
+        gtk_label_set_xalign(GTK_LABEL(lbl_needed), 0.0);
+        gtk_grid_attach(GTK_GRID(color_grid), lbl_needed, 2, color_row, 1, 1);
+        GtkWidget* lbl_delta = gtk_label_new(format_delta_text(delta).c_str());
+        gtk_label_set_xalign(GTK_LABEL(lbl_delta), 0.0);
+        style_delta_label(lbl_delta, delta);
+        gtk_grid_attach(GTK_GRID(color_grid), lbl_delta, 3, color_row, 1, 1);
+        std::string share_delta_text = share_delta == 0 ? std::string("0%") : (share_delta > 0 ? "+" + std::to_string(share_delta) + "%" : std::to_string(share_delta) + "%");
+        GtkWidget* lbl_share = gtk_label_new((share_text + " (" + share_delta_text + ")").c_str());
+        gtk_label_set_xalign(GTK_LABEL(lbl_share), 0.0);
+        if (share_delta > 0) gtk_widget_add_css_class(lbl_share, "trend-up");
+        else if (share_delta < 0) gtk_widget_add_css_class(lbl_share, "trend-down");
+        else gtk_widget_add_css_class(lbl_share, "trend-neutral");
+        gtk_label_set_wrap(GTK_LABEL(lbl_share), TRUE);
+        gtk_grid_attach(GTK_GRID(color_grid), lbl_share, 4, color_row, 1, 1);
+        color_row++;
+    }
+    gtk_box_append(GTK_BOX(right), color_panel);
+
     GtkWidget* btns = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_widget_set_margin_top(btns, 12);
     GtkWidget* export_png = gtk_button_new_with_label("Export PNG");
     GtkWidget* export_pdf = gtk_button_new_with_label("Export PDF");
     GtkWidget* export_stats = gtk_button_new_with_label("Export stats");
-    GtkWidget* close = gtk_button_new_with_label("Close");
-    // make export/close buttons narrower to avoid huge column width
+    GtkWidget* close = gtk_button_new_with_label("Chiudi");
     gtk_widget_set_size_request(export_png, 120, -1);
     gtk_widget_set_size_request(export_pdf, 120, -1);
     gtk_widget_set_size_request(export_stats, 120, -1);
@@ -2652,140 +3214,152 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
     gtk_box_append(GTK_BOX(btns), close);
     gtk_box_append(GTK_BOX(right), btns);
 
-    // If no type/color data is available, disable the corresponding buttons
     if (!has_type) gtk_widget_set_sensitive(btn_type, FALSE);
     if (!has_color) gtk_widget_set_sensitive(btn_color, FALSE);
 
-    // Handlers (avoid inline lambdas in macros)
-    struct ExportCtx {
-        GtkWidget* da; // drawing area where surfaces are shown
-        cairo_surface_t* surf;
-        cairo_surface_t* surf_total;
-        cairo_surface_t* surf_type;
-        cairo_surface_t* surf_color;
-        GtkWindow* parent;
-        int w,h;
-        std::map<int,int> buckets;
-        int total;
-        int cap;
-        std::string deck_name;
-        std::map<int, std::vector<std::pair<std::string,int>>> bucket_details;
-        std::map<std::string,int> color_counts;
-        double avg;
-        int median;
-        int mode_bucket;
-        int mode_count;
-        int max_cost;
-    };
-    ExportCtx* ectx = new ExportCtx();
+    g_object_set_data(G_OBJECT(da), "mana_surface_type", surf_type);
+    g_object_set_data(G_OBJECT(da), "mana_surface_color", surf_color);
+
+    ManaStatsExportCtx* ectx = new ManaStatsExportCtx();
     ectx->da = da;
-    ectx->surf = surf_total;
+    ectx->parent = parent;
     ectx->surf_total = surf_total;
     ectx->surf_type = surf_type;
     ectx->surf_color = surf_color;
-    ectx->parent = GTK_WINDOW(dialog);
-    ectx->w = w; ectx->h = h;
+    ectx->w = w;
+    ectx->h = h;
     ectx->buckets = buckets;
     ectx->total = total_cards;
     ectx->cap = cap;
     ectx->deck_name = deck_name;
     ectx->bucket_details = buckets_details_capped;
     ectx->color_counts = color_counts;
-    ectx->avg = avg; ectx->median = median; ectx->mode_bucket = mode_bucket; ectx->mode_count = mode_count; ectx->max_cost = max_cost;
+    ectx->avg = avg;
+    ectx->median = median;
+    ectx->mode_bucket = mode_bucket;
+    ectx->mode_count = mode_count;
+    ectx->max_cost = max_cost;
+    ectx->land_cards = land_cards;
+    ectx->spells_count = spells_count;
+    ectx->avg_total_cmc = avg_total_cmc;
+    ectx->avg_non_land_cmc = avg_non_land_cmc;
+    ectx->avg_creature_cmc = avg_creature_cmc;
+    ectx->avg_non_creature_cmc = avg_non_creature_cmc;
+    ectx->recommended_lands = recommended_lands;
+    ectx->land_delta = land_delta;
+    ectx->removal_spells = removal_spells;
+    ectx->board_wipes = board_wipes;
+    ectx->ramp_spells = ramp_spells;
+    ectx->card_draw_spells = card_draw_spells;
+    ectx->curve_targets = curve_targets;
+    ectx->curve_actual_summary = curve_actual_summary;
+    ectx->color_sources = color_sources;
+    ectx->color_source_targets = color_source_targets;
+    ectx->pip_counts = pip_counts;
+    ectx->total_pips = total_pips;
+    state->stats_ctx = ectx;
+
     g_signal_connect(export_png, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data){
-    ExportCtx* c = (ExportCtx*)user_data;
-    if (!c || !c->surf) return;
-    ensure_data_dir_exists("data");
-    std::string base = c->deck_name.empty() ? (std::string("mana_curve_") + std::to_string(time(nullptr))) : (std::string("mana_curve_") + sanitize_filename(c->deck_name));
-    std::string fname = std::string("data/") + base + ".png";
-    cairo_surface_write_to_png(c->surf, fname.c_str());
-    std::cout << "Exported PNG to " << fname << std::endl;
+        ManaStatsExportCtx* c = (ManaStatsExportCtx*)user_data;
+        if (!c || !c->surf) return;
+        ensure_data_dir_exists("data");
+        std::string base = c->deck_name.empty() ? (std::string("mana_curve_") + std::to_string(time(nullptr))) : (std::string("mana_curve_") + sanitize_filename(c->deck_name));
+        std::string fname = std::string("data/") + base + ".png";
+        cairo_surface_write_to_png(c->surf, fname.c_str());
+        std::cout << "Exported PNG to " << fname << std::endl;
     }), ectx);
     g_signal_connect(export_pdf, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data){
-    ExportCtx* c = (ExportCtx*)user_data;
-    if (!c || !c->surf) return;
-    ensure_data_dir_exists("data");
-    std::string base = c->deck_name.empty() ? (std::string("mana_curve_") + std::to_string(time(nullptr))) : (std::string("mana_curve_") + sanitize_filename(c->deck_name));
-    std::string fname = std::string("data/") + base + ".pdf";
-    cairo_surface_t* pdf = cairo_pdf_surface_create(fname.c_str(), c->w, c->h);
-    cairo_t* cr = cairo_create(pdf);
-    // Paint the currently selected raster surface into the PDF (embedding raster but reliable)
-    cairo_set_source_surface(cr, c->surf, 0, 0);
-    cairo_paint(cr);
-    cairo_destroy(cr);
-    cairo_surface_flush(pdf);
-    cairo_surface_destroy(pdf);
-    std::cout << "Exported PDF to " << fname << std::endl;
+        ManaStatsExportCtx* c = (ManaStatsExportCtx*)user_data;
+        if (!c || !c->surf) return;
+        ensure_data_dir_exists("data");
+        std::string base = c->deck_name.empty() ? (std::string("mana_curve_") + std::to_string(time(nullptr))) : (std::string("mana_curve_") + sanitize_filename(c->deck_name));
+        std::string fname = std::string("data/") + base + ".pdf";
+        cairo_surface_t* pdf = cairo_pdf_surface_create(fname.c_str(), c->w, c->h);
+        cairo_t* cr = cairo_create(pdf);
+        cairo_set_source_surface(cr, c->surf, 0, 0);
+        cairo_paint(cr);
+        cairo_destroy(cr);
+        cairo_surface_flush(pdf);
+        cairo_surface_destroy(pdf);
+        std::cout << "Exported PDF to " << fname << std::endl;
     }), ectx);
     g_signal_connect(export_stats, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data){
-    ExportCtx* c = (ExportCtx*)user_data;
-    if (!c) return;
-    ensure_data_dir_exists("data");
-    std::string base = c->deck_name.empty() ? (std::string("mana_stats_") + std::to_string(time(nullptr))) : (std::string("mana_stats_") + sanitize_filename(c->deck_name));
-    std::string fname = std::string("data/") + base + ".txt";
-    std::ofstream out(fname);
-    if (!out) return;
-    out << "Deck: " << c->deck_name << "\n";
-    out << "Total cards: " << c->total << "\n";
-    out << "Average mana cost: " << c->avg << "\n";
-    out << "Median cost: " << c->median << "\n";
-    out << "Mode bucket: " << c->mode_bucket << " (" << c->mode_count << ")\n";
-    out << "Max bucket: " << c->max_cost << "\n\n";
-    out << "Distribution:\n";
-    for (auto &p : c->buckets) out << "  " << p.first << ": " << p.second << "\n";
-    out << "\nPer-bucket card lists:\n";
-    for (auto &p : c->bucket_details) {
-        out << "Bucket " << p.first << ":\n";
-        for (auto &it : p.second) {
-            out << "    " << it.first << " x" << it.second << "\n";
+        ManaStatsExportCtx* c = (ManaStatsExportCtx*)user_data;
+        if (!c) return;
+        ensure_data_dir_exists("data");
+        std::string base = c->deck_name.empty() ? (std::string("mana_stats_") + std::to_string(time(nullptr))) : (std::string("mana_stats_") + sanitize_filename(c->deck_name));
+        std::string fname = std::string("data/") + base + ".txt";
+        std::ofstream out(fname);
+        if (!out) return;
+        auto format_double_txt = [](double value) {
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "%.2f", value);
+            return std::string(buf);
+        };
+        out << "Deck: " << c->deck_name << "\n";
+        out << "Total cards: " << c->total << "\n";
+        out << "Average mana cost (overall): " << format_double_txt(c->avg_total_cmc) << "\n";
+        out << "Average mana cost (non-lands): " << format_double_txt(c->avg_non_land_cmc) << "\n";
+        out << "Average creature MV: " << format_double_txt(c->avg_creature_cmc) << "\n";
+        out << "Average non-creature MV: " << format_double_txt(c->avg_non_creature_cmc) << "\n";
+        out << "Median bucket: " << c->median << "\n";
+        out << "Mode bucket: " << c->mode_bucket << " (" << c->mode_count << ")\n";
+        out << "Max bucket: " << c->max_cost << "\n";
+        out << "Lands: " << c->land_cards << " (target " << c->recommended_lands << ", Δ " << c->land_delta << ")\n";
+        out << "Spells: " << c->spells_count << "\n";
+        out << "Removal spells: " << c->removal_spells << " (board wipes " << c->board_wipes << ")\n";
+        out << "Ramp sources: " << c->ramp_spells << "\n";
+        out << "Card draw spells: " << c->card_draw_spells << "\n\n";
+        out << "Curve summary (bucket -> actual / target / Δ):\n";
+        for (const auto &entry : c->curve_actual_summary) {
+            int bucket = entry.first;
+            int actual = entry.second;
+            int target = c->curve_targets.count(bucket) ? c->curve_targets.at(bucket) : 0;
+            int delta = actual - target;
+            out << "  " << (bucket == 6 ? ">=6" : std::to_string(bucket)) << ": " << actual << " / " << target << " / " << (delta >= 0 ? "+" : "") << delta << "\n";
         }
-    }
-    out << "\nColor breakdown:\n";
-    for (auto &p : c->color_counts) out << "  " << p.first << ": " << p.second << "\n";
-    out.close();
-    std::cout << "Exported stats to " << fname << std::endl;
-    }), ectx);
-    g_signal_connect(close, "clicked", G_CALLBACK(+[](GtkButton* btn, gpointer user_data){
-        GtkWidget* dlg = GTK_WIDGET(user_data);
-        if (dlg) gtk_window_destroy(GTK_WINDOW(dlg));
-    }), dialog);
-
-    // Hook up the top buttons to swap the displayed surface. Use the heap-allocated
-    // ExportCtx as the callback user_data so we don't rely on stack memory.
-    g_signal_connect(btn_tot, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data){
-        ExportCtx* e = (ExportCtx*)user_data;
-        if (!e || !e->da) return;
-        g_object_set_data(G_OBJECT(e->da), "mana_surface", e->surf_total);
-        e->surf = e->surf_total;
-        gtk_widget_queue_draw(e->da);
-    }), ectx);
-    g_signal_connect(btn_type, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data){
-        ExportCtx* e = (ExportCtx*)user_data;
-        if (!e || !e->da) return;
-        g_object_set_data(G_OBJECT(e->da), "mana_surface", e->surf_type);
-        e->surf = e->surf_type;
-        gtk_widget_queue_draw(e->da);
-    }), ectx);
-    g_signal_connect(btn_color, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data){
-        ExportCtx* e = (ExportCtx*)user_data;
-        if (!e || !e->da) return;
-        g_object_set_data(G_OBJECT(e->da), "mana_surface", e->surf_color);
-        e->surf = e->surf_color;
-        gtk_widget_queue_draw(e->da);
-    }), ectx);
-
-    gtk_widget_show(dialog);
-    // cleanup when dialog is destroyed
-    g_signal_connect(dialog, "destroy", G_CALLBACK(+[](GtkWidget* w, gpointer user_data){
-        ExportCtx* c = (ExportCtx*)user_data;
-        if (c) {
-            if (c->surf_total) cairo_surface_destroy(c->surf_total);
-            if (c->surf_type) cairo_surface_destroy(c->surf_type);
-            if (c->surf_color) cairo_surface_destroy(c->surf_color);
-            delete c;
+        out << "\nDistribution detail:\n";
+        for (auto &p : c->buckets) out << "  " << p.first << ": " << p.second << "\n";
+        out << "\nPer-bucket card lists:\n";
+        for (auto &p : c->bucket_details) {
+            out << "Bucket " << p.first << ":\n";
+            for (auto &it : p.second) {
+                out << "    " << it.first << " x" << it.second << "\n";
+            }
         }
+        out << "\nColor identity breakdown:\n";
+        for (auto &p : c->color_counts) out << "  " << p.first << ": " << p.second << "\n";
+        out << "\nMana sources by color:\n";
+        auto get_or_zero_local = [](const std::map<std::string,int>& m, const std::string& key) {
+            auto it = m.find(key);
+            return it != m.end() ? it->second : 0;
+        };
+        std::set<std::string> export_colors;
+        for (auto &kv : c->color_sources) if (!kv.first.empty()) export_colors.insert(kv.first);
+        for (auto &kv : c->pip_counts) if (!kv.first.empty()) export_colors.insert(kv.first);
+        if (export_colors.empty()) export_colors.insert("C");
+        for (const auto &color : export_colors) {
+            int sources = get_or_zero_local(c->color_sources, color);
+            int needed = c->color_source_targets.count(color) ? c->color_source_targets.at(color) : 0;
+            int pips = get_or_zero_local(c->pip_counts, color);
+            double share_sources = c->land_cards > 0 ? (double)sources / (double)c->land_cards : 0.0;
+            double share_pips = c->total_pips > 0 ? (double)pips / c->total_pips : 0.0;
+            int share_delta = (int)std::round((share_sources - share_pips) * 100.0);
+            char share_buf[64];
+            std::snprintf(share_buf, sizeof(share_buf), "%.0f%% vs %.0f%% (Δ %s%d%%)", share_sources * 100.0, share_pips * 100.0, share_delta >= 0 ? "+" : "", share_delta);
+            out << "  " << color << ": sources " << sources << ", target " << needed << ", pips " << pips << ", " << share_buf << "\n";
+        }
+        out.close();
+        std::cout << "Exported stats to " << fname << std::endl;
     }), ectx);
-    if (pb) g_object_unref(pb);
+    g_signal_connect(close, "clicked", G_CALLBACK(on_stats_back_clicked), state);
+
+    g_signal_connect(btn_tot, "clicked", G_CALLBACK(on_stats_surface_total), ectx);
+    g_signal_connect(btn_type, "clicked", G_CALLBACK(on_stats_surface_type), ectx);
+    g_signal_connect(btn_color, "clicked", G_CALLBACK(on_stats_surface_color), ectx);
+
+    stats_set_surface(ectx, ectx->surf_total);
+    gtk_stack_set_visible_child_name(GTK_STACK(state->main_stack), "stats");
 }
 
 // Dialog per ricerca carta Scryfall
@@ -2816,7 +3390,8 @@ static std::vector<std::map<std::string, std::string>> load_cards_from_db(Databa
     std::vector<std::map<std::string, std::string>> cards;
     if (!db) return cards;
     // Build SQL and optional params for deck filtering
-    std::string sql = "SELECT id, english_name, localized_name, name, type, localized_type, colors, set_code, mana_cost, rarity, quantity, image_url, added_date, price_usd, foil, sideboard, deck_id FROM cards";
+    std::string oracle_select = g_cards_table_has_oracle_text ? "oracle_text" : "'' AS oracle_text";
+    std::string sql = "SELECT id, english_name, localized_name, name, type, localized_type, colors, set_code, mana_cost, " + oracle_select + ", rarity, quantity, image_url, added_date, price_usd, foil, sideboard, deck_id FROM cards";
     std::vector<std::string> params;
     if (deck_filter != -1) {
         sql += " WHERE deck_id = ?";
@@ -3489,7 +4064,7 @@ static bool remove_card_from_deck(AppState* state, int card_id, int to_remove) {
     if (to_remove <= 0) return false;
     // Fetch full row data
     std::map<std::string,std::string> crow;
-    if (!state->db->query("SELECT english_name, localized_name, type, localized_type, colors, set_code, mana_cost, rarity, image_url, price_usd, foil FROM cards WHERE id = ?", [&](const std::map<std::string,std::string>& r){ crow = r; }, std::vector<std::string>{std::to_string(card_id)})) {
+    if (!state->db->query("SELECT english_name, localized_name, type, localized_type, colors, set_code, mana_cost, rarity, image_url, price_usd, foil, oracle_text FROM cards WHERE id = ?", [&](const std::map<std::string,std::string>& r){ crow = r; }, std::vector<std::string>{std::to_string(card_id)})) {
         return false;
     }
     if (crow.empty()) return false;
@@ -3503,6 +4078,7 @@ static bool remove_card_from_deck(AppState* state, int card_id, int to_remove) {
     std::string rar = crow.count("rarity") ? crow["rarity"] : "";
     std::string img = crow.count("image_url") ? crow["image_url"] : "";
     std::string price = crow.count("price_usd") ? crow["price_usd"] : "";
+    std::string oracle = crow.count("oracle_text") ? crow["oracle_text"] : "";
     int foil = 0;
     if (crow.count("foil")) {
         try { foil = std::stoi(crow["foil"]); } catch(...) { foil = 0; }
@@ -3510,13 +4086,13 @@ static bool remove_card_from_deck(AppState* state, int card_id, int to_remove) {
 
     if (to_remove >= current_qty) {
         // Move entire row: insert into main (deck_id = -1) merged, then delete original
-    bool ok = state->db->insert_card(en, ln, ty, lty, cols, setc, mana, rar, current_qty, img, price, -1, foil);
+    bool ok = state->db->insert_card(en, ln, ty, lty, cols, setc, mana, rar, current_qty, img, price, oracle, -1, foil);
         if (!ok) return false;
         return state->db->delete_card(card_id);
     }
     // Partial remove: decrease original and insert into main deckless rows
     if (!state->db->update_quantity(card_id, current_qty - to_remove)) return false;
-    return state->db->insert_card(en, ln, ty, lty, cols, setc, mana, rar, to_remove, img, price, -1, foil);
+    return state->db->insert_card(en, ln, ty, lty, cols, setc, mana, rar, to_remove, img, price, oracle, -1, foil);
 }
 
 // Asynchronously prefetch thumbnails for the given page rows.
@@ -3569,7 +4145,7 @@ static bool add_card_to_deck(AppState* state, int card_id, int to_move, int targ
     if (!state->db->update_quantity(card_id, current_qty - to_move)) return false;
     // Fetch full row for insertion
     std::map<std::string,std::string> crow;
-    if (!state->db->query("SELECT english_name, localized_name, type, localized_type, colors, set_code, mana_cost, rarity, image_url, price_usd, foil FROM cards WHERE id = ?", [&](const std::map<std::string,std::string>& r){ crow = r; }, std::vector<std::string>{std::to_string(card_id)})) {
+    if (!state->db->query("SELECT english_name, localized_name, type, localized_type, colors, set_code, mana_cost, rarity, image_url, price_usd, foil, oracle_text FROM cards WHERE id = ?", [&](const std::map<std::string,std::string>& r){ crow = r; }, std::vector<std::string>{std::to_string(card_id)})) {
         return false;
     }
     if (crow.empty()) return false;
@@ -3583,12 +4159,13 @@ static bool add_card_to_deck(AppState* state, int card_id, int to_move, int targ
     std::string rar = crow.count("rarity") ? crow["rarity"] : "";
     std::string img = crow.count("image_url") ? crow["image_url"] : "";
     std::string price = crow.count("price_usd") ? crow["price_usd"] : "";
+    std::string oracle = crow.count("oracle_text") ? crow["oracle_text"] : "";
     int foil = 0;
     if (crow.count("foil")) {
         try { foil = std::stoi(crow["foil"]); } catch(...) { foil = 0; }
     }
     // Use Database::insert_card which will merge into existing identical card in the target deck
-    return state->db->insert_card(en, ln, ty, lty, cols, setc, mana, rar, to_move, img, price, target_deck_id, foil, sideboard);
+    return state->db->insert_card(en, ln, ty, lty, cols, setc, mana, rar, to_move, img, price, oracle, target_deck_id, foil, sideboard);
 }
 
 static void on_add_card_ok_clicked(GtkButton *button, gpointer user_data) {
@@ -3641,7 +4218,7 @@ static void on_add_card_ok_clicked(GtkButton *button, gpointer user_data) {
                 g_object_get(G_OBJECT(ctx->foil_checkbox), "active", &f, NULL);
                 foil = f ? 1 : 0;
             }
-            bool success = state->db->insert_card(card.english_name, card.localized_name, card.type, card.localized_type, card.colors, card.set_name, card.mana_cost, card.rarity, quantity, card.image_url, card.price_usd, -1, foil);
+            bool success = state->db->insert_card(card.english_name, card.localized_name, card.type, card.localized_type, card.colors, card.set_name, card.mana_cost, card.rarity, quantity, card.image_url, card.price_usd, card.oracle_text, -1, foil);
             std::cout << "Inserted card: " << card.english_name << " in set " << card.set_name << " qty " << quantity << " success: " << success << std::endl;
             if (success) {
                 refresh_card_list(state);
@@ -3805,7 +4382,7 @@ static void on_add_card_ok_clicked(GtkButton *button, gpointer user_data) {
                     g_object_get(G_OBJECT(sctx->original_ctx->foil_checkbox), "active", &f, NULL);
                     foil = f ? 1 : 0;
                 }
-                bool success = sctx->state->db->insert_card(card.english_name, card.localized_name, card.type, card.localized_type, card.colors, card.set_name, card.mana_cost, card.rarity, sctx->quantity, card.image_url, card.price_usd, -1, foil);
+                bool success = sctx->state->db->insert_card(card.english_name, card.localized_name, card.type, card.localized_type, card.colors, card.set_name, card.mana_cost, card.rarity, sctx->quantity, card.image_url, card.price_usd, card.oracle_text, -1, foil);
                 std::cout << "Inserted card: " << card.english_name << " in set " << card.set_name << " qty " << sctx->quantity << " success: " << success << std::endl;
                 if (success) {
                     refresh_card_list(sctx->state);
@@ -3952,9 +4529,10 @@ static void on_add_card_clicked(GtkButton *button, gpointer user_data) {
             if (state->db) delete state->db;
             state->db = new Database(db_path);
             state->db_path = db_path;
+            update_cards_schema_flags(state);
             gtk_label_set_text(GTK_LABEL(state->db_name_label), db_path.c_str());
                     Database db(db_path);
-                    db.execute("CREATE TABLE IF NOT EXISTS cards (id INTEGER PRIMARY KEY, name TEXT, type TEXT, colors TEXT, set_code TEXT, mana_cost TEXT, rarity TEXT, quantity INTEGER, image_url TEXT, added_date TEXT, price_usd TEXT, foil INTEGER DEFAULT 0)");
+                    db.execute("CREATE TABLE IF NOT EXISTS cards (id INTEGER PRIMARY KEY, name TEXT, type TEXT, colors TEXT, set_code TEXT, mana_cost TEXT, rarity TEXT, quantity INTEGER, image_url TEXT, added_date TEXT, price_usd TEXT, foil INTEGER DEFAULT 0, oracle_text TEXT)");
             std::ofstream lastdb("lastdb.txt");
             lastdb << db_path << std::endl;
             refresh_card_list(state);
@@ -4014,6 +4592,7 @@ static void on_add_card_clicked(GtkButton *button, gpointer user_data) {
                     if (ctx->state->db) delete ctx->state->db;
                     ctx->state->db = new Database(db_path);
                     ctx->state->db_path = db_path;
+                    update_cards_schema_flags(ctx->state);
                     gtk_label_set_text(GTK_LABEL(ctx->state->db_name_label), db_path);
                     std::ofstream lastdb("lastdb.txt");
                     lastdb << db_path << std::endl;
@@ -4177,6 +4756,7 @@ static void on_new_db_ok_clicked(GtkButton *button, gpointer user_data) {
             if (state->db) delete state->db;
             state->db = new Database(db_path);
             state->db_path = db_path;
+            update_cards_schema_flags(state);
             gtk_label_set_text(GTK_LABEL(state->db_name_label), db_path.c_str());
             // Salva percorso su file
             std::ofstream lastdb("lastdb.txt");
@@ -4185,7 +4765,7 @@ static void on_new_db_ok_clicked(GtkButton *button, gpointer user_data) {
             populate_deck_menu(state);
         }
     Database db(db_path);
-    db.execute("CREATE TABLE IF NOT EXISTS cards (id INTEGER PRIMARY KEY, name TEXT, type TEXT, colors TEXT, set_code TEXT, mana_cost TEXT, rarity TEXT, quantity INTEGER, image_url TEXT, added_date TEXT, price_usd TEXT, foil INTEGER DEFAULT 0)");
+    db.execute("CREATE TABLE IF NOT EXISTS cards (id INTEGER PRIMARY KEY, name TEXT, type TEXT, colors TEXT, set_code TEXT, mana_cost TEXT, rarity TEXT, quantity INTEGER, image_url TEXT, added_date TEXT, price_usd TEXT, foil INTEGER DEFAULT 0, oracle_text TEXT)");
     }
     gtk_window_destroy(GTK_WINDOW(widgets->dialog));
     delete widgets;
@@ -6000,6 +6580,14 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     state->deck_delete_button = NULL;
     state->db_button = NULL;
     state->search_debounce_id = 0;
+    state->main_window = window;
+    state->main_stack = NULL;
+    state->cards_page = NULL;
+    state->stats_page = NULL;
+    state->stats_container = NULL;
+    state->stats_placeholder = NULL;
+    state->stats_ctx = NULL;
+    state->has_oracle_text_column = false;
     state->filter_colors.clear();
     state->filter_rarities.clear();
     state->filter_types.clear();
@@ -6046,7 +6634,7 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
                 }
             }
             if (found) {
-                bool success = state->db->update_card_info(std::stoi(row.at("id")), found->english_name, found->localized_name, found->type, found->localized_type, found->colors, found->mana_cost, found->rarity, found->image_url, found->price_usd);
+                bool success = state->db->update_card_info(std::stoi(row.at("id")), found->english_name, found->localized_name, found->type, found->localized_type, found->colors, found->mana_cost, found->rarity, found->image_url, found->price_usd, found->oracle_text);
                 if (success) updated++;
                 std::cout << "Updated card " << search_name << " success: " << success << std::endl;
             } else {
@@ -6742,8 +7330,10 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     // Layout
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
 
-    // Scrolled window con tabella
-    gtk_box_append(GTK_BOX(vbox), scrolled_window);
+    GtkWidget *cards_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_set_hexpand(cards_page, TRUE);
+    gtk_widget_set_vexpand(cards_page, TRUE);
+    gtk_box_append(GTK_BOX(cards_page), scrolled_window);
 
     // Box inferiore: nome database e totale carte
     GtkWidget *bottom_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
@@ -6799,9 +7389,40 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     g_signal_connect(next_btn, "clicked", G_CALLBACK(on_next_page_clicked), window);
     g_signal_connect(ps_combo, "changed", G_CALLBACK(on_page_size_changed), window);
     g_signal_connect(all_toggle, "toggled", G_CALLBACK(on_view_all_toggled), window);
+    gtk_box_append(GTK_BOX(cards_page), bottom_box);
 
-    gtk_box_append(GTK_BOX(vbox), bottom_box);
+    GtkWidget *stats_container = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+    gtk_widget_set_margin_top(stats_container, 16);
+    gtk_widget_set_margin_bottom(stats_container, 32);
+    gtk_widget_set_margin_start(stats_container, 24);
+    gtk_widget_set_margin_end(stats_container, 24);
+    gtk_widget_set_hexpand(stats_container, TRUE);
+    gtk_widget_set_vexpand(stats_container, TRUE);
+    gtk_widget_add_css_class(stats_container, "stats-root");
+
+    GtkWidget *stats_scroller = gtk_scrolled_window_new();
+    gtk_widget_set_hexpand(stats_scroller, TRUE);
+    gtk_widget_set_vexpand(stats_scroller, TRUE);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(stats_scroller), stats_container);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(stats_scroller), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+
+    GtkWidget *stack = gtk_stack_new();
+    gtk_widget_set_hexpand(stack, TRUE);
+    gtk_widget_set_vexpand(stack, TRUE);
+    gtk_stack_set_transition_type(GTK_STACK(stack), GTK_STACK_TRANSITION_TYPE_SLIDE_LEFT_RIGHT);
+    gtk_stack_set_transition_duration(GTK_STACK(stack), 250);
+    gtk_stack_add_named(GTK_STACK(stack), cards_page, "cards");
+    gtk_stack_add_named(GTK_STACK(stack), stats_scroller, "stats");
+    gtk_stack_set_visible_child_name(GTK_STACK(stack), "cards");
+
+    gtk_box_append(GTK_BOX(vbox), stack);
     gtk_window_set_child(GTK_WINDOW(window), vbox);
+
+    state->main_stack = stack;
+    state->cards_page = cards_page;
+    state->stats_page = stats_scroller;
+    state->stats_container = stats_container;
+    stats_clear(state, true);
     // Salva lo stato globale nella finestra principale
     g_object_set_data(G_OBJECT(window), "app_state", state);
 
@@ -6839,6 +7460,7 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
                     if (state->db) delete state->db;
                     state->db = new Database(filename);
                     state->db_path = filename;
+                    update_cards_schema_flags(state);
                     gtk_label_set_text(GTK_LABEL(state->db_name_label), filename);
                     // Salva percorso su file
                     std::ofstream lastdb("lastdb.txt");
@@ -7138,6 +7760,7 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
             if (state->db) delete state->db;
             state->db = new Database(path);
             state->db_path = path;
+            update_cards_schema_flags(state);
             gtk_label_set_text(GTK_LABEL(state->db_name_label), path.c_str());
             refresh_card_list(state);
             // Ensure the deck submenu is up-to-date when loading the last used DB at startup
