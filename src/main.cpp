@@ -22,6 +22,7 @@
 #include <chrono>
 #include <cstring>
 #include <cstdio>
+#include <algorithm>
 
 // Forward declarations to allow scheduling helpers to be referenced before their definitions.
 struct AppState;
@@ -1115,8 +1116,8 @@ static bool export_cards_to_txt(AppState* state, bool deck, int deck_id, const s
         auto write_tsv_header = [](std::ofstream &f){ f << "name\ttype\tcolors\tset_code\tmana_cost\trarity\tquantity\tprice_usd\tfoil\n"; };
         auto write_csv_header = [](std::ofstream &f){ f << "name,type,colors,set_code,mana_cost,rarity,quantity,price_usd,foil\n"; };
         if (format == "bilingual" || format == "tsv_en" || format == "tsv_it") {
-            out_en << "name\ttype\tcolors\tset_code\tmana_cost\trarity\tquantity\tprice_usd\tfoil\n";
-            out_it << "name\ttype\tcolors\tset_code\tmana_cost\trarity\tquantity\tprice_usd\tfoil\n";
+            write_tsv_header(out_en);
+            write_tsv_header(out_it);
         }
         if (format == "csv_en" || format == "csv_it") {
             // we'll write CSVs down below as needed
@@ -1746,17 +1747,22 @@ static void sort_card_list(AppState* state, const char* column, bool asc) {
 
 // Draw mana histogram onto a cairo surface
 static void draw_mana_on_cairo(cairo_t* cr, int width, int height, const std::map<int,int>& counts, int total_cards, int cap_bucket) {
-    // background
-    cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
+    cairo_pattern_t* bg = cairo_pattern_create_linear(0, 0, 0, height);
+    cairo_pattern_add_color_stop_rgba(bg, 0.0, 0.07, 0.08, 0.12, 1.0);
+    cairo_pattern_add_color_stop_rgba(bg, 1.0, 0.04, 0.05, 0.09, 1.0);
+    cairo_set_source(cr, bg);
     cairo_paint(cr);
+    cairo_pattern_destroy(bg);
 
-    // layout
+    const double accent_r = 0.54;
+    const double accent_g = 0.43;
+    const double accent_b = 1.00;
+
     const int margin = 48;
     int w = width - margin*2;
     int h = height - margin*2;
     int buckets = cap_bucket + 1;
 
-    // gather values for each bucket index 0..cap_bucket
     std::vector<double> vals(buckets, 0.0);
     int maxc = 1;
     int total = 0;
@@ -1766,17 +1772,15 @@ static void draw_mana_on_cairo(cairo_t* cr, int width, int height, const std::ma
         if ((int)vals[i] > maxc) maxc = (int)vals[i];
         total += (int)vals[i];
     }
-    if (total_cards > 0) total = total_cards; // prefer provided total when available
+    if (total_cards > 0) total = total_cards;
 
-    // margins for drawing area
     double left = margin;
     double top = margin;
     double right = margin + w;
     double bottom = margin + h;
 
-    // draw light horizontal grid
     cairo_set_line_width(cr, 1.0);
-    cairo_set_source_rgba(cr, 0.85, 0.85, 0.85, 1.0);
+    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.06);
     int y_steps = 4;
     for (int s=0;s<=y_steps;++s) {
         double yy = top + (h * (double)s / (double)y_steps);
@@ -1785,66 +1789,65 @@ static void draw_mana_on_cairo(cairo_t* cr, int width, int height, const std::ma
         cairo_stroke(cr);
     }
 
-    // axes
-    cairo_set_source_rgb(cr, 0.1, 0.1, 0.1);
+    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.25);
     cairo_set_line_width(cr, 2.0);
     cairo_move_to(cr, left, top);
     cairo_line_to(cr, left, bottom);
     cairo_line_to(cr, right, bottom);
     cairo_stroke(cr);
 
-    // compute x positions
     std::vector<double> xs(buckets, 0.0), ys(buckets, 0.0);
     for (int i=0;i<buckets;++i) {
         double x = left + (w * ((i + 0.0) / (double)(buckets - 1 < 1 ? 1 : buckets - 1)));
         xs[i] = x;
         double v = vals[i];
         double y = bottom;
-        if (maxc > 0) y = bottom - ( (h - 20) * (v / (double)maxc) );
+        if (maxc > 0) y = bottom - ((h - 24) * (v / (double)maxc));
         ys[i] = y;
     }
 
-    // filled area under curve (subtle)
+    cairo_new_path(cr);
     cairo_move_to(cr, xs[0], bottom);
     for (int i=0;i<buckets;++i) cairo_line_to(cr, xs[i], ys[i]);
     cairo_line_to(cr, xs.back(), bottom);
     cairo_close_path(cr);
-    cairo_set_source_rgba(cr, 0.2, 0.6, 0.9, 0.12);
+    cairo_pattern_t* fill = cairo_pattern_create_linear(0, top, 0, bottom);
+    cairo_pattern_add_color_stop_rgba(fill, 0.0, accent_r, accent_g, accent_b, 0.32);
+    cairo_pattern_add_color_stop_rgba(fill, 1.0, accent_r, accent_g, accent_b, 0.08);
+    cairo_set_source(cr, fill);
     cairo_fill(cr);
+    cairo_pattern_destroy(fill);
 
-    // polyline
-    cairo_set_source_rgb(cr, 0.08, 0.44, 0.85);
-    cairo_set_line_width(cr, 2.5);
+    cairo_new_path(cr);
+    cairo_set_source_rgb(cr, accent_r, accent_g, accent_b);
+    cairo_set_line_width(cr, 2.8);
     cairo_move_to(cr, xs[0], ys[0]);
     for (int i=1;i<buckets;++i) cairo_line_to(cr, xs[i], ys[i]);
     cairo_stroke(cr);
 
-    // points
     for (int i=0;i<buckets;++i) {
         double x = xs[i];
         double y = ys[i];
         cairo_arc(cr, x, y, 5.0, 0, 2*M_PI);
-        cairo_set_source_rgb(cr, 1,1,1);
+        cairo_set_source_rgba(cr, 0.06, 0.08, 0.12, 1.0);
         cairo_fill_preserve(cr);
-        cairo_set_source_rgb(cr, 0.08, 0.44, 0.85);
+        cairo_set_source_rgb(cr, accent_r, accent_g, accent_b);
         cairo_set_line_width(cr, 1.5);
         cairo_stroke(cr);
-        // small label for value above point if non-zero
         if (vals[i] > 0.5) {
             char tb[32]; snprintf(tb, sizeof(tb), "%d", (int)vals[i]);
-            cairo_set_source_rgb(cr, 0.1,0.1,0.1);
-            cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+            cairo_set_source_rgba(cr, 0.88, 0.92, 1.0, 0.9);
+            cairo_select_font_face(cr, "Inter", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
             cairo_set_font_size(cr, 11.0);
             cairo_text_extents_t ext;
             cairo_text_extents(cr, tb, &ext);
-            cairo_move_to(cr, x - ext.width/2.0, y - 8);
+            cairo_move_to(cr, x - ext.width/2.0, y - 10);
             cairo_show_text(cr, tb);
         }
     }
 
-    // x labels
-    cairo_set_source_rgb(cr, 0.1,0.1,0.1);
-    cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_source_rgba(cr, 0.88, 0.92, 1.0, 0.85);
+    cairo_select_font_face(cr, "Inter", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
     cairo_set_font_size(cr, 12.0);
     for (int i=0;i<buckets;++i) {
         char lbl[32];
@@ -1853,12 +1856,11 @@ static void draw_mana_on_cairo(cairo_t* cr, int width, int height, const std::ma
         cairo_text_extents_t ext;
         cairo_text_extents(cr, lbl, &ext);
         double lx = xs[i] - ext.width/2.0 - ext.x_bearing;
-        double ly = bottom + 18;
+        double ly = bottom + 20;
         cairo_move_to(cr, lx, ly);
         cairo_show_text(cr, lbl);
     }
 
-    // y axis ticks and labels
     cairo_set_font_size(cr, 11.0);
     for (int s=0;s<=y_steps;++s) {
         double frac = (double)(y_steps - s) / (double)y_steps;
@@ -1867,15 +1869,14 @@ static void draw_mana_on_cairo(cairo_t* cr, int width, int height, const std::ma
         cairo_text_extents_t ext;
         cairo_text_extents(cr, lb, &ext);
         double yy = top + (h * (double)s / (double)y_steps);
-        double lx = left - 8 - ext.width;
+        double lx = left - 10 - ext.width;
         double ly = yy + ext.height/2.0;
         cairo_move_to(cr, lx, ly);
         cairo_show_text(cr, lb);
     }
 
-    // title
-    cairo_set_source_rgb(cr, 0.05, 0.05, 0.05);
-    cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+    cairo_set_source_rgba(cr, 0.9, 0.95, 1.0, 0.92);
+    cairo_select_font_face(cr, "Inter", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
     cairo_set_font_size(cr, 18.0);
     cairo_move_to(cr, left, margin/2);
     cairo_show_text(cr, "Curva Mana");
@@ -1893,21 +1894,26 @@ static cairo_surface_t* create_mana_surface(const std::map<int,int>& counts, int
 
 // Draw multiple series (label -> bucket->count) onto cairo surface with legend
 static void draw_mana_multi_on_cairo(cairo_t* cr, int width, int height, const std::map<std::string, std::map<int,int>>& series, int cap_bucket) {
-    // background
-    cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
+    cairo_pattern_t* bg = cairo_pattern_create_linear(0, 0, 0, height);
+    cairo_pattern_add_color_stop_rgba(bg, 0.0, 0.07, 0.08, 0.12, 1.0);
+    cairo_pattern_add_color_stop_rgba(bg, 0.5, 0.06, 0.07, 0.11, 1.0);
+    cairo_pattern_add_color_stop_rgba(bg, 1.0, 0.04, 0.05, 0.09, 1.0);
+    cairo_set_source(cr, bg);
     cairo_paint(cr);
+    cairo_pattern_destroy(bg);
+
     const int margin = 48;
     int w = width - margin*2;
     int h = height - margin*2;
     int buckets = cap_bucket + 1;
-    // compute global max
+
     int maxc = 1;
     for (auto &s : series) for (auto &p : s.second) if (p.second > maxc) maxc = p.second;
-    // layout
+
     double left = margin, top = margin, right = margin + w, bottom = margin + h;
-    // grid
+
     cairo_set_line_width(cr, 1.0);
-    cairo_set_source_rgba(cr, 0.92, 0.92, 0.92, 1.0);
+    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.06);
     int y_steps = 4;
     for (int s=0;s<=y_steps;++s) {
         double yy = top + (h * (double)s / (double)y_steps);
@@ -1915,25 +1921,22 @@ static void draw_mana_multi_on_cairo(cairo_t* cr, int width, int height, const s
         cairo_line_to(cr, right, yy);
         cairo_stroke(cr);
     }
-    // axes
-    cairo_set_source_rgb(cr, 0.12,0.12,0.12);
+
+    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.25);
     cairo_set_line_width(cr, 2.0);
     cairo_move_to(cr, left, top);
     cairo_line_to(cr, left, bottom);
     cairo_line_to(cr, right, bottom);
     cairo_stroke(cr);
 
-    // predefined palette
     std::vector<std::array<double,3>> palette = {
-        {0.08,0.44,0.85}, {0.9,0.33,0.23}, {0.2,0.7,0.2}, {0.65,0.2,0.7}, {0.95,0.7,0.2}, {0.2,0.7,0.8}, {0.6,0.6,0.6}
+        {0.54,0.43,1.00}, {0.96,0.44,0.75}, {0.31,0.79,0.99}, {0.49,0.92,0.61}, {0.99,0.76,0.43}, {0.48,0.66,1.00}, {0.78,0.78,0.90}
     };
 
-    // for each series, compute xs, ys and draw
     int si = 0;
-    double legend_x = right - 150;
-    double legend_y = top + 8;
+    double legend_x = right - 180;
+    double legend_y = top + 12;
     for (auto &s : series) {
-        // compute points
         std::vector<double> xs(buckets), ys(buckets);
         for (int i=0;i<buckets;++i) {
             double x = left + (w * ((i + 0.0) / (double)(buckets - 1 < 1 ? 1 : buckets - 1)));
@@ -1942,66 +1945,86 @@ static void draw_mana_multi_on_cairo(cairo_t* cr, int width, int height, const s
             auto it = s.second.find(i);
             if (it != s.second.end()) v = it->second;
             double y = bottom;
-            if (maxc > 0) y = bottom - ( (h - 20) * (v / (double)maxc) );
+            if (maxc > 0) y = bottom - ((h - 24) * (v / (double)maxc));
             ys[i] = y;
         }
-        // determine color for this series. For color plots prefer mana colors.
+
         std::array<double,3> col = palette[si % palette.size()];
-        bool use_dash = false;
         std::string key = s.first;
-        if (key == "W" || key == "White" || key == "Bianco") {
-            // white -> grey dashed
-            col = {0.65, 0.65, 0.65};
-            use_dash = true;
-        } else if (key == "U" || key == "Blue" || key == "Blu") {
-            col = {0.08,0.44,0.85};
-        } else if (key == "B" || key == "Black" || key == "Nero") {
-            col = {0.06,0.06,0.06};
-        } else if (key == "R" || key == "Red" || key == "Rosso") {
-            col = {0.9,0.33,0.23};
-        } else if (key == "G" || key == "Green" || key == "Verde") {
-            col = {0.2,0.7,0.2};
-        } else if (key == "C" || key == "Colorless" || key == "Incolore") {
-            // incolore (colorless) -> magenta
-            col = {0.9, 0.0, 0.6};
+        bool dashed = false;
+        auto lower_key = key; std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(), ::tolower);
+        if (lower_key == "w" || lower_key.find("white") != std::string::npos || lower_key.find("bianco") != std::string::npos) {
+            col = {0.88,0.88,0.86};
+            dashed = true;
+        } else if (lower_key == "u" || lower_key.find("blue") != std::string::npos || lower_key.find("blu") != std::string::npos) {
+            col = {0.31,0.79,0.99};
+        } else if (lower_key == "b" || lower_key.find("black") != std::string::npos || lower_key.find("nero") != std::string::npos) {
+            col = {0.16,0.16,0.18};
+        } else if (lower_key == "r" || lower_key.find("red") != std::string::npos || lower_key.find("rosso") != std::string::npos) {
+            col = {0.96,0.44,0.30};
+        } else if (lower_key == "g" || lower_key.find("green") != std::string::npos || lower_key.find("verde") != std::string::npos) {
+            col = {0.49,0.92,0.61};
+        } else if (lower_key == "c" || lower_key.find("colorless") != std::string::npos || lower_key.find("incolore") != std::string::npos) {
+            col = {0.90,0.52,0.98};
         }
-        // polyline
+
+        cairo_new_path(cr);
+        cairo_move_to(cr, xs[0], bottom);
+        for (int i=0;i<buckets;++i) cairo_line_to(cr, xs[i], ys[i]);
+        cairo_line_to(cr, xs.back(), bottom);
+        cairo_close_path(cr);
+        cairo_pattern_t* fill = cairo_pattern_create_linear(0, top, 0, bottom);
+        cairo_pattern_add_color_stop_rgba(fill, 0.0, col[0], col[1], col[2], 0.24);
+        cairo_pattern_add_color_stop_rgba(fill, 1.0, col[0], col[1], col[2], 0.04);
+        cairo_set_source(cr, fill);
+        cairo_fill(cr);
+        cairo_pattern_destroy(fill);
+
+        cairo_new_path(cr);
         cairo_set_source_rgb(cr, col[0], col[1], col[2]);
-        cairo_set_line_width(cr, 2.5);
-        if (use_dash) {
+        cairo_set_line_width(cr, 2.6);
+        if (dashed) {
             double dashes[] = {6.0,6.0};
             cairo_set_dash(cr, dashes, 2, 0);
         }
         cairo_move_to(cr, xs[0], ys[0]);
         for (int i=1;i<buckets;++i) cairo_line_to(cr, xs[i], ys[i]);
         cairo_stroke(cr);
-        if (use_dash) cairo_set_dash(cr, NULL, 0, 0);
-        // points
+        if (dashed) cairo_set_dash(cr, NULL, 0, 0);
+
         for (int i=0;i<buckets;++i) {
             cairo_arc(cr, xs[i], ys[i], 4.0, 0, 2*M_PI);
-            cairo_set_source_rgb(cr, 1,1,1);
+            cairo_set_source_rgba(cr, 0.06,0.08,0.12,1.0);
             cairo_fill_preserve(cr);
             cairo_set_source_rgb(cr, col[0], col[1], col[2]);
-            cairo_set_line_width(cr, 1.5);
+            cairo_set_line_width(cr, 1.4);
             cairo_stroke(cr);
         }
-        // legend
+
         double lx = legend_x;
-        double ly = legend_y + si*20;
-        cairo_rectangle(cr, lx, ly-8, 12, 12);
+        double ly = legend_y + si*24;
+        cairo_save(cr);
+        cairo_translate(cr, lx, ly);
+        cairo_new_path(cr);
+        cairo_arc(cr, 8, -2, 6, M_PI/2, 3*M_PI/2);
+        cairo_arc(cr, 28, -2, 6, 3*M_PI/2, M_PI/2);
+        cairo_close_path(cr);
+        cairo_set_source_rgba(cr, col[0], col[1], col[2], 0.18);
+        cairo_fill_preserve(cr);
         cairo_set_source_rgb(cr, col[0], col[1], col[2]);
-        cairo_fill(cr);
-        cairo_set_source_rgb(cr, 0.05,0.05,0.05);
-        cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+        cairo_set_line_width(cr, 1.2);
+        cairo_stroke(cr);
+        cairo_restore(cr);
+    cairo_set_source_rgba(cr, 0.9, 0.95, 1.0, 0.9);
+    cairo_select_font_face(cr, "Inter", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
         cairo_set_font_size(cr, 12.0);
-        cairo_move_to(cr, lx + 18, ly + 2);
+        cairo_move_to(cr, lx + 30, ly + 2);
         cairo_show_text(cr, s.first.c_str());
         si++;
     }
 
-    // x labels
-    cairo_set_source_rgb(cr, 0.12,0.12,0.12);
-    cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_source_rgba(cr, 0.88, 0.92, 1.0, 0.85);
+    cairo_select_font_face(cr, "Inter", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
     cairo_set_font_size(cr, 12.0);
     for (int i=0;i<buckets;++i) {
         char lbl[32];
@@ -2010,12 +2033,11 @@ static void draw_mana_multi_on_cairo(cairo_t* cr, int width, int height, const s
         cairo_text_extents_t ext;
         cairo_text_extents(cr, lbl, &ext);
         double lx = left + (w * ((i + 0.0) / (double)(buckets - 1 < 1 ? 1 : buckets - 1))) - ext.width/2.0 - ext.x_bearing;
-        double ly = bottom + 18;
+        double ly = bottom + 20;
         cairo_move_to(cr, lx, ly);
         cairo_show_text(cr, lbl);
     }
 
-    // y axis ticks and labels (match draw_mana_on_cairo behavior)
     cairo_set_font_size(cr, 11.0);
     for (int s=0;s<=y_steps;++s) {
         double frac = (double)(y_steps - s) / (double)y_steps;
@@ -2024,15 +2046,14 @@ static void draw_mana_multi_on_cairo(cairo_t* cr, int width, int height, const s
         cairo_text_extents_t ext;
         cairo_text_extents(cr, lb, &ext);
         double yy = top + (h * (double)s / (double)y_steps);
-        double lx = left - 8 - ext.width;
+        double lx = left - 10 - ext.width;
         double ly = yy + ext.height/2.0;
         cairo_move_to(cr, lx, ly);
         cairo_show_text(cr, lb);
     }
 
-    // title
-    cairo_set_source_rgb(cr, 0.05, 0.05, 0.05);
-    cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+    cairo_set_source_rgba(cr, 0.9, 0.95, 1.0, 0.92);
+    cairo_select_font_face(cr, "Inter", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
     cairo_set_font_size(cr, 18.0);
     cairo_move_to(cr, left, margin/2);
     cairo_show_text(cr, "Curva Mana");
@@ -2085,6 +2106,105 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
     // detailed info per bucket: cost -> list of (name, qty)
     std::map<int, std::vector<std::pair<std::string,int>>> bucket_details;
     std::map<std::string,int> color_counts;
+    std::map<std::string,int> type_summary = {
+        {"Land",0}, {"Creature",0}, {"Instant",0}, {"Sorcery",0}, {"Enchantment",0}, {"Artifact",0}, {"Planeswalker",0}, {"Other",0}
+    };
+    int land_cards = 0;
+    int creature_cards = 0;
+    int non_creature_spells = 0;
+    double sum_all_cmc = 0.0;
+    double sum_non_land_cmc = 0.0;
+    int count_non_land_cards = 0;
+    double sum_creature_cmc = 0.0;
+    int count_creature_cards = 0;
+    double sum_non_creature_cmc = 0.0;
+    int count_non_creature_cards = 0;
+    auto accumulate_card_stats = [&](const std::string& type_val, int qty, int cost) {
+        std::string lower = type_val;
+        lower.reserve(type_val.size());
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        bool is_land = lower.find("land") != std::string::npos;
+        bool is_creature = lower.find("creature") != std::string::npos;
+        bool is_planeswalker = lower.find("planeswalker") != std::string::npos;
+        bool is_instant = lower.find("instant") != std::string::npos || lower.find("istantaneo") != std::string::npos;
+        bool is_sorcery = lower.find("sorcery") != std::string::npos || lower.find("stregoneria") != std::string::npos;
+        bool is_enchantment = lower.find("enchantment") != std::string::npos || lower.find("incantesimo") != std::string::npos;
+        bool is_artifact = lower.find("artifact") != std::string::npos || lower.find("artefatto") != std::string::npos;
+        bool assigned = false;
+
+        sum_all_cmc += cost * qty;
+
+        if (is_land) {
+            land_cards += qty;
+            type_summary["Land"] += qty;
+            return;
+        }
+
+        sum_non_land_cmc += cost * qty;
+        count_non_land_cards += qty;
+
+        if (is_creature) {
+            creature_cards += qty;
+            sum_creature_cmc += cost * qty;
+            count_creature_cards += qty;
+            type_summary["Creature"] += qty;
+            assigned = true;
+        } else {
+            non_creature_spells += qty;
+            sum_non_creature_cmc += cost * qty;
+            count_non_creature_cards += qty;
+        }
+
+        if (!assigned && is_planeswalker) {
+            type_summary["Planeswalker"] += qty;
+            assigned = true;
+        }
+        if (!assigned && is_instant) {
+            type_summary["Instant"] += qty;
+            assigned = true;
+        }
+        if (!assigned && is_sorcery) {
+            type_summary["Sorcery"] += qty;
+            assigned = true;
+        }
+        if (!assigned && is_enchantment) {
+            type_summary["Enchantment"] += qty;
+            assigned = true;
+        }
+        if (!assigned && is_artifact) {
+            type_summary["Artifact"] += qty;
+            assigned = true;
+        }
+        if (!assigned) {
+            type_summary["Other"] += qty;
+        }
+    };
+    auto register_color = [&](const std::string& raw, int qty) {
+        std::string norm;
+        norm.reserve(raw.size());
+        for (char ch : raw) {
+            if (!std::isspace((unsigned char)ch)) {
+                norm.push_back(std::toupper((unsigned char)ch));
+            }
+        }
+        if (norm.empty()) norm = "C";
+        if (norm == "WHITE" || norm == "BIANCO") norm = "W";
+        else if (norm == "BLUE" || norm == "BLU") norm = "U";
+        else if (norm == "BLACK" || norm == "NERO") norm = "B";
+        else if (norm == "RED" || norm == "ROSSO") norm = "R";
+        else if (norm == "GREEN" || norm == "VERDE") norm = "G";
+        else if (norm == "COLORLESS" || norm == "INCOLORE") norm = "C";
+        else if (norm == "AZORIUS") norm = "WU";
+        else if (norm == "DIMIR") norm = "UB";
+        else if (norm == "RAKDOS") norm = "BR";
+        else if (norm == "GRUUL") norm = "RG";
+        else if (norm == "SELESNYA") norm = "GW";
+        else if (norm.size() > 1 && norm != "WU" && norm != "UB" && norm != "BR" && norm != "RG" && norm != "GW") {
+            // fallback to first character for unknown multi-color strings
+            norm = std::string(1, norm[0]);
+        }
+        color_counts[norm] += qty;
+    };
     if (deck_id == -1) {
         // Build counts from the current filtered main view (use aggregated loader and apply UI filters)
         std::string filter = "";
@@ -2155,20 +2275,26 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
             else if (row.count("english_name") && !row.at("english_name").empty()) cname = row.at("english_name");
             else if (row.count("name")) cname = row.at("name");
             bucket_details[cost].push_back({cname, qty});
+            std::string ctype = row.count("type") ? row.at("type") : "";
+            if (row.count("localized_type") && !row.at("localized_type").empty()) {
+                if (!ctype.empty()) ctype += " ";
+                ctype += row.at("localized_type");
+            }
+            accumulate_card_stats(ctype, qty, cost);
             // colors
             std::string cols = row.count("colors") ? row.at("colors") : "";
             if (!cols.empty()) {
                 try {
                     auto j = nlohmann::json::parse(cols);
-                    if (j.is_array()) for (auto &c : j) color_counts[c.get<std::string>()] += qty;
+                    if (j.is_array()) for (auto &c : j) register_color(c.get<std::string>(), qty);
                 } catch(...) {
-                    for (char ch : cols) if (std::isalpha((unsigned char)ch)) color_counts[std::string(1,ch)] += qty;
+                    for (char ch : cols) if (std::isalpha((unsigned char)ch)) register_color(std::string(1,ch), qty);
                 }
             }
         }
     } else {
         // Query DB for mana_cost, name, quantity and colors in this deck
-        state->db->query("SELECT english_name, localized_name, name, mana_cost, quantity, colors FROM cards WHERE deck_id = ?", [&](const std::map<std::string,std::string>& row){
+        state->db->query("SELECT english_name, localized_name, name, localized_type, type, mana_cost, quantity, colors FROM cards WHERE deck_id = ?", [&](const std::map<std::string,std::string>& row){
             std::string mana = row.count("mana_cost") ? row.at("mana_cost") : "";
             int qty = 1;
             try { if (row.count("quantity") && !row.at("quantity").empty()) qty = std::stoi(row.at("quantity")); } catch(...) { qty = 1; }
@@ -2182,6 +2308,12 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
             else if (row.count("english_name") && !row.at("english_name").empty()) cname = row.at("english_name");
             else if (row.count("name")) cname = row.at("name");
             bucket_details[cost].push_back({cname, qty});
+            std::string ctype = row.count("type") ? row.at("type") : "";
+            if (row.count("localized_type") && !row.at("localized_type").empty()) {
+                if (!ctype.empty()) ctype += " ";
+                ctype += row.at("localized_type");
+            }
+            accumulate_card_stats(ctype, qty, cost);
             // colors parsing: either JSON array or compact codes
             std::string cols = row.count("colors") ? row.at("colors") : "";
             if (!cols.empty()) {
@@ -2189,16 +2321,14 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
                     auto j = nlohmann::json::parse(cols);
                     if (j.is_array()) {
                         for (auto &c : j) {
-                            std::string cc = c.get<std::string>();
-                            color_counts[cc] += qty;
+                            register_color(c.get<std::string>(), qty);
                         }
                     }
                 } catch(...) {
                     // fallback: treat as sequence of letters (e.g., WUBRG or "WU")
                     for (char ch : cols) {
                         if (std::isalpha((unsigned char)ch)) {
-                            std::string s(1, ch);
-                            color_counts[s] += qty;
+                            register_color(std::string(1, ch), qty);
                         }
                     }
                 }
@@ -5314,7 +5444,7 @@ static void name_factory_setup_cb(GtkListItemFactory *factory, GtkListItem *item
     gtk_box_append(GTK_BOX(detail_box), picture);
     /* Small Remove button just to the right of the image */
     GtkWidget *remove_btn = gtk_button_new_with_label(translate("Rimuovi").c_str());
-    gtk_widget_add_css_class(remove_btn, "danger");
+    gtk_widget_add_css_class(remove_btn, "danger-button");
     gtk_widget_add_css_class(remove_btn, "compact-button");
     gtk_widget_set_size_request(remove_btn, 92, -1);
     gtk_widget_set_valign(remove_btn, GTK_ALIGN_START);
@@ -5667,6 +5797,14 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         "    background-color: rgba(255,64,115,0.18);\n"
         "    border-color: rgba(255,128,151,0.6);\n"
         "}\n"
+    ".compact-button {\n"
+    "    padding: 2px 10px;\n"
+    "    min-height: 22px;\n"
+    "    font-size: 12px;\n"
+    "}\n"
+    ".compact-button:hover {\n"
+    "    background-color: rgba(255,255,255,0.06);\n"
+    "}\n"
         "headerbar entry,\n"
         "entry,\n"
         "spinbutton {\n"
@@ -5727,6 +5865,13 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         "columnview row:selected label {\n"
         "    color: @text_primary;\n"
         "}\n"
+    ".db-row {\n"
+    "    padding: 4px 0;\n"
+    "    border-radius: 10px;\n"
+    "}\n"
+    ".db-row:hover {\n"
+    "    background-color: rgba(138,108,255,0.12);\n"
+    "}\n"
         "scrolledwindow.card-scroller {\n"
         "    border-radius: 12px;\n"
         "    box-shadow: 0 18px 40px rgba(5,10,20,0.55);\n"
@@ -5734,7 +5879,18 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         "    border: 1px solid rgba(255,255,255,0.05);\n"
         "}\n"
         "label { color: @text_primary; }\n"
+    ".name-label { font-weight: 600; letter-spacing: 0.2px; color: @text_primary; }\n"
+    ".meta-label { font-size: 12px; color: @text_muted; }\n"
         "label.muted { color: @text_muted; }\n"
+    ".detail-panel {\n"
+    "    background-color: rgba(14,20,32,0.92);\n"
+    "    border: 1px solid rgba(138,108,255,0.18);\n"
+    "    border-radius: 12px;\n"
+    "    box-shadow: inset 0 0 0 1px rgba(0,0,0,0.35), 0 14px 28px rgba(6,10,18,0.55);\n"
+    "}\n"
+    ".detail-title { font-size: 15px; font-weight: 600; color: @text_primary; }\n"
+    ".detail-meta { font-size: 12px; color: @text_muted; }\n"
+    ".detail-text { font-size: 12px; line-height: 1.4; color: @text_primary; opacity: 0.88; }\n"
         ".stat-label { color: @accent_primary; font-weight: 600; }\n"
         ".foil { color: #ffd977; text-shadow: 0 0 4px rgba(255,217,119,0.42); }\n"
         "menu,\n"
@@ -5746,11 +5902,16 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         "menuitem,\n"
         "popover modelbutton {\n"
         "    padding: 6px 12px;\n"
+    "    border-radius: 6px;\n"
         "}\n"
         "menuitem:hover,\n"
         "popover modelbutton:hover {\n"
         "    background-color: rgba(138,108,255,0.18);\n"
         "}\n"
+    "menuitem:selected,\n"
+    "popover modelbutton:selected {\n"
+    "    background-image: linear-gradient(135deg, rgba(138,108,255,0.28), rgba(61,201,255,0.22));\n"
+    "}\n"
         "checkbutton,\n"
         "radiobutton {\n"
         "    color: @text_primary;\n"
