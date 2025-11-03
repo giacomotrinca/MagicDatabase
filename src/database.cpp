@@ -14,9 +14,53 @@
 #include <sstream>
 #include <iomanip>
 
+namespace {
 
-#include "database.h"
-#include <iostream>
+bool cards_fts_exists(sqlite3* db) {
+    sqlite3_stmt* stmt = nullptr;
+    const char* query = "SELECT name FROM sqlite_master WHERE type='table' AND name='cards_fts'";
+    bool exists = false;
+    if (sqlite3_prepare_v2(db, query, -1, &stmt, nullptr) == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            exists = true;
+        }
+        sqlite3_finalize(stmt);
+    }
+    return exists;
+}
+
+void drop_cards_fts_triggers(sqlite3* db) {
+    sqlite3_exec(db, "DROP TRIGGER IF EXISTS trg_cards_ai; DROP TRIGGER IF EXISTS trg_cards_au; DROP TRIGGER IF EXISTS trg_cards_ad;", nullptr, nullptr, nullptr);
+}
+
+void create_cards_fts_triggers(sqlite3* db) {
+    if (!cards_fts_exists(db)) {
+        return;
+    }
+    const char* trig_ins =
+        "CREATE TRIGGER trg_cards_ai AFTER INSERT ON cards BEGIN "
+        "INSERT INTO cards_fts(rowid, name, type, mana_cost, rarity, set_code) VALUES (new.id, COALESCE(new.english_name, new.localized_name, new.name), new.type, new.mana_cost, new.rarity, new.set_code); "
+        "END;";
+    const char* trig_upd =
+        "CREATE TRIGGER trg_cards_au AFTER UPDATE ON cards BEGIN "
+        "INSERT INTO cards_fts(cards_fts, rowid) VALUES('delete', old.id); "
+        "INSERT INTO cards_fts(rowid, name, type, mana_cost, rarity, set_code) VALUES (new.id, COALESCE(new.english_name, new.localized_name, new.name), new.type, new.mana_cost, new.rarity, new.set_code); "
+        "END;";
+    const char* trig_del =
+        "CREATE TRIGGER trg_cards_ad AFTER DELETE ON cards BEGIN "
+        "INSERT INTO cards_fts(cards_fts, rowid) VALUES('delete', old.id); "
+        "END;";
+    sqlite3_exec(db, trig_ins, nullptr, nullptr, nullptr);
+    sqlite3_exec(db, trig_upd, nullptr, nullptr, nullptr);
+    sqlite3_exec(db, trig_del, nullptr, nullptr, nullptr);
+}
+
+void recreate_cards_fts_triggers(sqlite3* db) {
+    drop_cards_fts_triggers(db);
+    create_cards_fts_triggers(db);
+}
+
+}
 
 Database::Database(const std::string& db_path) : db(nullptr) {
     if (sqlite3_open(db_path.c_str(), &db) != SQLITE_OK) {
@@ -449,39 +493,7 @@ Database::Database(const std::string& db_path) : db(nullptr) {
                     sqlite3_finalize(s2);
                 }
                 if (has_fts2) {
-                    // Helper to check/create trigger
-                    auto ensure_trigger = [&](const char* trig_name, const char* trig_sql) {
-                        sqlite3_stmt* tchk = nullptr;
-                        std::string tchk_q = std::string("SELECT name FROM sqlite_master WHERE type='trigger' AND name='") + trig_name + "'";
-                        if (sqlite3_prepare_v2(db, tchk_q.c_str(), -1, &tchk, nullptr) == SQLITE_OK) {
-                            bool exists = false;
-                            if (sqlite3_step(tchk) == SQLITE_ROW) exists = true;
-                            sqlite3_finalize(tchk);
-                            if (!exists) {
-                                char* terr = nullptr;
-                                if (sqlite3_exec(db, trig_sql, nullptr, nullptr, &terr) != SQLITE_OK) {
-                                    if (terr) { std::cerr << "Warning creating trigger " << trig_name << ": " << terr << std::endl; sqlite3_free(terr); }
-                                }
-                            }
-                        }
-                    };
-
-                    const char* trig_ins =
-                        "CREATE TRIGGER trg_cards_ai AFTER INSERT ON cards BEGIN "
-                        "INSERT INTO cards_fts(rowid, name, type, mana_cost, rarity, set_code) VALUES (new.id, COALESCE(new.english_name, new.localized_name, new.name), new.type, new.mana_cost, new.rarity, new.set_code); "
-                        "END;";
-                    const char* trig_upd =
-                        "CREATE TRIGGER trg_cards_au AFTER UPDATE ON cards BEGIN "
-                        "DELETE FROM cards_fts WHERE rowid = old.id; "
-                        "INSERT INTO cards_fts(rowid, name, type, mana_cost, rarity, set_code) VALUES (new.id, COALESCE(new.english_name, new.localized_name, new.name), new.type, new.mana_cost, new.rarity, new.set_code); "
-                        "END;";
-                    const char* trig_del =
-                        "CREATE TRIGGER trg_cards_ad AFTER DELETE ON cards BEGIN "
-                        "DELETE FROM cards_fts WHERE rowid = old.id; "
-                        "END;";
-                    ensure_trigger("trg_cards_ai", trig_ins);
-                    ensure_trigger("trg_cards_au", trig_upd);
-                    ensure_trigger("trg_cards_ad", trig_del);
+                    recreate_cards_fts_triggers(db);
                 }
             } else {
                 sqlite3_finalize(stmt);
@@ -587,7 +599,7 @@ bool Database::insert_card(const std::string& english_name, const std::string& l
         // (e.g. "cannot DELETE from contentless fts5 table"). To avoid failing the
         // user's save operation, drop the FTS triggers temporarily, perform the
         // update, then recreate the triggers if the FTS table exists.
-        sqlite3_exec(db, "DROP TRIGGER IF EXISTS trg_cards_ai; DROP TRIGGER IF EXISTS trg_cards_au; DROP TRIGGER IF EXISTS trg_cards_ad;", nullptr, nullptr, nullptr);
+    drop_cards_fts_triggers(db);
         rc = sqlite3_step(update_stmt);
         sqlite3_finalize(update_stmt);
         if (rc != SQLITE_DONE) {
@@ -595,32 +607,7 @@ bool Database::insert_card(const std::string& english_name, const std::string& l
             return false;
         }
         std::cout << "Updated card " << english_name << " quantity to " << (existing_qty + quantity) << std::endl;
-        // Attempt to recreate lightweight FTS triggers (best-effort). If cards_fts
-        // exists, create the standard triggers to keep it in sync.
-        sqlite3_stmt* s2 = nullptr;
-        const char* q2 = "SELECT name FROM sqlite_master WHERE type='table' AND name='cards_fts'";
-        if (sqlite3_prepare_v2(db, q2, -1, &s2, nullptr) == SQLITE_OK) {
-            if (sqlite3_step(s2) == SQLITE_ROW) {
-                // create triggers (ignore errors)
-                const char* trig_ins =
-                    "CREATE TRIGGER trg_cards_ai AFTER INSERT ON cards BEGIN "
-                    "INSERT INTO cards_fts(rowid, name, type, mana_cost, rarity, set_code) VALUES (new.id, COALESCE(new.english_name, new.localized_name, new.name), new.type, new.mana_cost, new.rarity, new.set_code); "
-                    "END;";
-                const char* trig_upd =
-                    "CREATE TRIGGER trg_cards_au AFTER UPDATE ON cards BEGIN "
-                    "DELETE FROM cards_fts WHERE rowid = old.id; "
-                    "INSERT INTO cards_fts(rowid, name, type, mana_cost, rarity, set_code) VALUES (new.id, COALESCE(new.english_name, new.localized_name, new.name), new.type, new.mana_cost, new.rarity, new.set_code); "
-                    "END;";
-                const char* trig_del =
-                    "CREATE TRIGGER trg_cards_ad AFTER DELETE ON cards BEGIN "
-                    "DELETE FROM cards_fts WHERE rowid = old.id; "
-                    "END;";
-                sqlite3_exec(db, trig_ins, nullptr, nullptr, nullptr);
-                sqlite3_exec(db, trig_upd, nullptr, nullptr, nullptr);
-                sqlite3_exec(db, trig_del, nullptr, nullptr, nullptr);
-            }
-            sqlite3_finalize(s2);
-        }
+        recreate_cards_fts_triggers(db);
         return true;
     } else {
         sqlite3_finalize(check_stmt);
@@ -679,8 +666,8 @@ bool Database::insert_card(const std::string& english_name, const std::string& l
         } else {
             sqlite3_bind_null(insert_stmt, 18);
         }
-        // As above, drop FTS triggers before insert to avoid FTS5 trigger errors
-        sqlite3_exec(db, "DROP TRIGGER IF EXISTS trg_cards_ai; DROP TRIGGER IF EXISTS trg_cards_au; DROP TRIGGER IF EXISTS trg_cards_ad;", nullptr, nullptr, nullptr);
+    // As above, drop FTS triggers before insert to avoid FTS5 trigger errors
+    drop_cards_fts_triggers(db);
         rc = sqlite3_step(insert_stmt);
         sqlite3_finalize(insert_stmt);
         if (rc != SQLITE_DONE) {
@@ -688,29 +675,7 @@ bool Database::insert_card(const std::string& english_name, const std::string& l
             return false;
         }
         // recreate triggers if FTS table exists (best-effort)
-        sqlite3_stmt* s3 = nullptr;
-        const char* q3 = "SELECT name FROM sqlite_master WHERE type='table' AND name='cards_fts'";
-        if (sqlite3_prepare_v2(db, q3, -1, &s3, nullptr) == SQLITE_OK) {
-            if (sqlite3_step(s3) == SQLITE_ROW) {
-                const char* trig_ins =
-                    "CREATE TRIGGER trg_cards_ai AFTER INSERT ON cards BEGIN "
-                    "INSERT INTO cards_fts(rowid, name, type, mana_cost, rarity, set_code) VALUES (new.id, COALESCE(new.english_name, new.localized_name, new.name), new.type, new.mana_cost, new.rarity, new.set_code); "
-                    "END;";
-                const char* trig_upd =
-                    "CREATE TRIGGER trg_cards_au AFTER UPDATE ON cards BEGIN "
-                    "DELETE FROM cards_fts WHERE rowid = old.id; "
-                    "INSERT INTO cards_fts(rowid, name, type, mana_cost, rarity, set_code) VALUES (new.id, COALESCE(new.english_name, new.localized_name, new.name), new.type, new.mana_cost, new.rarity, new.set_code); "
-                    "END;";
-                const char* trig_del =
-                    "CREATE TRIGGER trg_cards_ad AFTER DELETE ON cards BEGIN "
-                    "DELETE FROM cards_fts WHERE rowid = old.id; "
-                    "END;";
-                sqlite3_exec(db, trig_ins, nullptr, nullptr, nullptr);
-                sqlite3_exec(db, trig_upd, nullptr, nullptr, nullptr);
-                sqlite3_exec(db, trig_del, nullptr, nullptr, nullptr);
-            }
-            sqlite3_finalize(s3);
-        }
+        recreate_cards_fts_triggers(db);
         std::cout << "Inserted new card " << english_name << std::endl;
         return true;
     }
@@ -773,31 +738,96 @@ bool Database::get_card_quantity(int id, int& quantity) {
 }
 
 bool Database::update_card_info(int id, const std::string& english_name, const std::string& localized_name, const std::string& type, const std::string& localized_type, const std::string& colors, const std::string& mana_cost, const std::string& rarity, const std::string& image_url, const std::string& price_usd, const std::string& oracle_text) {
+    std::string set_code;
+    bool set_code_is_null = true;
+    {
+        sqlite3_stmt* code_stmt = nullptr;
+        const char* code_sql = "SELECT set_code FROM cards WHERE id = ?";
+        if (sqlite3_prepare_v2(db, code_sql, -1, &code_stmt, nullptr) == SQLITE_OK) {
+            sqlite3_bind_int(code_stmt, 1, id);
+            if (sqlite3_step(code_stmt) == SQLITE_ROW) {
+                const unsigned char* txt = sqlite3_column_text(code_stmt, 0);
+                if (txt) {
+                    set_code.assign(reinterpret_cast<const char*>(txt));
+                    set_code_is_null = false;
+                }
+            }
+            sqlite3_finalize(code_stmt);
+        }
+    }
+
+    drop_cards_fts_triggers(db);
+
     const char* sql = "UPDATE cards SET english_name = ?, localized_name = ?, name = ?, type = ?, localized_type = ?, colors = ?, mana_cost = ?, rarity = ?, image_url = ?, price_usd = ?, oracle_text = ? WHERE id = ?";
-    sqlite3_stmt* stmt;
+    sqlite3_stmt* stmt = nullptr;
+    bool success = false;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
         std::cerr << "Errore prepare update_card_info: " << sqlite3_errmsg(db) << std::endl;
-        return false;
+    } else {
+        sqlite3_bind_text(stmt, 1, english_name.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, localized_name.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 3, localized_name.c_str(), -1, SQLITE_TRANSIENT); // name = localized
+        sqlite3_bind_text(stmt, 4, type.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 5, localized_type.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 6, colors.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 7, mana_cost.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 8, rarity.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 9, image_url.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 10, price_usd.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 11, oracle_text.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(stmt, 12, id);
+        int rc = sqlite3_step(stmt);
+        if (rc != SQLITE_DONE) {
+            std::cerr << "Errore update_card_info: " << sqlite3_errmsg(db) << std::endl;
+        } else {
+            success = true;
+        }
     }
-    sqlite3_bind_text(stmt, 1, english_name.c_str(), -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 2, localized_name.c_str(), -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 3, localized_name.c_str(), -1, SQLITE_STATIC); // name = localized
-    sqlite3_bind_text(stmt, 4, type.c_str(), -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 5, localized_type.c_str(), -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 6, colors.c_str(), -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 7, mana_cost.c_str(), -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 8, rarity.c_str(), -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 9, image_url.c_str(), -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 10, price_usd.c_str(), -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 11, oracle_text.c_str(), -1, SQLITE_STATIC);
-    sqlite3_bind_int(stmt, 12, id);
-    int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    if (rc != SQLITE_DONE) {
-        std::cerr << "Errore update_card_info: " << sqlite3_errmsg(db) << std::endl;
-        return false;
+    if (stmt) {
+        sqlite3_finalize(stmt);
     }
-    return true;
+
+    bool has_fts = cards_fts_exists(db);
+    if (has_fts && success) {
+        sqlite3_stmt* fts_del = nullptr;
+        const char* fts_del_sql = "INSERT INTO cards_fts(cards_fts, rowid) VALUES('delete', ?)";
+        if (sqlite3_prepare_v2(db, fts_del_sql, -1, &fts_del, nullptr) == SQLITE_OK) {
+            sqlite3_bind_int(fts_del, 1, id);
+            sqlite3_step(fts_del);
+        }
+        if (fts_del) {
+            sqlite3_finalize(fts_del);
+        }
+
+        sqlite3_stmt* fts_ins = nullptr;
+        const char* fts_ins_sql = "INSERT INTO cards_fts(rowid, name, type, mana_cost, rarity, set_code) VALUES (?, ?, ?, ?, ?, ?)";
+        if (sqlite3_prepare_v2(db, fts_ins_sql, -1, &fts_ins, nullptr) == SQLITE_OK) {
+            std::string fts_name = english_name;
+            if (fts_name.empty()) {
+                fts_name = localized_name;
+            }
+            sqlite3_bind_int(fts_ins, 1, id);
+            sqlite3_bind_text(fts_ins, 2, fts_name.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(fts_ins, 3, type.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(fts_ins, 4, mana_cost.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(fts_ins, 5, rarity.c_str(), -1, SQLITE_TRANSIENT);
+            if (set_code_is_null) {
+                sqlite3_bind_null(fts_ins, 6);
+            } else {
+                sqlite3_bind_text(fts_ins, 6, set_code.c_str(), -1, SQLITE_TRANSIENT);
+            }
+            sqlite3_step(fts_ins);
+        }
+        if (fts_ins) {
+            sqlite3_finalize(fts_ins);
+        }
+    }
+
+    if (has_fts) {
+        recreate_cards_fts_triggers(db);
+    }
+
+    return success;
 }
 
 bool Database::create_deck(const std::string& name) {
