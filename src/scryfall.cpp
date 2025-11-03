@@ -64,6 +64,10 @@ using CacheEntry = std::pair<std::chrono::steady_clock::time_point, std::vector<
 static std::mutex g_cache_mutex;
 static std::unordered_map<std::string, CacheEntry> g_cache;
 
+using PriceCacheEntry = std::pair<std::chrono::steady_clock::time_point, std::string>;
+static std::mutex g_price_cache_mutex;
+static std::unordered_map<std::string, PriceCacheEntry> g_price_cache;
+
 static std::string make_cache_key(const std::string& query, bool require_italian) {
     return query + (require_italian ? "|it" : "|any");
 }
@@ -133,6 +137,93 @@ static bool try_cache_lookup(const std::string& key, std::vector<ScryfallCard>& 
     }
     out_cards = it->second.second;
     return true;
+}
+
+static std::string normalize_price_string(std::string price) {
+    price.erase(price.begin(), std::find_if(price.begin(), price.end(), [](unsigned char ch){ return !std::isspace(ch); }));
+    price.erase(std::find_if(price.rbegin(), price.rend(), [](unsigned char ch){ return !std::isspace(ch); }).base(), price.end());
+    return price;
+}
+
+static std::string pick_price_field(const json& prices, const std::initializer_list<const char*>& keys) {
+    if (prices.is_null() || !prices.is_object()) return "";
+    auto pick = [&](const char* key) -> std::string {
+        if (!prices.contains(key)) return std::string();
+        const json& node = prices.at(key);
+        if (node.is_null()) return std::string();
+        if (node.is_string()) return normalize_price_string(node.get<std::string>());
+        if (node.is_number_float() || node.is_number_integer()) {
+            std::ostringstream oss;
+            oss.setf(std::ios::fixed, std::ios::floatfield);
+            oss.precision(2);
+            oss << node.get<double>();
+            return oss.str();
+        }
+        return std::string();
+    };
+
+    for (const char* key : keys) {
+        std::string value = pick(key);
+        if (!value.empty()) return value;
+    }
+    return "";
+}
+
+static std::string select_best_price_usd(const json& prices) {
+    // prefer regular USD, then foil variants. If none present, return empty string.
+    return pick_price_field(prices, {"usd", "usd_foil", "usd_etched"});
+}
+
+static bool try_price_cache_lookup(const std::string& key, std::string& out_price) {
+    std::lock_guard<std::mutex> lock(g_price_cache_mutex);
+    auto it = g_price_cache.find(key);
+    if (it == g_price_cache.end()) return false;
+    auto age = std::chrono::steady_clock::now() - it->second.first;
+    if (age > kCacheTtl) {
+        g_price_cache.erase(it);
+        return false;
+    }
+    out_price = it->second.second;
+    return true;
+}
+
+static void store_price_cache_entry(const std::string& key, const std::string& price) {
+    std::lock_guard<std::mutex> lock(g_price_cache_mutex);
+    g_price_cache[key] = {std::chrono::steady_clock::now(), price};
+}
+
+static std::string fetch_price_from_named(const std::string& exact_name) {
+    const std::string trimmed = sanitize_query(exact_name);
+    if (trimmed.empty()) return "";
+    std::string cached;
+    if (try_price_cache_lookup(trimmed, cached)) {
+        return cached;
+    }
+
+    char* escaped = curl_easy_escape(nullptr, trimmed.c_str(), static_cast<int>(trimmed.length()));
+    std::string url = "https://api.scryfall.com/cards/named?exact=" + std::string(escaped ? escaped : "");
+    if (escaped) curl_free(escaped);
+
+    std::string buffer;
+    if (!perform_json_request(url, buffer)) {
+        store_price_cache_entry(trimmed, "");
+        return "";
+    }
+
+    json payload;
+    if (!parse_json(buffer, payload)) {
+        store_price_cache_entry(trimmed, "");
+        return "";
+    }
+
+    if (payload.contains("object") && payload["object"] == "error") {
+        store_price_cache_entry(trimmed, "");
+        return "";
+    }
+
+    std::string price = select_best_price_usd(payload.value("prices", json::object()));
+    store_price_cache_entry(trimmed, price);
+    return price;
 }
 
 } // namespace
@@ -231,10 +322,9 @@ static std::vector<ScryfallCard> perform_search(const std::string& query, bool r
             }
 
             auto prices = card.value("prices", json::object());
-            if (!prices.is_null() && prices.contains("usd") && !prices["usd"].is_null()) {
-                result.price_usd = prices["usd"];
-            } else {
-                result.price_usd = "";
+            result.price_usd = select_best_price_usd(prices);
+            if (result.price_usd.empty()) {
+                result.price_usd = fetch_price_from_named(result.english_name.empty() ? card.value("name", "") : result.english_name);
             }
 
             std::cout << "Parsed card: " << result.name << ", price_usd: '" << result.price_usd << "'" << std::endl;
