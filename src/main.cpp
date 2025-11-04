@@ -14,6 +14,8 @@
 #include <vector>
 #include <set>
 #include <filesystem>
+#include <unordered_map>
+#include <unordered_set>
 #include <nlohmann/json.hpp>
 #include "database.h"
 #include "scryfall.h"
@@ -30,6 +32,7 @@
 #include <sstream>
 #include <iomanip>
 #include <locale>
+#include <iterator>
 // Forward declarations to allow scheduling helpers to be referenced before their definitions.
 struct AppState;
 struct ManaStatsExportCtx;
@@ -46,6 +49,10 @@ static void prefetch_thumbnails_async(const std::vector<std::map<std::string,std
     static void refresh_dialog_cancel(GtkButton* button, gpointer user_data);
     static void start_refresh_cards_async(GtkWindow* window, AppState* state);
     static std::vector<std::map<std::string, std::string>> load_cards_from_db(Database* db, const std::string& filter, int deck_filter, bool only_no_deck);
+static GtkWidget* create_welcome_overlay(AppState* state);
+static void hide_welcome_overlay(AppState* state);
+static gboolean welcome_auto_hide_cb(gpointer user_data);
+static void on_welcome_click_released(GtkGestureClick* gesture, gint n_press, gdouble x, gdouble y, gpointer user_data);
 
 // Struct per dialog widgets
 typedef struct {
@@ -57,6 +64,7 @@ typedef struct _CardRow {
     int id;
     gchar *name;
     gchar *type;
+    gchar *type_english;
     gchar *colors;
     gchar *set_code;
     gchar *mana_cost;
@@ -93,6 +101,7 @@ static void card_row_finalize(GObject *object) {
     CardRow *self = (CardRow*)object;
     g_free(self->name);
     g_free(self->type);
+    g_free(self->type_english);
     g_free(self->colors);
     g_free(self->set_code);
     g_free(self->mana_cost);
@@ -152,6 +161,7 @@ static void card_row_init(CardRow *self) {
     self->id = 0;
     self->name = NULL;
     self->type = NULL;
+    self->type_english = NULL;
     self->colors = NULL;
     self->set_code = NULL;
     self->mana_cost = NULL;
@@ -187,6 +197,829 @@ static int calculate_total_mana_cost(const std::string &mana) {
         }
     }
     return total;
+}
+
+static const std::unordered_map<std::string, guint> kManaSymbolCodepoints = {
+    {"W", 0xE600}, {"U", 0xE601}, {"B", 0xE602}, {"R", 0xE603}, {"G", 0xE604},
+    {"0", 0xE605}, {"1", 0xE606}, {"2", 0xE607}, {"3", 0xE608}, {"4", 0xE609},
+    {"5", 0xE60A}, {"6", 0xE60B}, {"7", 0xE60C}, {"8", 0xE60D}, {"9", 0xE60E},
+    {"10", 0xE60F}, {"11", 0xE610}, {"12", 0xE611}, {"13", 0xE612}, {"14", 0xE613},
+    {"15", 0xE614}, {"16", 0xE62A}, {"17", 0xE62B}, {"18", 0xE62C}, {"19", 0xE62D},
+    {"20", 0xE62E}, {"X", 0xE615}, {"Y", 0xE616}, {"Z", 0xE617}, {"S", 0xE619},
+    {"C", 0xE904}, {"E", 0xE907}, {"P", 0xE618}, {"T", 0xE61A}, {"Q", 0xE61B},
+    {"CHAOS", 0xE61D}, {"INFINITY", 0xE903}, {"100", 0xE900}, {"1000000", 0xE901},
+    {"HALF", 0xE902}, {"1/2", 0xE902}, {"ACORN", 0xE929}, {"TICKET", 0xE9C4}
+};
+
+static std::string trim_copy(const std::string& s) {
+    size_t start = 0;
+    while (start < s.size() && std::isspace(static_cast<unsigned char>(s[start]))) {
+        ++start;
+    }
+    size_t end = s.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(s[end - 1]))) {
+        --end;
+    }
+    return s.substr(start, end - start);
+}
+
+static std::string uppercase_ascii(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char ch : s) {
+        out.push_back(static_cast<char>(std::toupper(ch)));
+    }
+    return out;
+}
+
+static std::string lowercase_ascii(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char ch : s) {
+        out.push_back(static_cast<char>(std::tolower(ch)));
+    }
+    return out;
+}
+
+static std::string symbol_color_override(const std::string& code);
+static std::string resolve_symbol_color_hex(const std::string& raw_code);
+
+static std::string escape_pango_text(const std::string& text) {
+    std::string out;
+    out.reserve(text.size());
+    for (char ch : text) {
+        switch (ch) {
+            case '&': out.append("&amp;"); break;
+            case '<': out.append("&lt;"); break;
+            case '>': out.append("&gt;"); break;
+            default: out.push_back(ch); break;
+        }
+    }
+    return out;
+}
+
+struct AbilityIconRule {
+    guint codepoint;
+    std::vector<std::string> keywords; // lower-case ASCII (accents preserved)
+};
+
+static const AbilityIconRule kAbilityIconRules[] = {
+    {0xE94D, {"double strike", "doppio attacco"}},
+    {0xE950, {"first strike", "iniziativa"}},
+    {0xE968, {"vigilance", "cautela"}},
+    {0xE952, {"flying", "volare"}},
+    {0xE953, {"haste", "rapidita", "rapidità"}},
+    {0xE95D, {"menace", "minaccia", "minacciare"}},
+    {0xE94B, {"deathtouch", "tocco letale"}},
+    {0xEA4B, {"lifelink", "legame vitale"}},
+    {0xE964, {"trample", "travolgere"}},
+    {0xE960, {"reach", "portata"}},
+    {0xE954, {"hexproof", "antimalocchio"}},
+    {0xE95A, {"indestructible", "indistruttibile"}},
+    {0xE992, {"ward", "difesa"}},
+    {0xE982, {"prowess", "destrezza"}},
+    {0xE951, {"flash", "lampo"}},
+    {0xE61A, {"tap", "tappa"}},
+    {0xE61B, {"untap", "stappa"}}
+};
+
+static inline bool is_word_char(char ch) {
+    unsigned char uc = static_cast<unsigned char>(ch);
+    if (uc >= 128) return true;
+    return std::isalnum(uc) || uc == '_' || uc == '-' || uc == '\'';
+}
+
+static std::string build_ability_icon_markup(guint codepoint, const std::string& label_text) {
+    char buf[8];
+    int len = g_unichar_to_utf8(codepoint, buf);
+    std::string markup = "<span font_family='Mana'>";
+    markup.append(buf, len);
+    markup.append("</span>");
+    if (!label_text.empty()) {
+        markup += "&#8201;";
+        markup += escape_pango_text(label_text);
+    }
+    return markup;
+}
+
+static std::string replace_ability_keywords_with_placeholders(const std::string& input, std::vector<std::pair<std::string,std::string>>& replacements) {
+    std::string output;
+    output.reserve(input.size());
+    size_t i = 0;
+    while (i < input.size()) {
+        bool matched = false;
+        for (const auto& rule : kAbilityIconRules) {
+            for (const auto& keyword : rule.keywords) {
+                size_t len = keyword.size();
+                if (!len || i + len > input.size()) continue;
+                std::string candidate = input.substr(i, len);
+                std::string candidate_lower = lowercase_ascii(candidate);
+                if (candidate_lower != keyword) continue;
+                bool start_ok = (i == 0) || !is_word_char(input[i - 1]);
+                bool end_ok = (i + len >= input.size()) || !is_word_char(input[i + len]);
+                if (!start_ok || !end_ok) continue;
+                std::string placeholder = "[[ABILITY" + std::to_string(replacements.size()) + "]]";
+                replacements.emplace_back(placeholder, build_ability_icon_markup(rule.codepoint, candidate));
+                output += placeholder;
+                i += len;
+                matched = true;
+                break;
+            }
+            if (matched) break;
+        }
+        if (!matched) {
+            output.push_back(input[i]);
+            ++i;
+        }
+    }
+    return output;
+}
+
+static std::vector<std::string> split_on_char(const std::string& value, char delimiter) {
+    std::vector<std::string> parts;
+    if (value.empty()) return parts;
+    size_t start = 0;
+    while (start <= value.size()) {
+        size_t pos = value.find(delimiter, start);
+        if (pos == std::string::npos) {
+            parts.emplace_back(value.substr(start));
+            break;
+        }
+        parts.emplace_back(value.substr(start, pos - start));
+        start = pos + 1;
+    }
+    return parts;
+}
+
+static bool mana_symbol_codepoint(const std::string& token_raw, guint* out_cp) {
+    if (!out_cp) return false;
+    std::string trimmed = trim_copy(token_raw);
+    if (trimmed.empty()) return false;
+    if (trimmed == u8"∞") { *out_cp = 0xE903; return true; }
+    if (trimmed == u8"½" || trimmed == "1/2") { *out_cp = 0xE902; return true; }
+    std::string upper = uppercase_ascii(trimmed);
+    if (upper == "SNOW") upper = "S";
+    if (upper == "PHYREXIAN") upper = "P";
+    if (upper == "UNTAP") upper = "Q";
+    if (upper == "TAP") upper = "T";
+    if (upper == "ENERGY") upper = "E";
+    if (upper == "COLORLESS") upper = "C";
+    if (upper == "INFINITE" || upper == "INFINITY") { *out_cp = 0xE903; return true; }
+    auto it = kManaSymbolCodepoints.find(upper);
+    if (it != kManaSymbolCodepoints.end()) {
+        *out_cp = it->second;
+        return true;
+    }
+    return false;
+}
+
+static bool build_single_symbol_markup(const std::string& token_raw, std::string& out_markup) {
+    std::string trimmed = trim_copy(token_raw);
+    guint cp = 0;
+    if (!mana_symbol_codepoint(trimmed, &cp)) return false;
+    std::string color_hex = resolve_symbol_color_hex(trimmed);
+    char buf[8];
+    int len = g_unichar_to_utf8(cp, buf);
+    out_markup = "<span font_family='Mana'";
+    if (!color_hex.empty()) {
+        out_markup += " foreground='";
+        out_markup += color_hex;
+        out_markup += "'";
+    }
+    out_markup += ">";
+    out_markup.append(buf, len);
+    out_markup.append("</span>");
+    return true;
+}
+
+static bool build_combo_symbol_markup(const std::string& token_raw, std::string& out_markup) {
+    if (token_raw.find('/') == std::string::npos) return false;
+    auto parts = split_on_char(token_raw, '/');
+    if (parts.size() < 2) return false;
+    std::string result;
+    bool first = true;
+    for (const auto& raw_part : parts) {
+        std::string part = trim_copy(raw_part);
+        if (part.empty()) return false;
+        std::string part_markup;
+        if (!build_single_symbol_markup(part, part_markup)) return false;
+        if (!first) {
+            result += "<span font_family='Inter' size='smaller'>/</span>";
+        }
+        result += part_markup;
+        first = false;
+    }
+    out_markup = result;
+    return true;
+}
+
+static bool build_symbol_markup(const std::string& token_raw, std::string& out_markup) {
+    if (build_combo_symbol_markup(token_raw, out_markup)) return true;
+    return build_single_symbol_markup(token_raw, out_markup);
+}
+
+static const std::unordered_map<std::string, std::string> kColorNameToCode = {
+    {"white", "W"}, {"blue", "U"}, {"black", "B"}, {"red", "R"}, {"green", "G"}, {"colorless", "C"},
+    {"bianco", "W"}, {"blu", "U"}, {"nero", "B"}, {"rosso", "R"}, {"verde", "G"}, {"incolore", "C"}
+};
+
+static void append_unique_color_code(std::vector<std::string>& codes, const std::string& candidate) {
+    std::string upper = uppercase_ascii(candidate);
+    if (upper.size() != 1) return;
+    char ch = upper[0];
+    if (ch != 'W' && ch != 'U' && ch != 'B' && ch != 'R' && ch != 'G' && ch != 'C') return;
+    if (std::find(codes.begin(), codes.end(), upper) == codes.end()) {
+        codes.push_back(upper);
+    }
+}
+
+static void add_color_token(std::vector<std::string>& codes, const std::string& token_raw);
+
+static std::vector<std::string> parse_color_identity_codes(const std::string& raw) {
+    std::vector<std::string> codes;
+    if (raw.empty()) {
+        append_unique_color_code(codes, "C");
+        return codes;
+    }
+    std::string trimmed = trim_copy(raw);
+    if (trimmed.empty() || trimmed == "[]" || trimmed == "null" || trimmed == "NULL") {
+        append_unique_color_code(codes, "C");
+        return codes;
+    }
+    if (trimmed.front() == '[') {
+        try {
+            auto j = nlohmann::json::parse(trimmed);
+            if (j.is_array()) {
+                for (auto& el : j) {
+                    if (el.is_string()) {
+                        add_color_token(codes, el.get<std::string>());
+                    }
+                }
+            }
+        } catch (...) {
+            // fall through to heuristic parsing below
+        }
+    } else {
+        std::string sanitized = trimmed;
+        if (!sanitized.empty() && sanitized.front() == '"' && sanitized.back() == '"' && sanitized.size() >= 2) {
+            sanitized = sanitized.substr(1, sanitized.size() - 2);
+        }
+        for (char& ch : sanitized) {
+            if (ch == ',' || ch == ';') ch = ' ';
+        }
+        std::istringstream iss(sanitized);
+        std::string token;
+        while (iss >> token) {
+            add_color_token(codes, token);
+        }
+    }
+    return codes;
+}
+
+static void add_color_token(std::vector<std::string>& codes, const std::string& token_raw) {
+    std::string token = trim_copy(token_raw);
+    if (token.empty()) return;
+    std::string upper = uppercase_ascii(token);
+    if (upper.size() == 1) {
+        append_unique_color_code(codes, upper);
+        return;
+    }
+    std::string lower = lowercase_ascii(token);
+    auto it = kColorNameToCode.find(lower);
+    if (it != kColorNameToCode.end()) {
+        append_unique_color_code(codes, it->second);
+        return;
+    }
+    bool all_letters = !upper.empty();
+    for (char ch : upper) {
+        if (!std::isalpha(static_cast<unsigned char>(ch))) {
+            all_letters = false;
+            break;
+        }
+    }
+    if (all_letters && upper.size() <= 6) {
+        for (char ch : upper) {
+            append_unique_color_code(codes, std::string(1, ch));
+        }
+        return;
+    }
+    for (char delim : {'/', '+', '-', '|'}) {
+        if (upper.find(delim) != std::string::npos) {
+            auto parts = split_on_char(upper, delim);
+            for (const auto& part : parts) {
+                add_color_token(codes, part);
+            }
+            return;
+        }
+    }
+}
+
+static void clear_container(GtkWidget* container) {
+    if (!container) return;
+    GtkWidget* child = gtk_widget_get_first_child(container);
+    while (child) {
+        GtkWidget* next = gtk_widget_get_next_sibling(child);
+        gtk_widget_unparent(child);
+        child = next;
+    }
+}
+
+static std::vector<std::string> parse_mana_cost_tokens(const std::string& mana_text) {
+    std::vector<std::string> tokens;
+    bool inside = false;
+    std::string token;
+    for (char ch : mana_text) {
+        if (inside) {
+            if (ch == '}') {
+                inside = false;
+                if (!token.empty()) tokens.push_back(token);
+                token.clear();
+            } else {
+                token.push_back(ch);
+            }
+        } else if (ch == '{') {
+            inside = true;
+            token.clear();
+        }
+    }
+    return tokens;
+}
+
+static std::vector<std::string> expand_symbol_token(const std::string& token_raw) {
+    std::vector<std::string> result;
+    std::string trimmed = trim_copy(token_raw);
+    if (trimmed.empty()) return result;
+    if (trimmed == u8"½" || uppercase_ascii(trimmed) == "1/2") {
+        result.push_back("HALF");
+        return result;
+    }
+    if (trimmed == u8"∞") {
+        result.push_back("INFINITY");
+        return result;
+    }
+    std::string upper = uppercase_ascii(trimmed);
+    if (upper == "INFINITE") upper = "INFINITY";
+    if (upper == "SNOW") upper = "S";
+    if (upper == "PHYREXIAN") upper = "P";
+    if (upper == "UNTAP") upper = "Q";
+    if (upper == "TAP") upper = "T";
+    if (upper == "ENERGY") upper = "E";
+    if (upper == "COLORLESS") upper = "C";
+    if (upper == "HYBRID") return result;
+
+    if (upper.find('/') != std::string::npos) {
+        auto parts = split_on_char(upper, '/');
+        for (const auto& part : parts) {
+            auto sub = expand_symbol_token(part);
+            if (sub.empty()) return std::vector<std::string>();
+            result.insert(result.end(), sub.begin(), sub.end());
+        }
+        return result;
+    }
+
+    result.push_back(upper);
+    return result;
+}
+
+static const std::unordered_map<std::string, std::string> kSymbolColorHex = {
+    {"W", "#f7f1d0"},
+    {"U", "#2f80ed"},
+    {"B", "#3b2f2f"},
+    {"R", "#d1493f"},
+    {"G", "#3b8c3a"},
+    {"C", "#b7b0a5"}
+};
+
+static std::string symbol_color_override(const std::string& code) {
+    auto it = kSymbolColorHex.find(code);
+    if (it != kSymbolColorHex.end()) return it->second;
+    return std::string();
+}
+
+static std::string resolve_symbol_color_hex(const std::string& raw_code) {
+    std::string upper = uppercase_ascii(raw_code);
+    if (upper == "SNOW") upper = "S";
+    if (upper == "PHYREXIAN") upper = "P";
+    if (upper == "UNTAP") upper = "Q";
+    if (upper == "TAP") upper = "T";
+    if (upper == "ENERGY") upper = "E";
+    if (upper == "COLORLESS") upper = "C";
+    std::string color_hex = symbol_color_override(upper);
+    auto is_number = !upper.empty() && std::all_of(upper.begin(), upper.end(), [](char ch){ return std::isdigit(static_cast<unsigned char>(ch)); });
+    if (color_hex.empty()) {
+        if (upper == "T") color_hex = "#cca052";
+        else if (upper == "Q") color_hex = "#2f80ed";
+        else if (upper == "X" || upper == "Y" || upper == "Z" || is_number) color_hex = "#b7b0a5";
+        else if (upper == "E") color_hex = "#d1493f";
+        else if (upper == "S" || upper == "P") color_hex = "#7b5aa6";
+        else if (upper == "HALF" || upper == "INFINITY" || upper == "CHAOS" || upper == "ACORN" || upper == "TICKET") color_hex = "#b7b0a5";
+    }
+    return color_hex;
+}
+
+static const std::filesystem::path kManaSvgDirectory("img/mana/svg");
+
+static std::string symbol_code_to_filename(const std::string& code) {
+    if (code.empty()) return std::string();
+    std::string upper = uppercase_ascii(code);
+    auto is_number = std::all_of(upper.begin(), upper.end(), [](char ch){ return std::isdigit(static_cast<unsigned char>(ch)); });
+    if (is_number && !upper.empty()) {
+        std::filesystem::path full = kManaSvgDirectory / (upper + ".svg");
+        if (std::filesystem::exists(full)) return upper + ".svg";
+    }
+    if (upper.size() == 1) {
+        char ch = upper[0];
+        if ((ch >= 'A' && ch <= 'Z')) {
+            std::string name;
+            switch (ch) {
+                case 'T': name = "tap"; break;
+                case 'Q': name = "untap"; break;
+                default:
+                    name = std::string(1, static_cast<char>(std::tolower(ch)));
+                    break;
+            }
+            std::filesystem::path full = kManaSvgDirectory / (name + ".svg");
+            if (std::filesystem::exists(full)) return name + ".svg";
+        }
+    }
+    if (upper == "HALF" || upper == "1/2") {
+        if (std::filesystem::exists(kManaSvgDirectory / "half.svg")) return "half.svg";
+    }
+    if (upper == "INFINITY") {
+        if (std::filesystem::exists(kManaSvgDirectory / "infinity.svg")) return "infinity.svg";
+    }
+    if (upper == "CHAOS") {
+        if (std::filesystem::exists(kManaSvgDirectory / "chaos.svg")) return "chaos.svg";
+    }
+    if (upper == "ACORN") {
+        if (std::filesystem::exists(kManaSvgDirectory / "acorn.svg")) return "acorn.svg";
+    }
+    if (upper == "TICKET") {
+        if (std::filesystem::exists(kManaSvgDirectory / "ticket.svg")) return "ticket.svg";
+    }
+    if (upper == "E") {
+        if (std::filesystem::exists(kManaSvgDirectory / "e.svg")) return "e.svg";
+    }
+    if (upper == "S") {
+        if (std::filesystem::exists(kManaSvgDirectory / "s.svg")) return "s.svg";
+    }
+    if (upper == "P") {
+        if (std::filesystem::exists(kManaSvgDirectory / "p.svg")) return "p.svg";
+    }
+    if (upper == "C") {
+        if (std::filesystem::exists(kManaSvgDirectory / "c.svg")) return "c.svg";
+    }
+    if (upper == "X") {
+        if (std::filesystem::exists(kManaSvgDirectory / "x.svg")) return "x.svg";
+    }
+    if (upper == "Y") {
+        if (std::filesystem::exists(kManaSvgDirectory / "y.svg")) return "y.svg";
+    }
+    if (upper == "Z") {
+        if (std::filesystem::exists(kManaSvgDirectory / "z.svg")) return "z.svg";
+    }
+    return std::string();
+}
+
+static bool replace_svg_dimension_token(std::string& data, const std::string& attr, char quote, int size_px) {
+    std::string token;
+    token.reserve(attr.size() + 3);
+    token.append(attr);
+    token.push_back('=');
+    token.push_back(quote);
+    size_t pos = data.find(token);
+    if (pos == std::string::npos) return false;
+    pos += token.size();
+    size_t end = data.find(quote, pos);
+    if (end == std::string::npos) return false;
+    bool had_px = (end >= pos + 2) && data.compare(end - 2, 2, "px") == 0;
+    std::string replacement = std::to_string(size_px);
+    if (had_px) replacement += "px";
+    data.replace(pos, end - pos, replacement);
+    return true;
+}
+
+static void replace_svg_dimension(std::string& data, const std::string& attr, int size_px) {
+    if (size_px <= 0) return;
+    if (replace_svg_dimension_token(data, attr, '"', size_px)) return;
+    replace_svg_dimension_token(data, attr, '\'', size_px);
+}
+
+static void rewrite_svg_dimensions(std::string& data, int size_px) {
+    if (size_px <= 0) return;
+    replace_svg_dimension(data, "width", size_px);
+    replace_svg_dimension(data, "height", size_px);
+}
+
+static void apply_svg_fill_override(std::string& data, const std::string& color_hex) {
+    if (color_hex.empty()) return;
+    std::string normalized = color_hex;
+    if (!normalized.empty() && normalized.front() != '#') normalized = "#" + normalized;
+    size_t pos = 0;
+    while ((pos = data.find("fill=\"", pos)) != std::string::npos) {
+        size_t start = pos + 6;
+        size_t end = data.find('\"', start);
+        if (end == std::string::npos) break;
+        std::string current = data.substr(start, end - start);
+        if (current != "none") {
+            data.replace(start, end - start, normalized);
+            pos = start + normalized.size();
+        } else {
+            pos = end;
+        }
+    }
+}
+
+static std::unordered_map<std::string, GdkTexture*> g_svg_texture_cache;
+
+static GdkTexture* load_svg_texture_cached(const std::string& file_name, const std::string& color_override, int size_px) {
+    if (file_name.empty()) return nullptr;
+    std::string key = file_name;
+    if (!color_override.empty()) {
+        key += "|";
+        key += color_override;
+    }
+    key += "|" + std::to_string(size_px);
+    auto it = g_svg_texture_cache.find(key);
+    if (it != g_svg_texture_cache.end()) {
+        return GDK_TEXTURE(g_object_ref(it->second));
+    }
+    std::filesystem::path full_path = kManaSvgDirectory / file_name;
+    std::error_code ec;
+    if (!std::filesystem::exists(full_path, ec)) {
+        return nullptr;
+    }
+    std::ifstream in(full_path, std::ios::binary);
+    if (!in.good()) {
+        return nullptr;
+    }
+    std::string data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    rewrite_svg_dimensions(data, size_px);
+    if (!color_override.empty()) {
+        apply_svg_fill_override(data, color_override);
+    }
+    GBytes* bytes = g_bytes_new(data.data(), data.size());
+    GdkTexture* texture = gdk_texture_new_from_bytes(bytes, nullptr);
+    g_bytes_unref(bytes);
+    if (!texture) return nullptr;
+    g_svg_texture_cache[key] = GDK_TEXTURE(g_object_ref(texture));
+    return texture;
+}
+
+static GtkWidget* make_svg_icon_widget(const std::string& file_name, const std::string& color_override, int size_px) {
+    GdkTexture* texture = load_svg_texture_cached(file_name, color_override, size_px);
+    if (!texture) return nullptr;
+    GtkWidget* picture = gtk_picture_new_for_paintable(GDK_PAINTABLE(texture));
+    gtk_picture_set_can_shrink(GTK_PICTURE(picture), TRUE);
+    gtk_picture_set_content_fit(GTK_PICTURE(picture), GTK_CONTENT_FIT_SCALE_DOWN);
+    gtk_widget_set_size_request(picture, size_px, size_px);
+    gtk_widget_set_valign(picture, GTK_ALIGN_CENTER);
+    gtk_widget_add_css_class(picture, "mana-icon");
+    g_object_unref(texture);
+    return picture;
+}
+
+static bool populate_mana_icon_box(GtkWidget* box, const std::string& mana_text) {
+    if (!box) return false;
+    std::vector<std::string> tokens = parse_mana_cost_tokens(mana_text);
+    if (tokens.empty()) return false;
+    std::vector<std::string> icon_files;
+    std::vector<std::string> icon_colors;
+    for (const auto& token : tokens) {
+        auto parts = expand_symbol_token(token);
+        if (parts.empty()) return false;
+        for (const auto& part : parts) {
+            std::string filename = symbol_code_to_filename(part);
+            if (filename.empty()) return false;
+            icon_files.push_back(filename);
+            icon_colors.push_back(symbol_color_override(part));
+        }
+    }
+    if (icon_files.empty()) return false;
+    std::vector<GtkWidget*> widgets;
+    widgets.reserve(icon_files.size());
+    for (size_t i = 0; i < icon_files.size(); ++i) {
+        GtkWidget* icon = make_svg_icon_widget(icon_files[i], icon_colors[i], 18);
+        if (!icon) {
+            for (GtkWidget* w : widgets) g_object_unref(w);
+            return false;
+        }
+        widgets.push_back(icon);
+    }
+    clear_container(box);
+    for (GtkWidget* icon : widgets) {
+        gtk_box_append(GTK_BOX(box), icon);
+    }
+    return true;
+}
+
+static bool populate_color_icon_box(GtkWidget* box, const std::string& raw_colors) {
+    if (!box) return false;
+    std::vector<std::string> codes = parse_color_identity_codes(raw_colors);
+    if (codes.empty()) return false;
+    std::vector<GtkWidget*> widgets;
+    widgets.reserve(codes.size());
+    for (const auto& code : codes) {
+        std::string filename = symbol_code_to_filename(code);
+        if (filename.empty()) {
+            for (GtkWidget* w : widgets) g_object_unref(w);
+            return false;
+        }
+    std::string color_hex = symbol_color_override(code);
+    GtkWidget* icon = make_svg_icon_widget(filename, color_hex, 16);
+        if (!icon) {
+            for (GtkWidget* w : widgets) g_object_unref(w);
+            return false;
+        }
+        widgets.push_back(icon);
+    }
+    clear_container(box);
+    for (GtkWidget* icon : widgets) {
+        gtk_box_append(GTK_BOX(box), icon);
+    }
+    return true;
+}
+
+struct TypeIconDescriptor {
+    const char* token;
+    const char* svg;
+    const char* color_hex;
+};
+
+static constexpr size_t kMaxTypeIconsPerCard = 2;
+
+static const TypeIconDescriptor kTypeIconDescriptors[] = {
+    {"LAND", "land.svg", "#b59b73"},
+    {"CREATURE", "creature.svg", "#3b8c3a"},
+    {"PLANESWALKER", "planeswalker.svg", "#cca052"},
+    {"INSTANT", "instant.svg", "#2f80ed"},
+    {"SORCERY", "sorcery.svg", "#d1493f"},
+    {"ARTIFACT", "artifact.svg", "#b7b0a5"},
+    {"ENCHANTMENT", "enchantment.svg", "#7b5aa6"}
+};
+
+static std::vector<std::string> parse_type_line_tokens(const std::string& type_line) {
+    std::vector<std::string> tokens;
+    if (type_line.empty()) return tokens;
+    std::string prefix = type_line;
+    size_t em_dash = prefix.find("—");
+    if (em_dash != std::string::npos) prefix = prefix.substr(0, em_dash);
+    size_t double_dash = prefix.find("--");
+    if (double_dash != std::string::npos) prefix = prefix.substr(0, double_dash);
+    std::string normalized;
+    normalized.reserve(prefix.size());
+    for (unsigned char ch : prefix) {
+        if (std::isalpha(ch)) {
+            normalized.push_back(static_cast<char>(std::toupper(ch)));
+        } else {
+            normalized.push_back(' ');
+        }
+    }
+    std::istringstream iss(normalized);
+    std::string token;
+    while (iss >> token) {
+        if (std::find(tokens.begin(), tokens.end(), token) == tokens.end()) {
+            tokens.push_back(token);
+        }
+    }
+    return tokens;
+}
+
+static std::vector<const TypeIconDescriptor*> select_type_icon_descriptors(const std::vector<std::string>& tokens) {
+    std::unordered_set<std::string> token_set(tokens.begin(), tokens.end());
+    std::vector<const TypeIconDescriptor*> selected;
+    for (const auto& desc : kTypeIconDescriptors) {
+        if (token_set.count(desc.token)) {
+            selected.push_back(&desc);
+            if (selected.size() >= kMaxTypeIconsPerCard) break;
+        }
+    }
+    return selected;
+}
+
+static bool populate_type_icon_box(GtkWidget* box, const std::vector<const TypeIconDescriptor*>& descriptors) {
+    if (!box) return false;
+    clear_container(box);
+    if (descriptors.empty()) return false;
+    std::vector<GtkWidget*> icons;
+    icons.reserve(descriptors.size());
+    for (const auto* desc : descriptors) {
+        std::string color = desc->color_hex ? desc->color_hex : "";
+        GtkWidget* icon = make_svg_icon_widget(desc->svg, color, 18);
+        if (!icon) {
+            for (GtkWidget* widget : icons) g_object_unref(widget);
+            clear_container(box);
+            return false;
+        }
+        icons.push_back(icon);
+    }
+    for (GtkWidget* icon : icons) {
+        gtk_box_append(GTK_BOX(box), icon);
+    }
+    return true;
+}
+
+static std::string build_type_fallback_letter(const std::vector<std::string>& tokens, const std::string& type_line) {
+    if (!tokens.empty() && !tokens.front().empty()) {
+        return tokens.front().substr(0, 1);
+    }
+    for (unsigned char ch : type_line) {
+        if (std::isalpha(ch)) {
+            std::string letter(1, static_cast<char>(std::toupper(ch)));
+            return letter;
+        }
+    }
+    return std::string();
+}
+
+static std::string convert_mana_text_to_markup(const std::string& input) {
+    if (input.empty()) return std::string();
+    std::string output;
+    std::string literal;
+    bool inside = false;
+    std::string token;
+    bool last_symbol = false;
+
+    auto flush_literal = [&]() {
+        if (!literal.empty()) {
+            output += escape_pango_text(literal);
+            literal.clear();
+            last_symbol = false;
+        }
+    };
+
+    for (char ch : input) {
+        if (inside) {
+            if (ch == '}') {
+                inside = false;
+                std::string markup;
+                if (build_symbol_markup(token, markup)) {
+                    if (last_symbol) output += "&#8201;";
+                    output += markup;
+                    last_symbol = true;
+                } else {
+                    literal += "{";
+                    literal += token;
+                    literal += "}";
+                }
+                token.clear();
+            } else {
+                token.push_back(ch);
+            }
+        } else {
+            if (ch == '{') {
+                inside = true;
+                flush_literal();
+                token.clear();
+            } else {
+                literal.push_back(ch);
+            }
+        }
+    }
+    if (inside) {
+        literal += "{";
+        literal += token;
+    }
+    flush_literal();
+    return output;
+}
+
+static void set_label_with_mana_markup(GtkWidget* label, const std::string& text) {
+    if (!label) return;
+    if (text.empty()) {
+        gtk_label_set_text(GTK_LABEL(label), "");
+        return;
+    }
+    std::vector<std::pair<std::string,std::string>> ability_replacements;
+    std::string preprocessed = replace_ability_keywords_with_placeholders(text, ability_replacements);
+    std::string markup = convert_mana_text_to_markup(preprocessed);
+    if (!ability_replacements.empty()) {
+        for (const auto& kv : ability_replacements) {
+            size_t pos = 0;
+            while ((pos = markup.find(kv.first, pos)) != std::string::npos) {
+                markup.replace(pos, kv.first.size(), kv.second);
+                pos += kv.second.size();
+            }
+        }
+    }
+    if (!markup.empty()) {
+        gtk_label_set_markup(GTK_LABEL(label), markup.c_str());
+    } else {
+        gtk_label_set_text(GTK_LABEL(label), text.c_str());
+    }
+}
+
+static std::string build_color_label_markup(const std::string& code, const std::string& fallback_text) {
+    std::string icon_markup;
+    if (build_single_symbol_markup(code, icon_markup)) {
+        std::string result = icon_markup;
+        if (!fallback_text.empty()) {
+            result += "&#160;";
+            result += escape_pango_text(fallback_text);
+        }
+        return result;
+    }
+    return escape_pango_text(fallback_text);
 }
 
 static const std::string& get_current_language();
@@ -284,8 +1117,15 @@ static double parse_price_to_double(const std::string& raw_price) {
     for (char ch : raw_price) {
         if (!std::isspace(static_cast<unsigned char>(ch))) cleaned.push_back(ch);
     }
-    if (!cleaned.empty() && (cleaned[0] == '$' || cleaned[0] == '€')) {
-        cleaned.erase(cleaned.begin());
+    if (!cleaned.empty()) {
+        if (cleaned[0] == '$') {
+            cleaned.erase(cleaned.begin());
+        } else if (cleaned.size() >= 3 &&
+                   static_cast<unsigned char>(cleaned[0]) == 0xE2 &&
+                   static_cast<unsigned char>(cleaned[1]) == 0x82 &&
+                   static_cast<unsigned char>(cleaned[2]) == 0xAC) {
+            cleaned.erase(0, 3);
+        }
     }
     cleaned.erase(std::remove(cleaned.begin(), cleaned.end(), '"'), cleaned.end());
     if (cleaned.empty()) return 0.0;
@@ -321,11 +1161,12 @@ static std::string format_currency_value(double value) {
     return std::string("$") + oss.str();
 }
 
-static CardRow* card_row_new(int id, const char* name, const char* type, const char* colors, const char* set_code, const char* mana_cost, const char* rarity, int quantity, const char* image_url, const char* added_date, const char* price_usd, const char* oracle_text, int foil, const char* quantity_display = NULL) {
+static CardRow* card_row_new(int id, const char* name, const char* type_display, const char* type_english, const char* colors, const char* set_code, const char* mana_cost, const char* rarity, int quantity, const char* image_url, const char* added_date, const char* price_usd, const char* oracle_text, int foil, const char* quantity_display = NULL) {
     CardRow* r = (CardRow*)g_object_new(card_row_get_type(), NULL);
     r->id = id;
     r->name = g_strdup(name ? name : "");
-    r->type = g_strdup(type ? type : "");
+    r->type = g_strdup(type_display ? type_display : "");
+    r->type_english = g_strdup(type_english ? type_english : "");
     r->colors = g_strdup(colors ? colors : "");
     r->set_code = g_strdup(set_code ? set_code : "");
     r->mana_cost = g_strdup(mana_cost ? mana_cost : "");
@@ -382,6 +1223,10 @@ static std::map<std::string, std::map<std::string, std::string>> translations = 
     {"Filtri...", {{"it","Filtri..."}, {"en","Filters..."}}},
     {"Elimina Deck", {{"it","Elimina Deck"}, {"en","Delete Deck"}}},
     {"Torna al Database Principale", {{"it","Torna al Database Principale"}, {"en","Back to Main Database"}}},
+    {"Filtri attivi", {{"it","Filtri attivi"}, {"en","Active filters"}}},
+    {"Solo carte senza deck", {{"it","Solo carte senza deck"}, {"en","Only cards without deck"}}},
+    {"Filtra per deck", {{"it","Filtra per deck"}, {"en","Filter by deck"}}},
+    {"Deck attivo", {{"it","Deck attivo"}, {"en","Active deck"}}},
     {"Ordina Crescente", {{"it","Ordina Crescente"}, {"en","Sort Ascending"}}},
     {"Ordina Decrescente", {{"it","Ordina Decrescente"}, {"en","Sort Descending"}}},
     {"Elimina", {{"it","Elimina"}, {"en","Delete"}}},
@@ -444,6 +1289,12 @@ static void __add_more_translations() {
 // Translation entry for the new filter: not in any deck
 static void __add_extra_translations() {
     translations["Non in alcun mazzo"] = {{"it", "Non in alcun mazzo"}, {"en", "Not in any deck"}};
+}
+
+static void __add_welcome_translations() {
+    translations["Magic Database"] = {{"it", "Magic Database"}, {"en", "Magic Database"}};
+    translations["Prepariamo la tua collezione..."] = {{"it", "Prepariamo la tua collezione..."}, {"en", "Preparing your collection..."}};
+    translations["Clicca per iniziare"] = {{"it", "Clicca per iniziare"}, {"en", "Click to get started"}};
 }
 
 std::string translate(const std::string& key) {
@@ -806,6 +1657,11 @@ struct AppState {
     GtkWidget* file_button;
     GtkWidget* view_button;
     GtkWidget* refresh_button;
+    GtkWidget* file_button_label;
+    GtkWidget* view_button_label;
+    GtkWidget* view_button_box;
+    GtkWidget* view_button_icon;
+    GtkWidget* view_button_arrow;
     int selected_deck_id;
     GtkWidget* deck_button;
     GtkWidget* deck_label;
@@ -814,6 +1670,7 @@ struct AppState {
     GMenu *deck_menu;
     GMenu *file_menu;
     GMenu *view_menu;
+    GtkWidget* filter_chip;
     // Filters
     std::set<std::string> filter_colors; // set of color codes, e.g. "W", "U"
     std::set<std::string> filter_rarities; // set of rarities: "common","uncommon","rare","mythic"
@@ -844,9 +1701,117 @@ struct AppState {
     GtkWidget* stats_placeholder;
     ManaStatsExportCtx* stats_ctx;
     bool has_oracle_text_column;
+    GtkWidget* welcome_revealer;
+    GtkWidget* welcome_spinner;
+    GtkWidget* main_overlay;
+    guint welcome_timeout_id;
+    bool welcome_visible;
 };
 
 static bool g_cards_table_has_oracle_text = false;
+
+static GtkWidget* create_welcome_overlay(AppState* state) {
+    if (!state) return NULL;
+
+    GtkWidget* revealer = gtk_revealer_new();
+    gtk_widget_set_hexpand(revealer, TRUE);
+    gtk_widget_set_vexpand(revealer, TRUE);
+    gtk_widget_set_halign(revealer, GTK_ALIGN_FILL);
+    gtk_widget_set_valign(revealer, GTK_ALIGN_FILL);
+    gtk_revealer_set_transition_type(GTK_REVEALER(revealer), GTK_REVEALER_TRANSITION_TYPE_CROSSFADE);
+    gtk_revealer_set_transition_duration(GTK_REVEALER(revealer), 480);
+    gtk_revealer_set_reveal_child(GTK_REVEALER(revealer), TRUE);
+
+    GtkWidget* layer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_add_css_class(layer, "welcome-overlay");
+    gtk_widget_set_hexpand(layer, TRUE);
+    gtk_widget_set_vexpand(layer, TRUE);
+    gtk_widget_set_halign(layer, GTK_ALIGN_FILL);
+    gtk_widget_set_valign(layer, GTK_ALIGN_FILL);
+
+    GtkWidget* card = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14);
+    gtk_widget_add_css_class(card, "welcome-card");
+    gtk_widget_set_halign(card, GTK_ALIGN_CENTER);
+    gtk_widget_set_valign(card, GTK_ALIGN_CENTER);
+
+    GtkWidget* title = gtk_label_new(translate("Magic Database").c_str());
+    gtk_widget_add_css_class(title, "welcome-title");
+    gtk_label_set_wrap(GTK_LABEL(title), TRUE);
+    gtk_label_set_justify(GTK_LABEL(title), GTK_JUSTIFY_CENTER);
+    gtk_box_append(GTK_BOX(card), title);
+
+    GtkWidget* subtitle = gtk_label_new(translate("Prepariamo la tua collezione...").c_str());
+    gtk_widget_add_css_class(subtitle, "welcome-subtitle");
+    gtk_label_set_wrap(GTK_LABEL(subtitle), TRUE);
+    gtk_label_set_justify(GTK_LABEL(subtitle), GTK_JUSTIFY_CENTER);
+    gtk_box_append(GTK_BOX(card), subtitle);
+
+    GtkWidget* spinner = gtk_spinner_new();
+    gtk_widget_add_css_class(spinner, "welcome-spinner");
+    gtk_widget_set_halign(spinner, GTK_ALIGN_CENTER);
+    gtk_spinner_start(GTK_SPINNER(spinner));
+    gtk_box_append(GTK_BOX(card), spinner);
+
+    GtkWidget* hint = gtk_label_new(translate("Clicca per iniziare").c_str());
+    gtk_widget_add_css_class(hint, "welcome-hint");
+    gtk_label_set_wrap(GTK_LABEL(hint), TRUE);
+    gtk_label_set_justify(GTK_LABEL(hint), GTK_JUSTIFY_CENTER);
+    gtk_box_append(GTK_BOX(card), hint);
+
+    gtk_box_append(GTK_BOX(layer), card);
+    gtk_revealer_set_child(GTK_REVEALER(revealer), layer);
+
+    GtkGesture* click = gtk_gesture_click_new();
+    gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(click), 0);
+    g_signal_connect(click, "released", G_CALLBACK(on_welcome_click_released), state);
+    gtk_widget_add_controller(layer, GTK_EVENT_CONTROLLER(click));
+    gtk_widget_set_can_target(layer, TRUE);
+
+    state->welcome_revealer = revealer;
+    state->welcome_spinner = spinner;
+    state->welcome_visible = true;
+
+    return revealer;
+}
+
+static void hide_welcome_overlay(AppState* state) {
+    if (!state) return;
+    if (!state->welcome_visible) return;
+    if (state->welcome_timeout_id != 0) {
+        g_source_remove(state->welcome_timeout_id);
+        state->welcome_timeout_id = 0;
+    }
+    state->welcome_visible = false;
+    if (state->welcome_spinner) {
+        gtk_spinner_stop(GTK_SPINNER(state->welcome_spinner));
+    }
+    if (state->welcome_revealer) {
+        gtk_revealer_set_reveal_child(GTK_REVEALER(state->welcome_revealer), FALSE);
+        gtk_widget_set_visible(state->welcome_revealer, FALSE);
+        if (state->main_overlay) {
+            gtk_overlay_remove_overlay(GTK_OVERLAY(state->main_overlay), state->welcome_revealer);
+        }
+        state->welcome_revealer = NULL;
+    }
+    state->welcome_spinner = NULL;
+}
+
+static gboolean welcome_auto_hide_cb(gpointer user_data) {
+    AppState* state = static_cast<AppState*>(user_data);
+    if (!state) return G_SOURCE_REMOVE;
+    state->welcome_timeout_id = 0;
+    hide_welcome_overlay(state);
+    return G_SOURCE_REMOVE;
+}
+
+static void on_welcome_click_released(GtkGestureClick* gesture, gint n_press, gdouble x, gdouble y, gpointer user_data) {
+    (void)gesture;
+    (void)n_press;
+    (void)x;
+    (void)y;
+    AppState* state = static_cast<AppState*>(user_data);
+    hide_welcome_overlay(state);
+}
 
 static void update_cards_schema_flags(AppState* state) {
     if (!state) return;
@@ -2071,14 +3036,12 @@ static void on_select_deck_id(GSimpleAction *action, GVariant *parameter, gpoint
             deck_name = row.at("name");
         }, std::vector<std::string>{std::to_string(deck_id)});
     }
-    if (state->deck_button) {
-        gtk_button_set_label(GTK_BUTTON(state->deck_button), deck_name.c_str());
+    if (state->deck_button && state->deck_label) {
+        gtk_label_set_text(GTK_LABEL(state->deck_label), deck_name.c_str());
         gtk_widget_set_visible(state->deck_button, TRUE);
-    }
-    if (state->deck_label) {
-        std::string lbl = std::string("Filtrando: ") + deck_name;
-        gtk_label_set_text(GTK_LABEL(state->deck_label), lbl.c_str());
-        gtk_widget_set_visible(state->deck_label, TRUE);
+        gtk_widget_add_css_class(state->deck_button, "active");
+    std::string tip = translate("Deck attivo") + ": " + deck_name;
+        gtk_widget_set_tooltip_text(state->deck_button, tip.c_str());
     }
     if (state->deck_delete_button) {
         gtk_widget_set_visible(state->deck_delete_button, TRUE);
@@ -2096,7 +3059,7 @@ static void on_select_deck_id(GSimpleAction *action, GVariant *parameter, gpoint
 static void update_ui_texts(GtkWindow *window, AppState* state) {
     gtk_column_view_column_set_title(state->name_col, translate("Nome").c_str());
     gtk_column_view_column_set_title(state->type_col, translate("Tipo").c_str());
-    gtk_column_view_column_set_title(state->colors_col, translate("Colori").c_str());
+    gtk_column_view_column_set_title(state->colors_col, "");
     gtk_column_view_column_set_title(state->mana_col, translate("Costo Mana").c_str());
     gtk_column_view_column_set_title(state->rarity_col, translate("Rarità").c_str());
     gtk_column_view_column_set_title(state->date_col, translate("Data di aggiunta").c_str());
@@ -2108,8 +3071,59 @@ static void update_ui_texts(GtkWindow *window, AppState* state) {
     } else {
         gtk_button_set_label(GTK_BUTTON(state->add_card_button), translate("Nuova Carta").c_str());
     }
-    gtk_menu_button_set_label(GTK_MENU_BUTTON(state->file_button), translate("File").c_str());
-    gtk_menu_button_set_label(GTK_MENU_BUTTON(state->view_button), translate("Visualizza").c_str());
+    std::string file_txt = translate("File");
+    std::string view_txt = translate("Visualizza");
+    if (state->file_button_label) {
+        gtk_label_set_text(GTK_LABEL(state->file_button_label), file_txt.c_str());
+    } else if (state->file_button) {
+        gtk_menu_button_set_label(GTK_MENU_BUTTON(state->file_button), file_txt.c_str());
+    }
+    if (state->view_button_label) {
+        gtk_label_set_text(GTK_LABEL(state->view_button_label), view_txt.c_str());
+    } else if (state->view_button) {
+        gtk_menu_button_set_label(GTK_MENU_BUTTON(state->view_button), view_txt.c_str());
+    }
+    if (state->deck_button) {
+        if (state->selected_deck_id == -1) {
+            gtk_widget_set_tooltip_text(state->deck_button, translate("Filtra per deck").c_str());
+        } else if (state->deck_label) {
+            const char* current = gtk_label_get_text(GTK_LABEL(state->deck_label));
+            std::string tip = translate("Deck attivo");
+            tip += ": ";
+            tip += current ? current : "";
+            gtk_widget_set_tooltip_text(state->deck_button, tip.c_str());
+        }
+    }
+    bool has_filters = !state->filter_colors.empty() || !state->filter_rarities.empty() ||
+                       !state->filter_types.empty() || state->filter_foil != -1 || state->filter_no_deck;
+    if (state->view_button_box) {
+        if (has_filters) {
+            gtk_widget_add_css_class(state->view_button_box, "toolbar-menubutton-active");
+        } else {
+            gtk_widget_remove_css_class(state->view_button_box, "toolbar-menubutton-active");
+        }
+    }
+    if (state->view_button_icon) {
+        if (has_filters) {
+            gtk_widget_add_css_class(state->view_button_icon, "toolbar-icon-accent");
+        } else {
+            gtk_widget_remove_css_class(state->view_button_icon, "toolbar-icon-accent");
+        }
+    }
+    if (state->view_button_arrow) {
+        if (has_filters) {
+            gtk_widget_add_css_class(state->view_button_arrow, "toolbar-arrow-accent");
+        } else {
+            gtk_widget_remove_css_class(state->view_button_arrow, "toolbar-arrow-accent");
+        }
+    }
+    if (state->view_button_label) {
+        if (has_filters) {
+            gtk_widget_add_css_class(state->view_button_label, "toolbar-button-label-accent");
+        } else {
+            gtk_widget_remove_css_class(state->view_button_label, "toolbar-button-label-accent");
+        }
+    }
     gtk_entry_set_placeholder_text(GTK_ENTRY(state->search_entry), translate("Cerca per nome...").c_str());
     // Update total label with quantity and aggregate value (based on main DB contents)
     char buf[256];
@@ -3431,12 +4445,22 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
         return std::string(buf);
     };
     auto translate_color_code = [](const std::string& code) {
-        if (code == "W") return std::string("Bianco");
-        if (code == "U") return std::string("Blu");
-        if (code == "B") return std::string("Nero");
-        if (code == "R") return std::string("Rosso");
-        if (code == "G") return std::string("Verde");
-        if (code == "C") return std::string("Incolore");
+        const std::string& lang = get_current_language();
+        if (lang == "it") {
+            if (code == "W") return std::string("Bianco");
+            if (code == "U") return std::string("Blu");
+            if (code == "B") return std::string("Nero");
+            if (code == "R") return std::string("Rosso");
+            if (code == "G") return std::string("Verde");
+            if (code == "C") return std::string("Incolore");
+        } else {
+            if (code == "W") return std::string("White");
+            if (code == "U") return std::string("Blue");
+            if (code == "B") return std::string("Black");
+            if (code == "R") return std::string("Red");
+            if (code == "G") return std::string("Green");
+            if (code == "C") return std::string("Colorless");
+        }
         return code;
     };
 
@@ -3456,6 +4480,7 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
 
     GtkWidget* hero = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 24);
     gtk_widget_add_css_class(hero, "stats-hero");
+    gtk_widget_add_css_class(hero, "shadow-elevated");
     gtk_widget_set_hexpand(hero, TRUE);
     gtk_box_append(GTK_BOX(container), hero);
 
@@ -3478,10 +4503,11 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
     gtk_label_set_xalign(GTK_LABEL(title_lbl), 0.0);
     gtk_box_append(GTK_BOX(hero_left), title_lbl);
 
-    GtkWidget* subtitle_lbl = gtk_label_new(hero_subtitle.c_str());
+    GtkWidget* subtitle_lbl = gtk_label_new("");
     gtk_widget_add_css_class(subtitle_lbl, "stats-hero-subtitle");
     gtk_label_set_xalign(GTK_LABEL(subtitle_lbl), 0.0);
     gtk_label_set_wrap(GTK_LABEL(subtitle_lbl), TRUE);
+    set_label_with_mana_markup(subtitle_lbl, hero_subtitle);
     gtk_box_append(GTK_BOX(hero_left), subtitle_lbl);
 
     GtkWidget* hero_metrics = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
@@ -3491,24 +4517,32 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
     gtk_widget_set_valign(hero_metrics, GTK_ALIGN_CENTER);
     gtk_box_append(GTK_BOX(hero), hero_metrics);
 
+    GtkSizeGroup* hero_metrics_size = gtk_size_group_new(GTK_SIZE_GROUP_HORIZONTAL);
+
     auto hero_metric = [&](const std::string& title, const std::string& value, const std::string& subtitle) {
         GtkWidget* pill = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
         gtk_widget_add_css_class(pill, "stats-hero-pill");
-        GtkWidget* pt = gtk_label_new(title.c_str());
+        gtk_widget_add_css_class(pill, "glass-pill");
+        gtk_widget_add_css_class(pill, "shadow-soft");
+        GtkWidget* pt = gtk_label_new("");
         gtk_widget_add_css_class(pt, "stats-hero-pill-title");
         gtk_label_set_xalign(GTK_LABEL(pt), 0.0);
+        set_label_with_mana_markup(pt, title);
         gtk_box_append(GTK_BOX(pill), pt);
-        GtkWidget* pv = gtk_label_new(value.c_str());
+        GtkWidget* pv = gtk_label_new("");
         gtk_widget_add_css_class(pv, "stats-hero-pill-value");
         gtk_label_set_xalign(GTK_LABEL(pv), 0.0);
+        set_label_with_mana_markup(pv, value);
         gtk_box_append(GTK_BOX(pill), pv);
         if (!subtitle.empty()) {
-            GtkWidget* ps = gtk_label_new(subtitle.c_str());
+            GtkWidget* ps = gtk_label_new("");
             gtk_widget_add_css_class(ps, "stats-hero-pill-subtitle");
             gtk_label_set_xalign(GTK_LABEL(ps), 0.0);
             gtk_label_set_wrap(GTK_LABEL(ps), TRUE);
+            set_label_with_mana_markup(ps, subtitle);
             gtk_box_append(GTK_BOX(pill), ps);
         }
+        gtk_size_group_add_widget(hero_metrics_size, pill);
         gtk_box_append(GTK_BOX(hero_metrics), pill);
     };
 
@@ -3516,6 +4550,7 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
     hero_metric("Terre", std::to_string(land_cards), format_percent(land_ratio));
     hero_metric("CMC medio", format_double(avg_non_land_cmc), std::string("Totale ") + format_double(avg_total_cmc));
     hero_metric("Spell chiave", std::to_string(removal_spells) + " rim.", format_percent(removal_share));
+    g_object_unref(hero_metrics_size);
 
     GtkWidget* content = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 24);
     gtk_widget_add_css_class(content, "stats-content");
@@ -3538,6 +4573,8 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
     GtkWidget* chart_card = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
     gtk_widget_add_css_class(chart_card, "stats-card");
     gtk_widget_add_css_class(chart_card, "stats-chart-card");
+    gtk_widget_add_css_class(chart_card, "glass-card");
+    gtk_widget_add_css_class(chart_card, "shadow-elevated");
     gtk_widget_set_hexpand(chart_card, TRUE);
     gtk_widget_set_vexpand(chart_card, TRUE);
     gtk_box_append(GTK_BOX(left_column), chart_card);
@@ -3552,10 +4589,11 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
     gtk_label_set_xalign(GTK_LABEL(chart_title), 0.0);
     gtk_box_append(GTK_BOX(chart_header), chart_title);
 
-    GtkWidget* chart_desc = gtk_label_new(chart_caption.c_str());
+    GtkWidget* chart_desc = gtk_label_new("");
     gtk_widget_add_css_class(chart_desc, "stats-card-subtitle");
     gtk_label_set_xalign(GTK_LABEL(chart_desc), 0.0);
     gtk_label_set_wrap(GTK_LABEL(chart_desc), TRUE);
+    set_label_with_mana_markup(chart_desc, chart_caption);
     gtk_box_append(GTK_BOX(chart_card), chart_desc);
 
     GtkWidget* switch_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
@@ -3585,15 +4623,18 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
     gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(da), (GtkDrawingAreaDrawFunc)on_mana_area_draw, NULL, NULL);
     gtk_frame_set_child(GTK_FRAME(chart_frame), da);
 
-    GtkWidget* chart_hint = gtk_label_new("Suggerimento: alterna le viste per mettere a confronto curva, tipi e colori.");
+    GtkWidget* chart_hint = gtk_label_new("");
     gtk_widget_add_css_class(chart_hint, "stats-card-hint");
     gtk_label_set_xalign(GTK_LABEL(chart_hint), 0.0);
     gtk_label_set_wrap(GTK_LABEL(chart_hint), TRUE);
+    set_label_with_mana_markup(chart_hint, "Suggerimento: alterna le viste per mettere a confronto curva, tipi e colori.");
     gtk_box_append(GTK_BOX(chart_card), chart_hint);
 
     GtkWidget* insights_card = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
     gtk_widget_add_css_class(insights_card, "stats-card");
     gtk_widget_add_css_class(insights_card, "stats-highlights-card");
+    gtk_widget_add_css_class(insights_card, "glass-card");
+    gtk_widget_add_css_class(insights_card, "shadow-elevated");
     gtk_box_append(GTK_BOX(left_column), insights_card);
 
     GtkWidget* insights_title = gtk_label_new("Highlights");
@@ -3612,10 +4653,11 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
         gtk_widget_add_css_class(bullet, "stats-highlight-bullet");
         gtk_label_set_xalign(GTK_LABEL(bullet), 0.0);
         gtk_box_append(GTK_BOX(row), bullet);
-        GtkWidget* lbl = gtk_label_new(text.c_str());
+    GtkWidget* lbl = gtk_label_new("");
         gtk_widget_add_css_class(lbl, "stats-highlight-text");
-        gtk_label_set_xalign(GTK_LABEL(lbl), 0.0);
-        gtk_label_set_wrap(GTK_LABEL(lbl), TRUE);
+    gtk_label_set_xalign(GTK_LABEL(lbl), 0.0);
+    gtk_label_set_wrap(GTK_LABEL(lbl), TRUE);
+        set_label_with_mana_markup(lbl, text);
         gtk_box_append(GTK_BOX(row), lbl);
         gtk_box_append(GTK_BOX(highlights_list), row);
     };
@@ -3662,6 +4704,8 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
 
     GtkWidget* summary_card = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
     gtk_widget_add_css_class(summary_card, "stats-card");
+    gtk_widget_add_css_class(summary_card, "glass-card");
+    gtk_widget_add_css_class(summary_card, "shadow-elevated");
     gtk_box_append(GTK_BOX(right_column), summary_card);
 
     GtkWidget* summary_title = gtk_label_new("Panoramica rapida");
@@ -3676,26 +4720,35 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
     gtk_widget_add_css_class(summary_flow, "stats-pill-flow");
     gtk_box_append(GTK_BOX(summary_card), summary_flow);
 
+    GtkSizeGroup* summary_pill_size = gtk_size_group_new(GTK_SIZE_GROUP_HORIZONTAL);
+
     auto create_stats_pill = [&](const std::string& title, const std::string& value, const std::string& subtitle) {
         GtkWidget* pill = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
         gtk_widget_add_css_class(pill, "stats-pill");
+        gtk_widget_add_css_class(pill, "glass-pill");
+        gtk_widget_add_css_class(pill, "shadow-soft");
         gtk_widget_set_margin_end(pill, 8);
         gtk_widget_set_margin_bottom(pill, 8);
-        GtkWidget* title_label = gtk_label_new(title.c_str());
+        GtkWidget* title_label = gtk_label_new("");
         gtk_widget_add_css_class(title_label, "stats-pill-title");
         gtk_label_set_xalign(GTK_LABEL(title_label), 0.0);
+        gtk_label_set_wrap(GTK_LABEL(title_label), TRUE);
+        set_label_with_mana_markup(title_label, title);
         gtk_box_append(GTK_BOX(pill), title_label);
-        GtkWidget* value_label = gtk_label_new(value.c_str());
+        GtkWidget* value_label = gtk_label_new("");
         gtk_widget_add_css_class(value_label, "stats-pill-value");
         gtk_label_set_xalign(GTK_LABEL(value_label), 0.0);
+        set_label_with_mana_markup(value_label, value);
         gtk_box_append(GTK_BOX(pill), value_label);
         if (!subtitle.empty()) {
-            GtkWidget* subtitle_label = gtk_label_new(subtitle.c_str());
+            GtkWidget* subtitle_label = gtk_label_new("");
             gtk_widget_add_css_class(subtitle_label, "stats-pill-subtitle");
-            gtk_label_set_wrap(GTK_LABEL(subtitle_label), TRUE);
             gtk_label_set_xalign(GTK_LABEL(subtitle_label), 0.0);
+            gtk_label_set_wrap(GTK_LABEL(subtitle_label), TRUE);
+            set_label_with_mana_markup(subtitle_label, subtitle);
             gtk_box_append(GTK_BOX(pill), subtitle_label);
         }
+        gtk_size_group_add_widget(summary_pill_size, pill);
         return pill;
     };
 
@@ -3719,6 +4772,7 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
     append_pill(create_stats_pill("Ramp", std::to_string(ramp_spells), ramp_sub));
     std::string draw_sub = format_percent(draw_share);
     append_pill(create_stats_pill("Pescate", std::to_string(card_draw_spells), draw_sub));
+    g_object_unref(summary_pill_size);
 
     auto style_delta_label = [&](GtkWidget* lbl, int delta) {
         if (delta > 0) gtk_widget_add_css_class(lbl, "trend-up");
@@ -3728,7 +4782,8 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
 
     GtkWidget* curve_panel = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
     gtk_widget_add_css_class(curve_panel, "stats-panel");
-    gtk_widget_set_margin_bottom(curve_panel, 12);
+    gtk_widget_add_css_class(curve_panel, "glass-panel");
+    gtk_widget_add_css_class(curve_panel, "shadow-soft");
     GtkWidget* curve_title = gtk_label_new("Curva vs target");
     gtk_widget_add_css_class(curve_title, "stats-panel-title");
     gtk_label_set_xalign(GTK_LABEL(curve_title), 0.0);
@@ -3773,6 +4828,8 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
 
     GtkWidget* color_panel = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
     gtk_widget_add_css_class(color_panel, "stats-panel");
+    gtk_widget_add_css_class(color_panel, "glass-panel");
+    gtk_widget_add_css_class(color_panel, "shadow-soft");
     GtkWidget* color_title = gtk_label_new("Fonti di colore");
     gtk_widget_add_css_class(color_title, "stats-panel-title");
     gtk_label_set_xalign(GTK_LABEL(color_title), 0.0);
@@ -3813,9 +4870,12 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
         double share_sources = land_cards > 0 ? (double)sources / (double)land_cards : 0.0;
         double share_pips = total_pips > 0 ? (double)pips / total_pips : 0.0;
         int share_delta = (int)std::round((share_sources - share_pips) * 100.0);
-        std::string share_text = format_percent(share_sources) + " vs " + format_percent(share_pips);
-        GtkWidget* lbl_color = gtk_label_new(color.c_str());
+    std::string share_text = format_percent(share_sources) + " vs " + format_percent(share_pips);
+    std::string color_label_text = translate_color_code(color);
+    GtkWidget* lbl_color = gtk_label_new("");
         gtk_label_set_xalign(GTK_LABEL(lbl_color), 0.0);
+    std::string color_markup = build_color_label_markup(color, color_label_text);
+    gtk_label_set_markup(GTK_LABEL(lbl_color), color_markup.c_str());
         gtk_grid_attach(GTK_GRID(color_grid), lbl_color, 0, color_row, 1, 1);
         GtkWidget* lbl_sources = gtk_label_new(std::to_string(sources).c_str());
         gtk_label_set_xalign(GTK_LABEL(lbl_sources), 0.0);
@@ -3842,6 +4902,8 @@ static void on_mana_curve_action(GSimpleAction *action, GVariant *parameter, gpo
     GtkWidget* actions_card = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
     gtk_widget_add_css_class(actions_card, "stats-card");
     gtk_widget_add_css_class(actions_card, "stats-actions-card");
+    gtk_widget_add_css_class(actions_card, "glass-card");
+    gtk_widget_add_css_class(actions_card, "shadow-elevated");
     gtk_box_append(GTK_BOX(right_column), actions_card);
 
     GtkWidget* actions_title = gtk_label_new("Esporta");
@@ -4570,6 +5632,7 @@ void refresh_card_list(AppState* state) {
             CardRow* crow = card_row_new(std::stoi(row.at("id")),
                                          display_name.c_str(),
                                          display_type.c_str(),
+                                         english_type.c_str(),
                                          row.at("colors").c_str(),
                                          row.at("set_code").c_str(),
                                          row.at("mana_cost").c_str(),
@@ -4620,7 +5683,7 @@ void refresh_card_list(AppState* state) {
             if (row.count("foil")) {
                 try { foil = std::stoi(row.at("foil")); } catch(...) { foil = 0; }
             }
-            CardRow* crow = card_row_new(std::stoi(row.at("id")), display_name.c_str(), display_type.c_str(), row.count("colors") ? row.at("colors").c_str() : "", row.count("set_code") ? row.at("set_code").c_str() : "", row.count("mana_cost") ? row.at("mana_cost").c_str() : "", row.count("rarity") ? row.at("rarity").c_str() : "", std::stoi(row.at("quantity")), row.count("image_url") ? row.at("image_url").c_str() : "", row.count("added_date") ? row.at("added_date").c_str() : "", row.count("price_usd") ? row.at("price_usd").c_str() : "", row.count("oracle_text") ? row.at("oracle_text").c_str() : "", foil);
+            CardRow* crow = card_row_new(std::stoi(row.at("id")), display_name.c_str(), display_type.c_str(), row.count("type") ? row.at("type").c_str() : "", row.count("colors") ? row.at("colors").c_str() : "", row.count("set_code") ? row.at("set_code").c_str() : "", row.count("mana_cost") ? row.at("mana_cost").c_str() : "", row.count("rarity") ? row.at("rarity").c_str() : "", std::stoi(row.at("quantity")), row.count("image_url") ? row.at("image_url").c_str() : "", row.count("added_date") ? row.at("added_date").c_str() : "", row.count("price_usd") ? row.at("price_usd").c_str() : "", row.count("oracle_text") ? row.at("oracle_text").c_str() : "", foil);
             g_list_store_append(state->card_store, crow);
             g_object_unref(crow);
             int qty = 0;
@@ -4635,7 +5698,7 @@ void refresh_card_list(AppState* state) {
         if (!side_rows.empty()) {
             std::string sep_label = translate("Sideboard");
             // Separator visual row (visual-only title row)
-            CardRow* sep = card_row_new(ROW_ID_SEPARATOR_TITLE, sep_label.c_str(), "", "", "", "", "", 0, "", "", "", "", 0);
+            CardRow* sep = card_row_new(ROW_ID_SEPARATOR_TITLE, sep_label.c_str(), "", "", "", "", "", "", 0, "", "", "", "", 0);
             g_list_store_append(state->card_store, sep);
             // Also add separator style to the list item widget when rendered via factories
             g_object_unref(sep);
@@ -4649,7 +5712,7 @@ void refresh_card_list(AppState* state) {
             header_line += translate("Rarità"); header_line += " | ";
             header_line += translate("Data di aggiunta"); header_line += " | ";
             header_line += translate("Quantità");
-            CardRow* hdr = card_row_new(ROW_ID_HEADER, header_line.c_str(), "", "", "", "", "", 0, "", "", "", "", 0);
+            CardRow* hdr = card_row_new(ROW_ID_HEADER, header_line.c_str(), "", "", "", "", "", "", 0, "", "", "", "", 0);
             g_list_store_append(state->card_store, hdr);
             g_object_unref(hdr);
             for (const auto& row : side_rows) {
@@ -4662,7 +5725,7 @@ void refresh_card_list(AppState* state) {
                 if (row.count("foil")) {
                     try { foil = std::stoi(row.at("foil")); } catch(...) { foil = 0; }
                 }
-                CardRow* crow = card_row_new(std::stoi(row.at("id")), display_name.c_str(), display_type.c_str(), row.count("colors") ? row.at("colors").c_str() : "", row.count("set_code") ? row.at("set_code").c_str() : "", row.count("mana_cost") ? row.at("mana_cost").c_str() : "", row.count("rarity") ? row.at("rarity").c_str() : "", std::stoi(row.at("quantity")), row.count("image_url") ? row.at("image_url").c_str() : "", row.count("added_date") ? row.at("added_date").c_str() : "", row.count("price_usd") ? row.at("price_usd").c_str() : "", row.count("oracle_text") ? row.at("oracle_text").c_str() : "", foil);
+                CardRow* crow = card_row_new(std::stoi(row.at("id")), display_name.c_str(), display_type.c_str(), row.count("type") ? row.at("type").c_str() : "", row.count("colors") ? row.at("colors").c_str() : "", row.count("set_code") ? row.at("set_code").c_str() : "", row.count("mana_cost") ? row.at("mana_cost").c_str() : "", row.count("rarity") ? row.at("rarity").c_str() : "", std::stoi(row.at("quantity")), row.count("image_url") ? row.at("image_url").c_str() : "", row.count("added_date") ? row.at("added_date").c_str() : "", row.count("price_usd") ? row.at("price_usd").c_str() : "", row.count("oracle_text") ? row.at("oracle_text").c_str() : "", foil);
                 g_list_store_append(state->card_store, crow);
                 g_object_unref(crow);
                 int qty = 0;
@@ -4696,6 +5759,8 @@ void refresh_card_list(AppState* state) {
     int debug_total_quantity = (state->selected_deck_id == -1) ? total_quantity : (main_count + side_count);
     double debug_total_value = (state->selected_deck_id == -1) ? total_value : (main_value + side_value);
     // Update filter summary label
+    bool has_filters = !state->filter_colors.empty() || !state->filter_rarities.empty() ||
+                       !state->filter_types.empty() || state->filter_foil != -1 || state->filter_no_deck;
     std::string fsummary;
     if (!state->filter_colors.empty()) {
         fsummary += "Colori:";
@@ -4733,8 +5798,55 @@ void refresh_card_list(AppState* state) {
     if (state->filter_foil != -1) {
         fsummary += (state->filter_foil == 1) ? "Solo Foil" : "Solo Non-Foil";
     }
-    if (fsummary.empty()) fsummary = "";
-    gtk_label_set_text(GTK_LABEL(state->filter_label), fsummary.c_str());
+    if (state->filter_no_deck) {
+        if (!fsummary.empty()) fsummary += " ";
+        fsummary += translate("Solo carte senza deck");
+    }
+    if (has_filters && fsummary.empty()) {
+        fsummary = translate("Filtri attivi");
+    }
+    while (!fsummary.empty() && fsummary.back() == ' ') {
+        fsummary.pop_back();
+    }
+    if (state->filter_label) {
+        gtk_label_set_text(GTK_LABEL(state->filter_label), fsummary.c_str());
+    }
+    if (state->filter_chip) {
+        gtk_widget_set_visible(state->filter_chip, has_filters);
+        if (has_filters) {
+            gtk_widget_add_css_class(state->filter_chip, "active");
+        } else {
+            gtk_widget_remove_css_class(state->filter_chip, "active");
+        }
+    }
+    if (state->view_button_box) {
+        if (has_filters) {
+            gtk_widget_add_css_class(state->view_button_box, "toolbar-menubutton-active");
+        } else {
+            gtk_widget_remove_css_class(state->view_button_box, "toolbar-menubutton-active");
+        }
+    }
+    if (state->view_button_icon) {
+        if (has_filters) {
+            gtk_widget_add_css_class(state->view_button_icon, "toolbar-icon-accent");
+        } else {
+            gtk_widget_remove_css_class(state->view_button_icon, "toolbar-icon-accent");
+        }
+    }
+    if (state->view_button_arrow) {
+        if (has_filters) {
+            gtk_widget_add_css_class(state->view_button_arrow, "toolbar-arrow-accent");
+        } else {
+            gtk_widget_remove_css_class(state->view_button_arrow, "toolbar-arrow-accent");
+        }
+    }
+    if (state->view_button_label) {
+        if (has_filters) {
+            gtk_widget_add_css_class(state->view_button_label, "toolbar-button-label-accent");
+        } else {
+            gtk_widget_remove_css_class(state->view_button_label, "toolbar-button-label-accent");
+        }
+    }
     // Debug log to help track down cases where UI shows zero
     std::cout << "DEBUG: totals computed -> quantity=" << debug_total_quantity << ", value=$" << debug_total_value << std::endl;
     // Update the columnview model
@@ -5907,9 +7019,10 @@ static void on_delete_deck_confirmed(GtkButton* button, gpointer user_data) {
     state->selected_deck_id = -1;
     if (state->deck_button) {
         gtk_widget_set_visible(state->deck_button, FALSE);
-        gtk_button_set_label(GTK_BUTTON(state->deck_button), "");
+        gtk_widget_remove_css_class(state->deck_button, "active");
+        gtk_widget_set_tooltip_text(state->deck_button, translate("Filtra per deck").c_str());
     }
-    if (state->deck_label) gtk_widget_set_visible(state->deck_label, FALSE);
+    if (state->deck_label) gtk_label_set_text(GTK_LABEL(state->deck_label), "");
     if (state->deck_delete_button) gtk_widget_set_visible(state->deck_delete_button, FALSE);
     if (state->db_button) gtk_widget_set_visible(state->db_button, FALSE);
     populate_deck_menu(state);
@@ -6002,14 +7115,17 @@ static void on_clear_deck(GSimpleAction *action, GVariant *parameter, gpointer u
     // Hide deck indicator/button
     if (state->deck_button) {
         gtk_widget_set_visible(state->deck_button, FALSE);
-        // clear label
-        gtk_button_set_label(GTK_BUTTON(state->deck_button), "");
+        gtk_widget_remove_css_class(state->deck_button, "active");
+        gtk_widget_set_tooltip_text(state->deck_button, translate("Filtra per deck").c_str());
     }
     if (state->deck_delete_button) {
         gtk_widget_set_visible(state->deck_delete_button, FALSE);
     }
     if (state->db_button) {
         gtk_widget_set_visible(state->db_button, FALSE);
+    }
+    if (state->deck_label) {
+        gtk_label_set_text(GTK_LABEL(state->deck_label), "");
     }
     refresh_card_list(state);
 }
@@ -6555,20 +7671,21 @@ static void on_select_deck_action(GSimpleAction *action, GVariant *parameter, gp
                 int id = atoi(idstr);
                 c->state->selected_deck_id = id;
                 // Update visible deck button with name
-                if (c->state->deck_button) {
-                    gtk_button_set_label(GTK_BUTTON(c->state->deck_button), namestr ? namestr : "");
+                if (c->state->deck_button && c->state->deck_label) {
+                    const char* deck_txt = namestr ? namestr : "";
+                    gtk_label_set_text(GTK_LABEL(c->state->deck_label), deck_txt);
                     gtk_widget_set_visible(c->state->deck_button, TRUE);
+                    gtk_widget_add_css_class(c->state->deck_button, "active");
+                    std::string tip = translate("Deck attivo");
+                    tip += ": ";
+                    tip += deck_txt;
+                    gtk_widget_set_tooltip_text(c->state->deck_button, tip.c_str());
                 }
                 if (c->state->deck_delete_button) {
                     gtk_widget_set_visible(c->state->deck_delete_button, TRUE);
                 }
                 if (c->state->db_button) {
                     gtk_widget_set_visible(c->state->db_button, TRUE);
-                }
-                if (c->state->deck_label) {
-                    std::string lbl = std::string("Filtrando: ") + (namestr ? namestr : "");
-                    gtk_label_set_text(GTK_LABEL(c->state->deck_label), lbl.c_str());
-                    gtk_widget_set_visible(c->state->deck_label, TRUE);
                 }
                 // Refresh list with deck filter
                 refresh_card_list(c->state);
@@ -6583,35 +7700,6 @@ static void on_select_deck_action(GSimpleAction *action, GVariant *parameter, gp
         delete c;
     }), sctx);
     gtk_window_present(GTK_WINDOW(dialog));
-}
-
-static GdkRGBA get_color_for_mana(const char* colors) {
-    // Parse colors and compute average RGB
-    if (!colors || strlen(colors) == 0) {
-        // Colorless: gray
-        return {0.5, 0.5, 0.5, 1.0};
-    }
-    std::vector<GdkRGBA> color_list;
-    for (char c : std::string(colors)) {
-        if (c == 'W') color_list.push_back({1.0, 0.95, 0.8, 1.0}); // White
-        else if (c == 'U') color_list.push_back({0.2, 0.4, 0.8, 1.0}); // Blue
-        else if (c == 'B') color_list.push_back({0.2, 0.1, 0.2, 1.0}); // Black
-        else if (c == 'R') color_list.push_back({0.8, 0.2, 0.1, 1.0}); // Red
-        else if (c == 'G') color_list.push_back({0.1, 0.6, 0.2, 1.0}); // Green
-    }
-    if (color_list.empty()) {
-        return {0.5, 0.5, 0.5, 1.0};
-    }
-    double r = 0, g = 0, b = 0;
-    for (auto& col : color_list) {
-        r += col.red;
-        g += col.green;
-        b += col.blue;
-    }
-    r /= color_list.size();
-    g /= color_list.size();
-    b /= color_list.size();
-    return {(float)r, (float)g, (float)b, 1.0f};
 }
 
 static void on_add_card_action(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
@@ -7046,7 +8134,7 @@ static void name_factory_bind_cb(GtkListItemFactory *factory, GtkListItem *item,
 
     std::string mana_text = row->mana_cost ? row->mana_cost : "";
     if (mana_label) {
-        gtk_label_set_text(GTK_LABEL(mana_label), mana_text.c_str());
+        set_label_with_mana_markup(mana_label, mana_text);
         gtk_widget_set_visible(mana_label, !mana_text.empty());
     }
 
@@ -7080,7 +8168,7 @@ static void name_factory_bind_cb(GtkListItemFactory *factory, GtkListItem *item,
     if (oracle_label && oracle_section) {
         std::string oracle_text = row->oracle_text ? row->oracle_text : "";
         oracle_text.erase(std::remove(oracle_text.begin(), oracle_text.end(), '\r'), oracle_text.end());
-        gtk_label_set_text(GTK_LABEL(oracle_label), oracle_text.c_str());
+    set_label_with_mana_markup(oracle_label, oracle_text);
         bool has_oracle = !oracle_text.empty();
         gtk_widget_set_visible(oracle_label, has_oracle);
         gtk_widget_set_visible(oracle_section, has_oracle);
@@ -7204,290 +8292,31 @@ static gboolean on_oracle_update_invoke(gpointer user_data) {
 static void on_activate(GtkApplication *app, gpointer user_data) {
     // Carica CSS personalizzato
     GtkCssProvider *provider = gtk_css_provider_new();
-    gtk_css_provider_load_from_string(provider,
-        "@define-color bg_base #0f121a;\n"
-        "@define-color bg_surface #151b26;\n"
-        "@define-color bg_panel #1c2432;\n"
-        "@define-color accent_primary #8a6cff;\n"
-        "@define-color accent_secondary #f56fbb;\n"
-        "@define-color accent_tertiary #3dc9ff;\n"
-        "@define-color text_primary #ecf0ff;\n"
-        "@define-color text_muted #9aa7bd;\n"
-        "@define-color outline_color rgba(138,108,255,0.45);\n"
-        ".small-popover { padding: 0; margin: 0; border: 1px solid rgba(255,255,255,0.08); background-color: @bg_panel; color: @text_primary; }\n"
-        "window {\n"
-        "    background-color: @bg_base;\n"
-        "    background-image: radial-gradient(circle at 12% 20%, rgba(138,108,255,0.22), transparent 55%),\n"
-        "                      radial-gradient(circle at 88% 10%, rgba(61,201,255,0.12), transparent 50%),\n"
-        "                      radial-gradient(circle at 50% 100%, rgba(245,111,187,0.10), transparent 60%);\n"
-        "    color: @text_primary;\n"
-        "    font-family: 'Inter', 'Segoe UI', 'Ubuntu', sans-serif;\n"
-        "    font-size: 13px;\n"
-        "}\n"
-        "headerbar,\n"
-        ".topbar {\n"
-        "    padding: 1px 6px;\n"
-        "    min-height: 24px;\n"
-        "    background-image: linear-gradient(180deg, rgba(28,36,50,0.95), rgba(19,25,36,0.92));\n"
-        "    border-bottom: 1px solid rgba(255,255,255,0.06);\n"
-        "    box-shadow: 0 1px 0 rgba(255,255,255,0.04);\n"
-        "}\n"
-        "headerbar button,\n"
-        "headerbar menubutton,\n"
-        "button,\n"
-        "menubutton {\n"
-        "    border-radius: 6px;\n"
-        "    padding: 1px 6px;\n"
-        "    background-color: rgba(21,27,38,0.8);\n"
-        "    color: @text_primary;\n"
-        "    border: 1px solid rgba(255,255,255,0.06);\n"
-        "    transition: all 0.14s ease;\n"
-        "}\n"
-        "button:hover,\n"
-        "menubutton:hover {\n"
-        "    background-color: rgba(138,108,255,0.18);\n"
-        "    border-color: outline_color;\n"
-        "    box-shadow: 0 3px 10px rgba(138,108,255,0.25);\n"
-        "}\n"
-        "button:active,\n"
-        "menubutton:active {\n"
-        "    background-color: rgba(138,108,255,0.28);\n"
-        "    border-color: rgba(138,108,255,0.55);\n"
-        "    box-shadow: inset 0 0 0 1px rgba(0,0,0,0.4);\n"
-        "}\n"
-        ".accent-button {\n"
-        "    background-image: linear-gradient(135deg, rgba(138,108,255,0.85), rgba(245,111,187,0.85));\n"
-        "    border-color: rgba(138,108,255,0.55);\n"
-        "}\n"
-        ".accent-button:hover {\n"
-        "    background-image: linear-gradient(135deg, rgba(148,118,255,0.95), rgba(247,125,197,0.95));\n"
-        "    box-shadow: 0 6px 18px rgba(138,108,255,0.45);\n"
-        "}\n"
-        ".ghost-button {\n"
-        "    background-color: transparent;\n"
-        "    border-color: rgba(255,255,255,0.08);\n"
-        "}\n"
-        ".ghost-button:hover {\n"
-        "    background-color: rgba(255,255,255,0.05);\n"
-        "}\n"
-        ".danger-button {\n"
-        "    color: #ff8097;\n"
-        "    border-color: rgba(255,128,151,0.35);\n"
-        "}\n"
-        ".danger-button:hover {\n"
-        "    background-color: rgba(255,64,115,0.18);\n"
-        "    border-color: rgba(255,128,151,0.6);\n"
-        "}\n"
-    ".compact-button {\n"
-    "    padding: 2px 10px;\n"
-    "    min-height: 22px;\n"
-    "    font-size: 12px;\n"
-    "}\n"
-    ".compact-button:hover {\n"
-    "    background-color: rgba(255,255,255,0.06);\n"
-    "}\n"
-        "headerbar entry,\n"
-        "entry,\n"
-        "spinbutton {\n"
-        "    border-radius: 6px;\n"
-        "    padding: 1px 6px;\n"
-        "    background-color: rgba(10,14,22,0.95);\n"
-        "    color: @text_primary;\n"
-        "    border: 1px solid rgba(255,255,255,0.08);\n"
-        "    transition: all 0.16s ease;\n"
-        "}\n"
-        "entry:hover,\n"
-        "spinbutton:hover {\n"
-        "    border-color: outline_color;\n"
-        "    background-color: rgba(28,36,50,0.95);\n"
-        "}\n"
-        "entry:focus,\n"
-        "spinbutton:focus {\n"
-        "    outline: none;\n"
-        "    border-color: rgba(138,108,255,0.75);\n"
-        "    box-shadow: 0 0 0 3px rgba(138,108,255,0.25);\n"
-        "}\n"
-        ".inline-field {\n"
-        "    background-color: rgba(18,23,34,0.95);\n"
-        "}\n"
-        ".inline-toggle {\n"
-        "    padding: 2px 8px;\n"
-        "}\n"
-        ".search-field {\n"
-        "    min-width: 220px;\n"
-        "    background-color: rgba(18,24,36,0.92);\n"
-        "}\n"
-        ".search-field:focus {\n"
-        "    border-color: rgba(61,201,255,0.65);\n"
-        "    box-shadow: 0 0 0 3px rgba(61,201,255,0.18);\n"
-        "}\n"
-        "columnview {\n"
-        "    background-color: @bg_surface;\n"
-        "    border: 1px solid rgba(255,255,255,0.05);\n"
-        "    border-radius: 10px;\n"
-        "    color: @text_primary;\n"
-        "}\n"
-        "columnview row {\n"
-        "    padding: 8px 12px;\n"
-        "    background-color: transparent;\n"
-        "}\n"
-        "columnview row:nth-child(even) {\n"
-        "    background-color: rgba(21,27,38,0.4);\n"
-        "}\n"
-        "columnview row:hover {\n"
-        "    background-color: rgba(138,108,255,0.18);\n"
-        "}\n"
-        "columnview row:selected,\n"
-        "columnview row:selected:hover {\n"
-        "    background-image: linear-gradient(135deg, rgba(138,108,255,0.4), rgba(61,201,255,0.28));\n"
-        "    border-radius: 8px;\n"
-        "    color: @text_primary;\n"
-        "}\n"
-        "columnview row:selected label {\n"
-        "    color: @text_primary;\n"
-        "}\n"
-    ".db-row {\n"
-    "    padding: 4px 0;\n"
-    "    border-radius: 10px;\n"
-    "}\n"
-    ".db-row:hover {\n"
-    "    background-color: rgba(138,108,255,0.12);\n"
-    "}\n"
-        "scrolledwindow.card-scroller {\n"
-        "    border-radius: 12px;\n"
-        "    box-shadow: 0 18px 40px rgba(5,10,20,0.55);\n"
-        "    background-color: rgba(16,20,28,0.8);\n"
-        "    border: 1px solid rgba(255,255,255,0.05);\n"
-        "}\n"
-        "label { color: @text_primary; }\n"
-    ".name-label { font-weight: 600; letter-spacing: 0.2px; color: @text_primary; }\n"
-    ".meta-label { font-size: 12px; color: @text_muted; }\n"
-        "label.muted { color: @text_muted; }\n"
-    ".detail-panel {\n"
-    "    background-color: rgba(14,20,32,0.92);\n"
-    "    border: 1px solid rgba(138,108,255,0.18);\n"
-    "    border-radius: 12px;\n"
-    "    box-shadow: inset 0 0 0 1px rgba(0,0,0,0.35), 0 14px 28px rgba(6,10,18,0.55);\n"
-    "}\n"
-    ".detail-content { align-items: flex-start; }\n"
-    ".detail-preview { min-width: 210px; }\n"
-    ".detail-art-frame { border-radius: 16px; background-image: radial-gradient(circle at 30% 20%, rgba(138,108,255,0.32), transparent 70%), linear-gradient(180deg, rgba(24,30,45,0.95), rgba(12,18,30,0.9)); border: 1px solid rgba(138,108,255,0.22); box-shadow: 0 18px 40px rgba(5,10,25,0.35); }\n"
-    ".detail-art { background-color: rgba(8,12,20,0.9); }\n"
-    ".detail-actions { padding-top: 8px; }\n"
-    ".detail-info { padding-top: 4px; }\n"
-    ".detail-meta-line { font-size: 12px; color: @text_muted; }\n"
-    ".detail-chip { background-color: rgba(138,108,255,0.18); color: @text_primary; border-radius: 999px; padding: 2px 10px; font-size: 12px; letter-spacing: 0.4px; }\n"
-    ".detail-qty-chip { background-color: rgba(61,201,255,0.18); font-weight: 600; }\n"
-    ".detail-stat-grid { margin-top: 4px; }\n"
-    ".detail-stat-name { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: rgba(154,167,189,0.85); }\n"
-    ".detail-stat-value { font-size: 12px; color: @text_primary; }\n"
-    ".detail-section { margin-top: 10px; }\n"
-    ".detail-section-title { font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: rgba(154,167,189,0.9); }\n"
-    ".detail-oracle-scroll { border-radius: 10px; border: 1px solid rgba(138,108,255,0.22); background-color: rgba(14,20,32,0.88); }\n"
-    ".detail-oracle-container { padding: 8px 10px; }\n"
-    ".detail-title { font-size: 15px; font-weight: 600; color: @text_primary; }\n"
-    ".detail-meta { font-size: 12px; color: @text_muted; }\n"
-    ".detail-text { font-size: 12px; line-height: 1.4; color: @text_primary; opacity: 0.88; }\n"
-    ".stat-label { color: @accent_primary; font-weight: 600; }\n"
-    ".foil { color: #ffd977; text-shadow: 0 0 4px rgba(255,217,119,0.42); }\n"
-    ".stats-root { color: @text_primary; }\n"
-    ".stats-hero { background-image: linear-gradient(135deg, rgba(138,108,255,0.26), rgba(61,201,255,0.18)); border: 1px solid rgba(138,108,255,0.32); border-radius: 20px; padding: 20px 24px; box-shadow: 0 20px 48px rgba(10,16,32,0.45); }\n"
-    ".stats-hero-left { min-width: 240px; }\n"
-    ".stats-hero-title { font-size: 22px; font-weight: 700; letter-spacing: 0.3px; color: @text_primary; }\n"
-    ".stats-hero-subtitle { color: rgba(236,240,255,0.75); font-size: 13px; max-width: 540px; }\n"
-    ".stats-hero-back { margin-bottom: 6px; padding: 2px 12px; min-width: 0; font-size: 12px; }\n"
-    ".stats-hero-metrics { padding-left: 12px; }\n"
-    ".stats-hero-pill { min-width: 130px; padding: 10px 14px; border-radius: 14px; background-color: rgba(12,16,28,0.65); border: 1px solid rgba(255,255,255,0.08); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.05); }\n"
-    ".stats-hero-pill-title { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: rgba(236,240,255,0.6); }\n"
-    ".stats-hero-pill-value { font-size: 20px; font-weight: 600; }\n"
-    ".stats-hero-pill-subtitle { font-size: 12px; color: rgba(236,240,255,0.55); }\n"
-    ".stats-content { margin-top: 20px; }\n"
-    ".stats-card { background-color: rgba(16,22,34,0.9); border: 1px solid rgba(138,108,255,0.22); border-radius: 18px; padding: 18px 20px; box-shadow: 0 16px 40px rgba(6,12,28,0.38); }\n"
-    ".stats-chart-card { padding-bottom: 20px; }\n"
-    ".stats-highlights-card { background-image: linear-gradient(135deg, rgba(61,201,255,0.12), rgba(138,108,255,0.14)); }\n"
-    ".stats-card-title { font-size: 12px; text-transform: uppercase; letter-spacing: 0.12em; color: rgba(236,240,255,0.68); margin-bottom: 6px; }\n"
-    ".stats-card-subtitle { font-size: 12px; color: rgba(236,240,255,0.55); margin-bottom: 6px; }\n"
-    ".stats-card-hint { font-size: 11px; color: rgba(236,240,255,0.4); }\n"
-    ".stats-switch { background-color: rgba(10,14,26,0.85); border-radius: 999px; padding: 4px; border: 1px solid rgba(138,108,255,0.28); }\n"
-    ".stats-switch-button { background-color: transparent; border: none; color: rgba(236,240,255,0.78); padding: 6px 18px; border-radius: 999px; box-shadow: none; }\n"
-    ".stats-switch-button:hover { background-color: rgba(138,108,255,0.18); border: none; }\n"
-    ".stats-switch-active { background-image: linear-gradient(135deg, rgba(138,108,255,0.92), rgba(61,201,255,0.65)); color: #ffffff; box-shadow: 0 8px 22px rgba(138,108,255,0.42); }\n"
-    ".stats-chart-frame { border-radius: 16px; border: 1px solid rgba(138,108,255,0.26); background-color: rgba(10,14,24,0.92); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.04); }\n"
-    ".stats-pill { background-image: linear-gradient(180deg, rgba(255,255,255,0.06), rgba(0,0,0,0.26)); border-radius: 14px; border: 1px solid rgba(138,108,255,0.18); padding: 10px 14px; min-width: 130px; box-shadow: 0 12px 28px rgba(6,12,30,0.32); }\n"
-    ".stats-pill-title { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: rgba(236,240,255,0.6); }\n"
-    ".stats-pill-value { font-size: 20px; font-weight: 600; }\n"
-    ".stats-pill-subtitle { font-size: 12px; color: rgba(236,240,255,0.58); }\n"
-    ".stats-pill-flow { padding-top: 4px; }\n"
-    ".stats-panel { background-color: rgba(16,24,38,0.88); border-radius: 16px; border: 1px solid rgba(138,108,255,0.2); padding: 16px 18px; box-shadow: 0 14px 32px rgba(6,12,26,0.34); }\n"
-    ".stats-panel-title { font-size: 13px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: rgba(236,240,255,0.72); }\n"
-    ".stats-grid { margin-top: 10px; }\n"
-    ".stats-grid-header { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: rgba(236,240,255,0.55); }\n"
-    ".stats-highlight-list { margin-top: 6px; }\n"
-    ".stats-highlight-item { align-items: flex-start; }\n"
-    ".stats-highlight-bullet { font-size: 18px; color: rgba(236,240,255,0.4); margin-top: -2px; }\n"
-    ".stats-highlight-text { font-size: 12px; color: rgba(236,240,255,0.7); }\n"
-    ".stats-actions-card { padding-bottom: 18px; }\n"
-    ".stats-action-button { min-width: 140px; }\n"
-        "menu,\n"
-        "popover,\n"
-        ".popover {\n"
-        "    background-color: @bg_panel;\n"
-        "    color: @text_primary;\n"
-        "}\n"
-        "menuitem,\n"
-        "popover modelbutton {\n"
-        "    padding: 6px 12px;\n"
-    "    border-radius: 6px;\n"
-        "}\n"
-        "menuitem:hover,\n"
-        "popover modelbutton:hover {\n"
-        "    background-color: rgba(138,108,255,0.18);\n"
-        "}\n"
-    "menuitem:selected,\n"
-    "popover modelbutton:selected {\n"
-    "    background-image: linear-gradient(135deg, rgba(138,108,255,0.28), rgba(61,201,255,0.22));\n"
-    "}\n"
-        "checkbutton,\n"
-        "radiobutton {\n"
-        "    color: @text_primary;\n"
-        "}\n"
-        "separator {\n"
-        "    background-color: rgba(255,255,255,0.08);\n"
-        "}\n"
-        "scrollbar slider {\n"
-        "    background-color: rgba(255,255,255,0.18);\n"
-        "    border-radius: 999px;\n"
-        "}\n"
-        "scrollbar slider:hover {\n"
-        "    background-color: rgba(138,108,255,0.45);\n"
-        "}\n"
-    ".toolbar {\n"
-    "    padding: 6px 12px;\n"
-    "    border-radius: 18px;\n"
-    "    background-color: rgba(22, 24, 37, 0.86);\n"
-    "    border: 1px solid rgba(255,255,255,0.05);\n"
-    "    box-shadow: 0 12px 32px rgba(6, 10, 24, 0.45);\n"
-    "}\n"
-    ".toolbar button,\n"
-    ".toolbar menubutton,\n"
-    ".toolbar entry {\n"
-    "    min-height: 32px;\n"
-    "}\n"
-    ".toolbar .inline-field {\n"
-    "    min-height: 32px;\n"
-    "}\n"
-    ".toolbar .inline-toggle {\n"
-    "    padding: 6px 12px;\n"
-    "}\n"
-    ".toolbar .search-field {\n"
-    "    min-width: 220px;\n"
-    "}\n"
-        "headerbar button,\n"
-        "headerbar menubutton,\n"
-        "headerbar entry {\n"
-        "    min-height: 22px;\n"
-        "}\n"
-    );
+    std::string css_data;
+    const char* css_path = "src/style.css";
+    std::ifstream css_file(css_path);
+    if (css_file.good()) {
+        css_data.assign(std::istreambuf_iterator<char>(css_file), std::istreambuf_iterator<char>());
+    }
+    try {
+        std::filesystem::path font_path = std::filesystem::absolute("img/mana/fonts/mana.ttf");
+        if (std::filesystem::exists(font_path)) {
+            char* font_uri = g_filename_to_uri(font_path.string().c_str(), NULL, NULL);
+            if (font_uri) {
+                css_data.append("\n@font-face { font-family: 'Mana'; src: url('");
+                css_data.append(font_uri);
+                css_data.append("') format('truetype'); font-weight: normal; font-style: normal; }\n");
+                g_free(font_uri);
+            }
+        }
+    } catch (...) {
+        std::cerr << "Warning: unable to resolve Mana font path" << std::endl;
+    }
+    if (!css_data.empty()) {
+        gtk_css_provider_load_from_data(provider, css_data.c_str(), static_cast<gssize>(css_data.size()));
+    } else {
+        std::cerr << "Warning: unable to load CSS from " << css_path << ". UI will use default GTK styles." << std::endl;
+    }
     gtk_style_context_add_provider_for_display(
         gdk_display_get_default(),
         GTK_STYLE_PROVIDER(provider),
@@ -7510,7 +8339,19 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     g_menu_append_submenu(file_menu, "Seleziona Deck", G_MENU_MODEL(deck_menu));
 
     GtkWidget *file_button = gtk_menu_button_new();
-    gtk_menu_button_set_label(GTK_MENU_BUTTON(file_button), "File");
+    gtk_widget_add_css_class(file_button, "toolbar-trigger");
+    GtkWidget *file_content = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_widget_add_css_class(file_content, "toolbar-menubutton");
+    GtkWidget *file_icon = gtk_image_new_from_icon_name("document-open-symbolic");
+    gtk_widget_add_css_class(file_icon, "toolbar-icon");
+    GtkWidget *file_label = gtk_label_new("File");
+    gtk_widget_add_css_class(file_label, "toolbar-button-label");
+    GtkWidget *file_arrow = gtk_image_new_from_icon_name("pan-down-symbolic");
+    gtk_widget_add_css_class(file_arrow, "toolbar-arrow");
+    gtk_box_append(GTK_BOX(file_content), file_icon);
+    gtk_box_append(GTK_BOX(file_content), file_label);
+    gtk_box_append(GTK_BOX(file_content), file_arrow);
+    gtk_menu_button_set_child(GTK_MENU_BUTTON(file_button), file_content);
     gtk_menu_button_set_menu_model(GTK_MENU_BUTTON(file_button), G_MENU_MODEL(file_menu));
 
     // View menu with language submenu
@@ -7526,15 +8367,31 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     g_object_unref(lang_menu);
 
     GtkWidget *view_button = gtk_menu_button_new();
-    gtk_menu_button_set_label(GTK_MENU_BUTTON(view_button), "Visualizza");
+    gtk_widget_add_css_class(view_button, "toolbar-trigger");
+    GtkWidget *view_content = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_widget_add_css_class(view_content, "toolbar-menubutton");
+    GtkWidget *view_icon = gtk_image_new_from_icon_name("view-grid-symbolic");
+    gtk_widget_add_css_class(view_icon, "toolbar-icon");
+    GtkWidget *view_label = gtk_label_new("Visualizza");
+    gtk_widget_add_css_class(view_label, "toolbar-button-label");
+    GtkWidget *view_arrow = gtk_image_new_from_icon_name("pan-down-symbolic");
+    gtk_widget_add_css_class(view_arrow, "toolbar-arrow");
+    gtk_box_append(GTK_BOX(view_content), view_icon);
+    gtk_box_append(GTK_BOX(view_content), view_label);
+    gtk_box_append(GTK_BOX(view_content), view_arrow);
+    gtk_menu_button_set_child(GTK_MENU_BUTTON(view_button), view_content);
     gtk_menu_button_set_menu_model(GTK_MENU_BUTTON(view_button), G_MENU_MODEL(view_menu));
     // view_menu is stored in state->view_menu so we keep a reference to it
 
 
     // Box per il nome del database attualmente aperto
     GtkWidget *db_name_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    gtk_widget_add_css_class(db_name_box, "db-indicator");
+    GtkWidget *db_name_icon = gtk_image_new_from_icon_name("database-symbolic");
+    gtk_widget_add_css_class(db_name_icon, "db-indicator-icon");
     GtkWidget *db_name_label = gtk_label_new("Nessun database aperto");
     gtk_widget_add_css_class(db_name_label, "muted");
+    gtk_box_append(GTK_BOX(db_name_box), db_name_icon);
     gtk_box_append(GTK_BOX(db_name_box), db_name_label);
 
     // Stato globale dell'applicazione
@@ -7544,14 +8401,29 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     state->db_name_label = db_name_label;
     state->total_cards_label = gtk_label_new("Totale carte: 0");
     gtk_widget_add_css_class(state->total_cards_label, "stat-label");
-    state->filter_label = gtk_label_new("");
-    gtk_widget_add_css_class(state->filter_label, "muted");
+    GtkWidget *filter_chip = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    gtk_widget_add_css_class(filter_chip, "filter-chip");
+    gtk_widget_add_css_class(filter_chip, "toolbar-pill");
+    GtkWidget *filter_icon = gtk_image_new_from_icon_name("view-filter-symbolic");
+    gtk_widget_add_css_class(filter_icon, "filter-chip-icon");
+    GtkWidget *filter_label = gtk_label_new("");
+    gtk_widget_add_css_class(filter_label, "filter-chip-label");
+    gtk_box_append(GTK_BOX(filter_chip), filter_icon);
+    gtk_box_append(GTK_BOX(filter_chip), filter_label);
+    gtk_widget_set_visible(filter_chip, FALSE);
+    state->filter_chip = filter_chip;
+    state->filter_label = filter_label;
     state->selected_deck_id = -1;
     state->deck_button = NULL;
     state->deck_label = NULL;
     state->deck_delete_button = NULL;
     state->db_button = NULL;
     state->refresh_button = NULL;
+    state->file_button_label = NULL;
+    state->view_button_label = NULL;
+    state->view_button_box = NULL;
+    state->view_button_icon = NULL;
+    state->view_button_arrow = NULL;
     state->search_debounce_id = 0;
     state->main_window = window;
     state->main_stack = NULL;
@@ -7561,6 +8433,11 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     state->stats_placeholder = NULL;
     state->stats_ctx = NULL;
     state->has_oracle_text_column = false;
+    state->welcome_revealer = NULL;
+    state->welcome_spinner = NULL;
+    state->main_overlay = NULL;
+    state->welcome_timeout_id = 0;
+    state->welcome_visible = false;
     state->name_col = state->type_col = state->colors_col = state->mana_col = state->rarity_col = state->date_col = state->qty_col = state->price_col = NULL;
     state->filter_colors.clear();
     state->filter_rarities.clear();
@@ -7611,6 +8488,11 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     state->add_card_button = add_card_button;
     state->file_button = file_button;
     state->view_button = view_button;
+    state->file_button_label = file_label;
+    state->view_button_label = view_label;
+    state->view_button_box = view_content;
+    state->view_button_icon = view_icon;
+    state->view_button_arrow = view_arrow;
     // Attach deck_menu (created above) to state so we can populate it dynamically
     state->deck_menu = deck_menu;
     // Keep file and view menu objects so we can rebuild them on language change
@@ -7619,6 +8501,7 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     // Add extra translations map entries (kept separate for clarity)
     __add_extra_translations();
     __add_more_translations();
+    __add_welcome_translations();
     __add_tendina_translations();
     __add_settings_translations();
     // Ensure menus reflect current language
@@ -7627,11 +8510,23 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     populate_deck_menu(state);
 
     // Deck indicator / clear-filter button (hidden when not filtering)
-    GtkWidget *deck_button = gtk_button_new_with_label("");
-    gtk_widget_add_css_class(deck_button, "ghost-button");
+    GtkWidget *deck_button = gtk_button_new();
+    gtk_widget_add_css_class(deck_button, "deck-chip");
+    gtk_widget_add_css_class(deck_button, "toolbar-pill");
+    gtk_widget_set_visible(deck_button, FALSE);
+    GtkWidget *deck_content = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_widget_add_css_class(deck_content, "deck-chip-content");
+    GtkWidget *deck_icon = gtk_image_new_from_icon_name("view-grid-symbolic");
+    gtk_widget_add_css_class(deck_icon, "deck-chip-icon");
     GtkWidget *deck_label = gtk_label_new("");
-    gtk_widget_add_css_class(deck_label, "stat-label");
-    gtk_widget_set_visible(deck_label, FALSE);
+    gtk_widget_add_css_class(deck_label, "deck-chip-label");
+    GtkWidget *deck_clear = gtk_image_new_from_icon_name("window-close-symbolic");
+    gtk_widget_add_css_class(deck_clear, "deck-chip-clear");
+    gtk_box_append(GTK_BOX(deck_content), deck_icon);
+    gtk_box_append(GTK_BOX(deck_content), deck_label);
+    gtk_box_append(GTK_BOX(deck_content), deck_clear);
+    gtk_button_set_child(GTK_BUTTON(deck_button), deck_content);
+    gtk_widget_set_tooltip_text(deck_button, translate("Filtra per deck").c_str());
     // Clicking it clears the deck filter
     g_signal_connect(deck_button, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data) {
         GtkWindow *window = GTK_WINDOW(user_data);
@@ -7659,6 +8554,7 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     gtk_widget_set_visible(db_button, FALSE);
     gtk_widget_set_tooltip_text(db_button, translate("Database").c_str());
     gtk_widget_add_css_class(db_button, "ghost-button");
+    gtk_widget_add_css_class(db_button, "toolbar-pill");
     g_signal_connect(db_button, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data) {
         GtkWindow *window = GTK_WINDOW(user_data);
         AppState* state = (AppState*)g_object_get_data(G_OBJECT(window), "app_state");
@@ -7709,6 +8605,7 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
 
     gtk_box_append(GTK_BOX(toolbar_right), add_card_button);
     gtk_box_append(GTK_BOX(toolbar_right), refresh_button);
+    gtk_box_append(GTK_BOX(toolbar_right), deck_button);
     // Inline add controls (shown in main DB view). These replace the old
     // modal add dialog for quick additions: entry + quantity spin + foil.
     GtkWidget *inline_entry = gtk_entry_new();
@@ -7799,65 +8696,108 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     GtkColumnView *column_view = GTK_COLUMN_VIEW(gtk_column_view_new(NULL));
     gtk_column_view_set_model(column_view, GTK_SELECTION_MODEL(gtk_single_selection_new(G_LIST_MODEL(state->card_store))));
 
-    // Colonna Colore (quadratino)
+    // Colonna Tipo (icone)
     GtkListItemFactory *color_factory = gtk_signal_list_item_factory_new();
     g_signal_connect(color_factory, "setup", G_CALLBACK(+[](GtkListItemFactory *, GtkListItem *item, gpointer) {
-    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
-    gtk_widget_add_css_class(box, "color-box");
-    // Use CSS-based sizing (1em) so the color square matches the font height and stays square.
-    // Center vertically relative to the row text and prevent the box from expanding to fill the cell.
-        /* make this cell respond to double-click/right-click like the name column */
+        GtkWidget *root = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+        gtk_widget_set_halign(root, GTK_ALIGN_CENTER);
+        gtk_widget_set_valign(root, GTK_ALIGN_CENTER);
+        gtk_widget_add_css_class(root, "type-icon-cell");
+
+        GtkWidget *icon_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
+        gtk_box_set_spacing(GTK_BOX(icon_box), 2);
+        gtk_widget_add_css_class(icon_box, "type-icon-row");
+        gtk_box_append(GTK_BOX(root), icon_box);
+
+        GtkWidget *fallback_label = gtk_label_new("");
+        gtk_widget_add_css_class(fallback_label, "type-icon-fallback");
+        gtk_widget_set_visible(fallback_label, FALSE);
+        gtk_box_append(GTK_BOX(root), fallback_label);
+
+        gtk_list_item_set_child(item, root);
+
+        g_object_set_data(G_OBJECT(item), "type_icon_root", root);
+        g_object_set_data(G_OBJECT(item), "type_icon_box", icon_box);
+        g_object_set_data(G_OBJECT(item), "type_icon_fallback", fallback_label);
+
         GtkGesture *dbl = gtk_gesture_click_new();
         gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(dbl), GDK_BUTTON_PRIMARY);
         g_signal_connect(dbl, "pressed", G_CALLBACK(on_row_double_click), item);
-        gtk_widget_add_controller(box, GTK_EVENT_CONTROLLER(dbl));
-        gtk_list_item_set_child(item, box);
+        gtk_widget_add_controller(root, GTK_EVENT_CONTROLLER(dbl));
+
+        GtkGesture *rclk = gtk_gesture_click_new();
+        gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(rclk), GDK_BUTTON_SECONDARY);
+        g_signal_connect(rclk, "pressed", G_CALLBACK(on_row_right_click), item);
+        gtk_widget_add_controller(root, GTK_EVENT_CONTROLLER(rclk));
+
+        GtkEventController *motion = gtk_event_controller_motion_new();
+        g_signal_connect(motion, "enter", G_CALLBACK(on_row_enter), item);
+        gtk_widget_add_controller(root, motion);
     }), NULL);
     g_signal_connect(color_factory, "bind", G_CALLBACK(+[](GtkListItemFactory *, GtkListItem *item, gpointer) {
         CardRow *row = (CardRow*)gtk_list_item_get_item(item);
-        GtkWidget *box = gtk_list_item_get_child(item);
+        GtkWidget *root = (GtkWidget*)g_object_get_data(G_OBJECT(item), "type_icon_root");
+        GtkWidget *icon_box = (GtkWidget*)g_object_get_data(G_OBJECT(item), "type_icon_box");
+        GtkWidget *fallback_label = (GtkWidget*)g_object_get_data(G_OBJECT(item), "type_icon_fallback");
         if (!row) {
-            gtk_widget_set_visible(box, FALSE);
+            gtk_widget_set_visible(root, FALSE);
             gtk_list_item_set_selectable(item, FALSE);
             return;
         }
         if (row->id == ROW_ID_SEPARATOR_TITLE || row->id == ROW_ID_HEADER) {
-            // Visual-only rows: hide the color box and make item non-selectable
-            gtk_widget_set_visible(box, FALSE);
+            gtk_widget_set_visible(root, FALSE);
             gtk_list_item_set_selectable(item, FALSE);
+            gtk_widget_set_tooltip_text(root, nullptr);
             return;
         }
-        gtk_widget_set_visible(box, TRUE);
-        // Calcola colore basato su row->colors
-        GdkRGBA color = get_color_for_mana(row->colors ? row->colors : "");
-        char css_buf[512];
-        // width/height in em units makes the box side equal to current font size (approx. font height)
-        // force min/max to keep it square. Add a small border-radius for nicer look.
-       /* GTK CSS doesn't support the 'width', 'height', 'max-width', 'max-height' or 'display'
-        * properties in the same way as browser CSS. Use min-width/min-height and border-radius
-        * only to avoid theme parser warnings. */
-       snprintf(css_buf, sizeof(css_buf), ".color-box { background-color: rgba(%d,%d,%d,1.0); border: 1px solid rgba(0,0,0,0.6); min-width: 1em; min-height: 1em; border-radius: 2px; }",
-           (int)(color.red * 255), (int)(color.green * 255), (int)(color.blue * 255));
-        GtkCssProvider *prov = gtk_css_provider_new();
-        gtk_css_provider_load_from_string(prov, css_buf);
-        gtk_style_context_add_provider(gtk_widget_get_style_context(box), GTK_STYLE_PROVIDER(prov), GTK_STYLE_PROVIDER_PRIORITY_USER);
-        g_object_unref(prov);
-        // Aggiungi gesture per click destro
-        GtkGesture *gesture = gtk_gesture_click_new();
-        gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(gesture), GDK_BUTTON_SECONDARY);
-        g_signal_connect(gesture, "pressed", G_CALLBACK(on_row_right_click), item);
-        gtk_widget_add_controller(box, GTK_EVENT_CONTROLLER(gesture));
-        // Aggiungi controller per hover immagine
-        GtkEventController *motion = gtk_event_controller_motion_new();
-        g_signal_connect(motion, "enter", G_CALLBACK(on_row_enter), item);
-        gtk_widget_add_controller(box, motion);
-    /* visibility for this cell depends only on deck membership. The small
-     * color-square column should remain visible when the tendina is open; we
-     * only hide it when the card is in a deck. */
-    char* _in_deck = (char*)g_object_get_data(G_OBJECT(item), "in_deck_names");
-    if (_in_deck && strlen(_in_deck) > 0) gtk_widget_set_visible(box, FALSE); else gtk_widget_set_visible(box, TRUE);
+
+        gtk_widget_set_visible(root, TRUE);
+        gtk_list_item_set_selectable(item, TRUE);
+
+        std::string type_line = row->type ? row->type : "";
+        std::string type_line_en = row->type_english ? row->type_english : "";
+        if (type_line_en.empty()) {
+            type_line_en = english_for_localized_type(type_line);
+        }
+        if (type_line_en.empty()) {
+            type_line_en = type_line;
+        }
+        std::vector<std::string> type_tokens = parse_type_line_tokens(type_line_en);
+        std::vector<const TypeIconDescriptor*> descriptors = select_type_icon_descriptors(type_tokens);
+        bool has_icons = populate_type_icon_box(icon_box, descriptors);
+        if (has_icons) {
+            gtk_widget_set_visible(icon_box, TRUE);
+            gtk_widget_set_visible(fallback_label, FALSE);
+        } else {
+            std::string fallback_letter = build_type_fallback_letter(type_tokens, type_line);
+            if (!fallback_letter.empty()) {
+                gtk_label_set_text(GTK_LABEL(fallback_label), fallback_letter.c_str());
+            } else {
+                gtk_label_set_text(GTK_LABEL(fallback_label), "–");
+            }
+            gtk_widget_set_visible(fallback_label, TRUE);
+            gtk_widget_set_visible(icon_box, FALSE);
+        }
+
+        if (!type_line.empty()) {
+            gtk_widget_set_tooltip_text(root, type_line.c_str());
+        } else {
+            gtk_widget_set_tooltip_text(root, nullptr);
+        }
+
+        char* in_deck = (char*)g_object_get_data(G_OBJECT(item), "in_deck_names");
+        gpointer tendina = row ? g_object_get_data(G_OBJECT(row), "tendina_open") : NULL;
+        if (!tendina) tendina = g_object_get_data(G_OBJECT(item), "tendina_open");
+        gboolean is_open = tendina ? (GPOINTER_TO_INT(tendina) != 0) : FALSE;
+        gboolean visible = !((in_deck && strlen(in_deck) > 0) || is_open);
+        gtk_widget_set_visible(root, visible);
+        if (!visible) {
+            gtk_widget_set_tooltip_text(root, nullptr);
+        }
     }), NULL);
-    GtkColumnViewColumn *color_col = gtk_column_view_column_new(NULL, color_factory);
+    GtkColumnViewColumn *color_col = gtk_column_view_column_new("", color_factory);
+    gtk_column_view_column_set_fixed_width(color_col, 48);
+    gtk_column_view_column_set_resizable(color_col, FALSE);
     gtk_column_view_append_column(column_view, color_col);
 
     // Colonna Nome
@@ -7932,30 +8872,56 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     // Colonna Colori
     GtkListItemFactory *colors_factory = gtk_signal_list_item_factory_new();
     g_signal_connect(colors_factory, "setup", G_CALLBACK(+[](GtkListItemFactory *, GtkListItem *item, gpointer) {
+        GtkWidget *root = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+        gtk_widget_set_halign(root, GTK_ALIGN_CENTER);
+        gtk_widget_set_valign(root, GTK_ALIGN_CENTER);
+        GtkWidget *stack = gtk_stack_new();
+        gtk_stack_set_hhomogeneous(GTK_STACK(stack), FALSE);
+        gtk_stack_set_vhomogeneous(GTK_STACK(stack), FALSE);
+        gtk_box_append(GTK_BOX(root), stack);
+
+        GtkWidget *icon_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+        gtk_widget_add_css_class(icon_box, "color-icon-row");
+        gtk_widget_set_halign(icon_box, GTK_ALIGN_CENTER);
+        gtk_stack_add_named(GTK_STACK(stack), icon_box, "icons");
+
         GtkWidget *label = gtk_label_new("");
         gtk_label_set_xalign(GTK_LABEL(label), 0.5);
         gtk_label_set_ellipsize(GTK_LABEL(label), PANGO_ELLIPSIZE_END);
-        gtk_list_item_set_child(item, label);
-    /* Make this cell also respond to double-click so clicking anywhere on the row toggles the tendina. */
+        gtk_stack_add_named(GTK_STACK(stack), label, "text");
+
+        gtk_list_item_set_child(item, root);
+
+        g_object_set_data(G_OBJECT(item), "color_root", root);
+        g_object_set_data(G_OBJECT(item), "color_stack", stack);
+        g_object_set_data(G_OBJECT(item), "color_icon_box", icon_box);
+        g_object_set_data(G_OBJECT(item), "color_text_label", label);
+
         GtkGesture *dbl = gtk_gesture_click_new();
         gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(dbl), GDK_BUTTON_PRIMARY);
         g_signal_connect(dbl, "pressed", G_CALLBACK(on_row_double_click), item);
-        gtk_widget_add_controller(label, GTK_EVENT_CONTROLLER(dbl));
+        gtk_widget_add_controller(root, GTK_EVENT_CONTROLLER(dbl));
+
         GtkGesture *rclk = gtk_gesture_click_new();
         gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(rclk), GDK_BUTTON_SECONDARY);
         g_signal_connect(rclk, "pressed", G_CALLBACK(on_row_right_click), item);
-        gtk_widget_add_controller(label, GTK_EVENT_CONTROLLER(rclk));
+        gtk_widget_add_controller(root, GTK_EVENT_CONTROLLER(rclk));
     }), NULL);
     g_signal_connect(colors_factory, "bind", G_CALLBACK(+[](GtkListItemFactory *, GtkListItem *item, gpointer) {
         CardRow *row = (CardRow*)gtk_list_item_get_item(item);
-        GtkWidget *label = gtk_list_item_get_child(item);
+        GtkWidget *root = (GtkWidget*)g_object_get_data(G_OBJECT(item), "color_root");
+        GtkWidget *stack = (GtkWidget*)g_object_get_data(G_OBJECT(item), "color_stack");
+        GtkWidget *icon_box = (GtkWidget*)g_object_get_data(G_OBJECT(item), "color_icon_box");
+        GtkWidget *label = (GtkWidget*)g_object_get_data(G_OBJECT(item), "color_text_label");
         if (!row) {
             gtk_label_set_text(GTK_LABEL(label), "");
+            gtk_stack_set_visible_child_name(GTK_STACK(stack), "text");
             gtk_list_item_set_selectable(item, FALSE);
             return;
         }
         if (row->id == ROW_ID_SEPARATOR_TITLE) {
             gtk_label_set_text(GTK_LABEL(label), "");
+            gtk_stack_set_visible_child_name(GTK_STACK(stack), "text");
             gtk_list_item_set_selectable(item, FALSE);
             return;
         }
@@ -7963,23 +8929,37 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
             std::string hdr = translate("Colori");
             std::string markup = "<span weight='bold'>" + hdr + "</span>";
             gtk_label_set_markup(GTK_LABEL(label), markup.c_str());
-            gtk_label_set_xalign(GTK_LABEL(label), 0.5);
+            gtk_stack_set_visible_child_name(GTK_STACK(stack), "text");
             gtk_list_item_set_selectable(item, FALSE);
+            gtk_widget_remove_css_class(root, "foil");
+            gtk_widget_set_tooltip_text(root, nullptr);
             return;
         }
-    gtk_label_set_text(GTK_LABEL(label), row->translated_colors ? row->translated_colors : "");
-    if (row->foil) gtk_widget_add_css_class(label, "foil"); else gtk_widget_remove_css_class(label, "foil");
-    char* _in_deck = (char*)g_object_get_data(G_OBJECT(item), "in_deck_names");
-    gpointer _t = NULL;
-    if (row) _t = g_object_get_data(G_OBJECT(row), "tendina_open");
-    if (!_t) _t = g_object_get_data(G_OBJECT(item), "tendina_open");
-    gboolean is_open = _t ? (GPOINTER_TO_INT(_t) != 0) : FALSE;
-    if ((_in_deck && strlen(_in_deck) > 0) || is_open) gtk_widget_set_visible(label, FALSE); else gtk_widget_set_visible(label, TRUE);
-        // Aggiungi gesture per click destro
-        GtkGesture *gesture = gtk_gesture_click_new();
-        gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(gesture), GDK_BUTTON_SECONDARY);
-        g_signal_connect(gesture, "pressed", G_CALLBACK(on_row_right_click), item);
-        gtk_widget_add_controller(label, GTK_EVENT_CONTROLLER(gesture));
+
+        std::string colors_text = row->translated_colors ? row->translated_colors : translate_colors(row->colors);
+        std::string raw_colors = row->colors ? row->colors : "";
+        bool has_icons = populate_color_icon_box(icon_box, raw_colors);
+        if (has_icons) {
+            gtk_stack_set_visible_child_name(GTK_STACK(stack), "icons");
+        } else {
+            gtk_label_set_text(GTK_LABEL(label), colors_text.c_str());
+            gtk_stack_set_visible_child_name(GTK_STACK(stack), "text");
+        }
+        if (!colors_text.empty()) {
+            gtk_widget_set_tooltip_text(root, colors_text.c_str());
+        } else {
+            gtk_widget_set_tooltip_text(root, nullptr);
+        }
+        if (row->foil) gtk_widget_add_css_class(root, "foil"); else gtk_widget_remove_css_class(root, "foil");
+        char* _in_deck = (char*)g_object_get_data(G_OBJECT(item), "in_deck_names");
+        gpointer _t = row ? g_object_get_data(G_OBJECT(row), "tendina_open") : NULL;
+        if (!_t) _t = g_object_get_data(G_OBJECT(item), "tendina_open");
+        gboolean is_open = _t ? (GPOINTER_TO_INT(_t) != 0) : FALSE;
+        gboolean visible = !((_in_deck && strlen(_in_deck) > 0) || is_open);
+        gtk_widget_set_visible(root, visible);
+        if (!visible) {
+            gtk_widget_set_tooltip_text(root, nullptr);
+        }
     }), NULL);
     GtkColumnViewColumn *colors_col = gtk_column_view_column_new("Colori", colors_factory);
     gtk_column_view_column_set_expand(colors_col, TRUE);
@@ -7991,31 +8971,57 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     // Colonna Costo Mana
     GtkListItemFactory *mana_factory = gtk_signal_list_item_factory_new();
     g_signal_connect(mana_factory, "setup", G_CALLBACK(+[](GtkListItemFactory *, GtkListItem *item, gpointer) {
+        GtkWidget *root = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+        gtk_widget_set_halign(root, GTK_ALIGN_CENTER);
+        gtk_widget_set_valign(root, GTK_ALIGN_CENTER);
+
+        GtkWidget *stack = gtk_stack_new();
+        gtk_stack_set_hhomogeneous(GTK_STACK(stack), FALSE);
+        gtk_stack_set_vhomogeneous(GTK_STACK(stack), FALSE);
+        gtk_box_append(GTK_BOX(root), stack);
+
+        GtkWidget *icon_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
+        gtk_widget_add_css_class(icon_box, "mana-icon-row");
+        gtk_widget_set_halign(icon_box, GTK_ALIGN_CENTER);
+        gtk_stack_add_named(GTK_STACK(stack), icon_box, "icons");
+
         GtkWidget *label = gtk_label_new("");
         gtk_label_set_xalign(GTK_LABEL(label), 0.5);
         gtk_label_set_ellipsize(GTK_LABEL(label), PANGO_ELLIPSIZE_END);
-        gtk_list_item_set_child(item, label);
-    /* Make this cell also respond to double-click so clicking anywhere on the row toggles the tendina. */
+        gtk_stack_add_named(GTK_STACK(stack), label, "text");
+
+        gtk_list_item_set_child(item, root);
+
+        g_object_set_data(G_OBJECT(item), "mana_root", root);
+        g_object_set_data(G_OBJECT(item), "mana_stack", stack);
+        g_object_set_data(G_OBJECT(item), "mana_icon_box", icon_box);
+        g_object_set_data(G_OBJECT(item), "mana_text_label", label);
+
         GtkGesture *dbl = gtk_gesture_click_new();
         gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(dbl), GDK_BUTTON_PRIMARY);
         g_signal_connect(dbl, "pressed", G_CALLBACK(on_row_double_click), item);
-        gtk_widget_add_controller(label, GTK_EVENT_CONTROLLER(dbl));
+        gtk_widget_add_controller(root, GTK_EVENT_CONTROLLER(dbl));
+
         GtkGesture *rclk = gtk_gesture_click_new();
         gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(rclk), GDK_BUTTON_SECONDARY);
         g_signal_connect(rclk, "pressed", G_CALLBACK(on_row_right_click), item);
-        gtk_widget_add_controller(label, GTK_EVENT_CONTROLLER(rclk));
+        gtk_widget_add_controller(root, GTK_EVENT_CONTROLLER(rclk));
     }), NULL);
     g_signal_connect(mana_factory, "bind", G_CALLBACK(+[](GtkListItemFactory *, GtkListItem *item, gpointer) {
         CardRow *row = (CardRow*)gtk_list_item_get_item(item);
-        GtkWidget *label = gtk_list_item_get_child(item);
-        char cost_str[16];
+        GtkWidget *root = (GtkWidget*)g_object_get_data(G_OBJECT(item), "mana_root");
+        GtkWidget *stack = (GtkWidget*)g_object_get_data(G_OBJECT(item), "mana_stack");
+        GtkWidget *icon_box = (GtkWidget*)g_object_get_data(G_OBJECT(item), "mana_icon_box");
+        GtkWidget *label = (GtkWidget*)g_object_get_data(G_OBJECT(item), "mana_text_label");
         if (!row) {
             gtk_label_set_text(GTK_LABEL(label), "");
+            gtk_stack_set_visible_child_name(GTK_STACK(stack), "text");
             gtk_list_item_set_selectable(item, FALSE);
             return;
         }
         if (row->id == ROW_ID_SEPARATOR_TITLE) {
             gtk_label_set_text(GTK_LABEL(label), "");
+            gtk_stack_set_visible_child_name(GTK_STACK(stack), "text");
             gtk_list_item_set_selectable(item, FALSE);
             return;
         }
@@ -8023,28 +9029,49 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
             std::string hdr = translate("Costo Mana");
             std::string markup = "<span weight='bold'>" + hdr + "</span>";
             gtk_label_set_markup(GTK_LABEL(label), markup.c_str());
-            gtk_label_set_xalign(GTK_LABEL(label), 0.5);
+            gtk_stack_set_visible_child_name(GTK_STACK(stack), "text");
             gtk_list_item_set_selectable(item, FALSE);
+            gtk_widget_remove_css_class(root, "foil");
+            gtk_widget_set_tooltip_text(root, nullptr);
             return;
         }
-        if (row->total_mana_cost > 0) {
-            snprintf(cost_str, sizeof(cost_str), "%d", row->total_mana_cost);
+
+        std::string mana_text = row->mana_cost ? row->mana_cost : "";
+        bool has_icons = populate_mana_icon_box(icon_box, mana_text);
+        if (has_icons) {
+            gtk_stack_set_visible_child_name(GTK_STACK(stack), "icons");
         } else {
-            snprintf(cost_str, sizeof(cost_str), "0");
+            std::string fallback_markup = convert_mana_text_to_markup(mana_text);
+            if (!fallback_markup.empty()) {
+                gtk_label_set_markup(GTK_LABEL(label), fallback_markup.c_str());
+            } else if (!mana_text.empty()) {
+                gtk_label_set_text(GTK_LABEL(label), mana_text.c_str());
+            } else {
+                char buf[16];
+                if (row->total_mana_cost > 0) {
+                    std::snprintf(buf, sizeof(buf), "%d", row->total_mana_cost);
+                } else {
+                    std::snprintf(buf, sizeof(buf), "0");
+                }
+                gtk_label_set_text(GTK_LABEL(label), buf);
+            }
+            gtk_stack_set_visible_child_name(GTK_STACK(stack), "text");
         }
-    gtk_label_set_text(GTK_LABEL(label), cost_str);
-    if (row->foil) gtk_widget_add_css_class(label, "foil"); else gtk_widget_remove_css_class(label, "foil");
-    char* _in_deck = (char*)g_object_get_data(G_OBJECT(item), "in_deck_names");
-    gpointer _t = NULL;
-    if (row) _t = g_object_get_data(G_OBJECT(row), "tendina_open");
-    if (!_t) _t = g_object_get_data(G_OBJECT(item), "tendina_open");
-    gboolean is_open = _t ? (GPOINTER_TO_INT(_t) != 0) : FALSE;
-    if ((_in_deck && strlen(_in_deck) > 0) || is_open) gtk_widget_set_visible(label, FALSE); else gtk_widget_set_visible(label, TRUE);
-        // Aggiungi gesture per click destro
-        GtkGesture *gesture = gtk_gesture_click_new();
-        gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(gesture), GDK_BUTTON_SECONDARY);
-        g_signal_connect(gesture, "pressed", G_CALLBACK(on_row_right_click), item);
-        gtk_widget_add_controller(label, GTK_EVENT_CONTROLLER(gesture));
+        if (!mana_text.empty()) {
+            gtk_widget_set_tooltip_text(root, mana_text.c_str());
+        } else {
+            gtk_widget_set_tooltip_text(root, nullptr);
+        }
+        if (row->foil) gtk_widget_add_css_class(root, "foil"); else gtk_widget_remove_css_class(root, "foil");
+        char* _in_deck = (char*)g_object_get_data(G_OBJECT(item), "in_deck_names");
+        gpointer _t = row ? g_object_get_data(G_OBJECT(row), "tendina_open") : NULL;
+        if (!_t) _t = g_object_get_data(G_OBJECT(item), "tendina_open");
+        gboolean is_open = _t ? (GPOINTER_TO_INT(_t) != 0) : FALSE;
+        gboolean visible = !((_in_deck && strlen(_in_deck) > 0) || is_open);
+        gtk_widget_set_visible(root, visible);
+        if (!visible) {
+            gtk_widget_set_tooltip_text(root, nullptr);
+        }
     }), NULL);
     GtkColumnViewColumn *mana_col = gtk_column_view_column_new("Costo Mana", mana_factory);
     gtk_column_view_column_set_fixed_width(mana_col, 100);
@@ -8361,10 +9388,10 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
 
     // Box inferiore: nome database e totale carte
     GtkWidget *bottom_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    gtk_widget_add_css_class(bottom_box, "status-strip");
     gtk_box_append(GTK_BOX(bottom_box), db_name_box);
-    if (state->deck_label) gtk_box_append(GTK_BOX(bottom_box), state->deck_label);
     gtk_box_append(GTK_BOX(bottom_box), state->total_cards_label);
-    gtk_box_append(GTK_BOX(bottom_box), state->filter_label);
+    if (state->filter_chip) gtk_box_append(GTK_BOX(bottom_box), state->filter_chip);
     // Pagination controls (Prev / Page X/Y / Next) and page size selector
     // Initialize pagination state defaults (0 = view all)
     state->page_size = g_page_size_default; // 0 means 'All rows'
@@ -8440,7 +9467,19 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     gtk_stack_set_visible_child_name(GTK_STACK(stack), "cards");
 
     gtk_box_append(GTK_BOX(vbox), stack);
-    gtk_window_set_child(GTK_WINDOW(window), vbox);
+
+    GtkWidget *root_overlay = gtk_overlay_new();
+    gtk_widget_set_hexpand(root_overlay, TRUE);
+    gtk_widget_set_vexpand(root_overlay, TRUE);
+    gtk_overlay_set_child(GTK_OVERLAY(root_overlay), vbox);
+
+    GtkWidget *welcome_revealer = create_welcome_overlay(state);
+    if (welcome_revealer) {
+        gtk_overlay_add_overlay(GTK_OVERLAY(root_overlay), welcome_revealer);
+    }
+
+    gtk_window_set_child(GTK_WINDOW(window), root_overlay);
+    state->main_overlay = root_overlay;
 
     state->main_stack = stack;
     state->cards_page = cards_page;
@@ -8449,6 +9488,10 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     stats_clear(state, true);
     // Salva lo stato globale nella finestra principale
     g_object_set_data(G_OBJECT(window), "app_state", state);
+
+    if (state->welcome_revealer) {
+        state->welcome_timeout_id = g_timeout_add(2200, welcome_auto_hide_cb, state);
+    }
 
     // Global key controller for shortcuts (GTK4 way). Use a GtkEventControllerKey so we don't rely on GdkEventKey.
     GtkEventController *key_controller = gtk_event_controller_key_new();
