@@ -9,6 +9,8 @@
 #include <mutex>
 #include <unordered_map>
 #include <cctype>
+#include <optional>
+#include <thread>
 
 using json = nlohmann::json;
 
@@ -84,29 +86,74 @@ static std::string sanitize_query(const std::string& query) {
 }
 
 static bool perform_json_request(const std::string& url, std::string& out_buffer) {
-    CurlHandle curl;
-    if (!curl) {
-        std::cout << "Failed to initialize CURL" << std::endl;
-        return false;
-    }
+    constexpr int kMaxAttempts = 3;
+    constexpr long kConnectTimeoutSec = 10L;
+    constexpr long kTransferTimeoutSec = 25L;
 
-    CurlHeaders headers;
-    headers.append("Accept: application/json");
+    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        CurlHandle curl;
+        if (!curl) {
+            std::cout << "Failed to initialize CURL" << std::endl;
+            return false;
+        }
 
-    curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, headers.get());
-    curl_easy_setopt(curl.get(), CURLOPT_USERAGENT, "MagicDatabase/1.0");
-    curl_easy_setopt(curl.get(), CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, WriteCallback);
-    curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &out_buffer);
+        CurlHeaders headers;
+        headers.append("Accept: application/json");
 
-    CURLcode res = curl_easy_perform(curl.get());
-    std::cout << "CURL result: " << res << std::endl;
-    if (res != CURLE_OK) {
+        out_buffer.clear();
+
+        curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, headers.get());
+        curl_easy_setopt(curl.get(), CURLOPT_USERAGENT, "MagicDatabase/1.0");
+        curl_easy_setopt(curl.get(), CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, WriteCallback);
+        curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &out_buffer);
+    curl_easy_setopt(curl.get(), CURLOPT_ACCEPT_ENCODING, "gzip,deflate");
+    curl_easy_setopt(curl.get(), CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT, kConnectTimeoutSec);
+    curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT, kTransferTimeoutSec);
+#ifdef CURLOPT_TCP_KEEPALIVE
+    curl_easy_setopt(curl.get(), CURLOPT_TCP_KEEPALIVE, 1L);
+#endif
+#ifdef CURLOPT_TCP_KEEPIDLE
+    curl_easy_setopt(curl.get(), CURLOPT_TCP_KEEPIDLE, 30L);
+#endif
+#ifdef CURLOPT_TCP_KEEPINTVL
+    curl_easy_setopt(curl.get(), CURLOPT_TCP_KEEPINTVL, 15L);
+#endif
+
+        CURLcode res = curl_easy_perform(curl.get());
+        std::cout << "CURL result: " << res << std::endl;
+
+        if (res == CURLE_OK) {
+            long response_code = 0;
+            curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &response_code);
+            std::cout << "HTTP status: " << response_code << std::endl;
+            if (response_code >= 200 && response_code < 300) {
+                std::cout << "Response length: " << out_buffer.length() << std::endl;
+                return true;
+            }
+
+            if (response_code == 429 || response_code >= 500) {
+                if (attempt + 1 < kMaxAttempts) {
+                    std::cout << "HTTP " << response_code << " received, retrying..." << std::endl;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(200 * (attempt + 1)));
+                    continue;
+                }
+            }
+
+            std::cout << "HTTP error: " << response_code << std::endl;
+            return false;
+        }
+
         std::cout << "CURL error: " << curl_easy_strerror(res) << std::endl;
+        if ((res == CURLE_OPERATION_TIMEDOUT || res == CURLE_COULDNT_RESOLVE_HOST || res == CURLE_COULDNT_CONNECT) && attempt + 1 < kMaxAttempts) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200 * (attempt + 1)));
+            continue;
+        }
         return false;
     }
-    std::cout << "Response length: " << out_buffer.length() << std::endl;
-    return true;
+
+    return false;
 }
 
 static bool parse_json(const std::string& payload, json& out_json) {
@@ -258,13 +305,11 @@ static std::vector<ScryfallCard> perform_search(const std::string& query, bool r
 
     std::string read_buffer;
     if (!perform_json_request(url, read_buffer)) {
-        store_in_cache(cache_key, results);
         return results;
     }
 
     json payload;
     if (!parse_json(read_buffer, payload)) {
-        store_in_cache(cache_key, results);
         return results;
     }
 
@@ -380,6 +425,102 @@ std::vector<ScryfallCard> search_cards_from_scryfall(const std::string& query) {
     }
     
     return results;
+}
+
+std::optional<ScryfallCard> fetch_card_named_exact(const std::string& name, const std::string& set_code, const std::string& language) {
+    const std::string trimmed = sanitize_query(name);
+    if (trimmed.empty()) {
+        return std::nullopt;
+    }
+
+    char* escaped_name = curl_easy_escape(nullptr, trimmed.c_str(), static_cast<int>(trimmed.length()));
+    std::string url = "https://api.scryfall.com/cards/named?exact=" + std::string(escaped_name ? escaped_name : "");
+    if (escaped_name) {
+        curl_free(escaped_name);
+    }
+
+    if (!set_code.empty()) {
+        std::string lowered = set_code;
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(), ::tolower);
+        char* esc_set = curl_easy_escape(nullptr, lowered.c_str(), static_cast<int>(lowered.length()));
+        url += "&set=" + std::string(esc_set ? esc_set : "");
+        if (esc_set) {
+            curl_free(esc_set);
+        }
+    }
+
+    if (!language.empty()) {
+        std::string lowered_lang = language;
+        std::transform(lowered_lang.begin(), lowered_lang.end(), lowered_lang.begin(), ::tolower);
+        char* esc_lang = curl_easy_escape(nullptr, lowered_lang.c_str(), static_cast<int>(lowered_lang.length()));
+        url += "&lang=" + std::string(esc_lang ? esc_lang : "");
+        if (esc_lang) {
+            curl_free(esc_lang);
+        }
+    }
+
+    std::string buffer;
+    if (!perform_json_request(url, buffer)) {
+        return std::nullopt;
+    }
+
+    json payload;
+    if (!parse_json(buffer, payload)) {
+        return std::nullopt;
+    }
+
+    const std::string object_type = payload.value("object", "");
+    if (object_type == "error" || object_type != "card") {
+        return std::nullopt;
+    }
+
+    ScryfallCard result;
+    result.english_name = payload.value("name", "");
+    result.localized_name = payload.value("printed_name", result.english_name);
+    result.name = result.localized_name.empty() ? result.english_name : result.localized_name;
+    result.type = payload.value("type_line", "");
+    result.localized_type = payload.value("printed_type_line", result.type);
+    result.oracle_text = payload.value("printed_text", payload.value("oracle_text", ""));
+
+    auto colors_json = payload.value("colors", json::array());
+    result.colors = colors_json.is_null() ? "[]" : colors_json.dump();
+
+    result.set_name = payload.value("set_name", "");
+    result.set_code = payload.value("set", "");
+    result.mana_cost = payload.value("mana_cost", "");
+    result.rarity = payload.value("rarity", "");
+
+    auto image_uris = payload.value("image_uris", json::object());
+    if (!image_uris.is_null()) {
+        result.image_url = image_uris.value("normal", "");
+    } else if (payload.contains("card_faces") && payload["card_faces"].is_array() && !payload["card_faces"].empty()) {
+        const auto& face = payload["card_faces"].front();
+        auto face_images = face.value("image_uris", json::object());
+        if (!face_images.is_null()) {
+            result.image_url = face_images.value("normal", "");
+        }
+        if (result.localized_name.empty()) {
+            result.localized_name = face.value("printed_name", "");
+        }
+        if (result.localized_type.empty()) {
+            result.localized_type = face.value("printed_type_line", result.localized_type);
+        }
+        if (result.oracle_text.empty()) {
+            result.oracle_text = face.value("printed_text", face.value("oracle_text", ""));
+        }
+    } else {
+        result.image_url.clear();
+    }
+
+    auto prices = payload.value("prices", json::object());
+    result.price_usd = select_best_price_usd(prices);
+    if (result.price_usd.empty()) {
+        const std::string price_name = result.english_name.empty() ? payload.value("name", "") : result.english_name;
+        result.price_usd = fetch_price_from_named(price_name);
+    }
+
+    result.is_exact_match = true;
+    return result;
 }
 
 std::vector<unsigned char> download_image_data(const std::string& url) {
