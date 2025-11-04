@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <unordered_map>
 #include <unordered_set>
+#include <optional>
 #include <nlohmann/json.hpp>
 #include "database.h"
 #include "scryfall.h"
@@ -48,7 +49,7 @@ static void prefetch_thumbnails_async(const std::vector<std::map<std::string,std
     static gboolean refresh_dialog_finish_cb(gpointer user_data);
     static void refresh_dialog_cancel(GtkButton* button, gpointer user_data);
     static void start_refresh_cards_async(GtkWindow* window, AppState* state);
-    static std::vector<std::map<std::string, std::string>> load_cards_from_db(Database* db, const std::string& filter, int deck_filter, bool only_no_deck);
+    static std::vector<std::map<std::string, std::string>> load_cards_from_db(Database* db, const std::string& filter, int deck_filter, bool only_no_deck, bool aggregate_main = true);
 static GtkWidget* create_welcome_overlay(AppState* state);
 static void hide_welcome_overlay(AppState* state);
 static gboolean welcome_auto_hide_cb(gpointer user_data);
@@ -825,8 +826,8 @@ static bool populate_color_icon_box(GtkWidget* box, const std::string& raw_color
             for (GtkWidget* w : widgets) g_object_unref(w);
             return false;
         }
-    std::string color_hex = symbol_color_override(code);
-    GtkWidget* icon = make_svg_icon_widget(filename, color_hex, 16);
+        std::string color_hex = symbol_color_override(code);
+        GtkWidget* icon = make_svg_icon_widget(filename, color_hex, 16);
         if (!icon) {
             for (GtkWidget* w : widgets) g_object_unref(w);
             return false;
@@ -1874,14 +1875,22 @@ struct RefreshDialogContext {
     GtkWidget* dialog = nullptr;
     GtkWidget* spinner = nullptr;
     GtkProgressBar* progress = nullptr;
+    GtkLabel* status_badge = nullptr;
     GtkLabel* summary_label = nullptr;
     GtkLabel* detail_label = nullptr;
+    GtkLabel* metrics_label = nullptr;
+    GtkLabel* eta_label = nullptr;
+    GtkLabel* stat_updated_value = nullptr;
+    GtkLabel* stat_accuracy_value = nullptr;
+    GtkLabel* stat_velocity_value = nullptr;
+    GtkLabel* stat_remaining_value = nullptr;
     GtkWidget* cancel_button = nullptr;
     GtkWidget* refresh_button = nullptr;
     std::atomic<bool> cancel_requested{false};
     std::vector<std::map<std::string,std::string>> cards;
     int updated_count = 0;
     int processed_count = 0;
+    std::chrono::steady_clock::time_point start_time;
 };
 
 struct RefreshProgressPayload {
@@ -1889,6 +1898,14 @@ struct RefreshProgressPayload {
     double fraction;
     std::string summary;
     std::string detail;
+    std::string metrics;
+    std::string eta;
+    int processed;
+    int updated;
+    int total;
+    std::string accuracy;
+    std::string velocity;
+    std::string remaining;
 };
 
 struct RefreshFinalPayload {
@@ -1897,6 +1914,11 @@ struct RefreshFinalPayload {
     int updated;
     int processed;
     int total;
+    std::string metrics;
+    std::string eta;
+    std::string accuracy;
+    std::string velocity;
+    std::string remaining;
 };
 
 static void destroy_mana_stats_context(ManaStatsExportCtx* ctx) {
@@ -2059,7 +2081,8 @@ static GtkWidget* create_styled_dialog(GtkWindow* parent, int width = -1, int he
     gtk_window_set_modal(GTK_WINDOW(dialog), true);
     if (parent && GTK_IS_WINDOW(parent)) gtk_window_set_transient_for(GTK_WINDOW(dialog), parent);
     if (width > 0 && height > 0) gtk_window_set_default_size(GTK_WINDOW(dialog), width, height);
-    // Apply CSS class used earlier for popovers
+    // Ensure dialogs pick up the custom theme surface
+    gtk_widget_add_css_class(dialog, "app-dialog");
     gtk_widget_add_css_class(dialog, "small-popover");
     return dialog;
 }
@@ -2083,6 +2106,25 @@ static gboolean refresh_dialog_progress_cb(gpointer user_data) {
     if (ctx->detail_label && GTK_IS_LABEL(ctx->detail_label)) {
         gtk_label_set_text(ctx->detail_label, payload->detail.c_str());
     }
+    if (ctx->metrics_label && GTK_IS_LABEL(ctx->metrics_label)) {
+        gtk_label_set_text(ctx->metrics_label, payload->metrics.c_str());
+    }
+    if (ctx->eta_label && GTK_IS_LABEL(ctx->eta_label)) {
+        gtk_label_set_text(ctx->eta_label, payload->eta.c_str());
+    }
+    if (ctx->stat_updated_value && GTK_IS_LABEL(ctx->stat_updated_value)) {
+        std::string updated_text = std::to_string(payload->updated);
+        gtk_label_set_text(ctx->stat_updated_value, updated_text.c_str());
+    }
+    if (ctx->stat_accuracy_value && GTK_IS_LABEL(ctx->stat_accuracy_value)) {
+        gtk_label_set_text(ctx->stat_accuracy_value, payload->accuracy.c_str());
+    }
+    if (ctx->stat_velocity_value && GTK_IS_LABEL(ctx->stat_velocity_value)) {
+        gtk_label_set_text(ctx->stat_velocity_value, payload->velocity.c_str());
+    }
+    if (ctx->stat_remaining_value && GTK_IS_LABEL(ctx->stat_remaining_value)) {
+        gtk_label_set_text(ctx->stat_remaining_value, payload->remaining.c_str());
+    }
     return G_SOURCE_REMOVE;
 }
 
@@ -2103,6 +2145,13 @@ static gboolean refresh_dialog_finish_cb(gpointer user_data) {
     }
     if (ctx->spinner && GTK_IS_SPINNER(ctx->spinner)) {
         gtk_spinner_stop(GTK_SPINNER(ctx->spinner));
+    }
+    if (ctx->status_badge && GTK_IS_LABEL(ctx->status_badge)) {
+        GtkWidget* badge_widget = GTK_WIDGET(ctx->status_badge);
+        gtk_label_set_text(ctx->status_badge, payload->cancelled ? "Annullato" : "Completato");
+        gtk_widget_remove_css_class(badge_widget, "refresh-status-badge-success");
+        gtk_widget_remove_css_class(badge_widget, "refresh-status-badge-cancelled");
+        gtk_widget_add_css_class(badge_widget, payload->cancelled ? "refresh-status-badge-cancelled" : "refresh-status-badge-success");
     }
     if (ctx->cancel_button && GTK_IS_WIDGET(ctx->cancel_button)) {
         gtk_widget_set_sensitive(ctx->cancel_button, FALSE);
@@ -2125,6 +2174,25 @@ static gboolean refresh_dialog_finish_cb(gpointer user_data) {
             detail << "Aggiornate " << payload->updated << " carte su " << payload->total << ".";
         }
         gtk_label_set_text(ctx->detail_label, detail.str().c_str());
+    }
+    if (ctx->metrics_label && GTK_IS_LABEL(ctx->metrics_label)) {
+        gtk_label_set_text(ctx->metrics_label, payload->metrics.c_str());
+    }
+    if (ctx->eta_label && GTK_IS_LABEL(ctx->eta_label)) {
+        gtk_label_set_text(ctx->eta_label, payload->eta.c_str());
+    }
+    if (ctx->stat_updated_value && GTK_IS_LABEL(ctx->stat_updated_value)) {
+        std::string updated_text = std::to_string(payload->updated);
+        gtk_label_set_text(ctx->stat_updated_value, updated_text.c_str());
+    }
+    if (ctx->stat_accuracy_value && GTK_IS_LABEL(ctx->stat_accuracy_value)) {
+        gtk_label_set_text(ctx->stat_accuracy_value, payload->accuracy.c_str());
+    }
+    if (ctx->stat_velocity_value && GTK_IS_LABEL(ctx->stat_velocity_value)) {
+        gtk_label_set_text(ctx->stat_velocity_value, payload->velocity.c_str());
+    }
+    if (ctx->stat_remaining_value && GTK_IS_LABEL(ctx->stat_remaining_value)) {
+        gtk_label_set_text(ctx->stat_remaining_value, payload->remaining.c_str());
     }
     if (ctx->refresh_button && GTK_IS_WIDGET(ctx->refresh_button)) {
         gtk_widget_set_sensitive(ctx->refresh_button, TRUE);
@@ -2159,9 +2227,226 @@ static void refresh_dialog_cancel(GtkButton*, gpointer user_data) {
     }
 }
 
+static std::optional<ScryfallCard> resolve_card_for_refresh(const std::map<std::string,std::string>& row, std::string& failure_reason) {
+    auto normalize = [](const std::string& value) {
+        std::string out;
+        out.reserve(value.size());
+        for (unsigned char ch : value) {
+            if (std::isspace(ch) || ch == '\'' || ch == '`') continue;
+            out.push_back(static_cast<char>(std::tolower(ch)));
+        }
+        return out;
+    };
+
+    std::vector<std::pair<std::string,std::string>> candidates;
+    std::vector<std::string> normalized_targets;
+    std::unordered_set<std::string> seen;
+    auto add_candidate = [&](const std::string& value, const std::string& lang) {
+        if (value.empty()) return;
+        std::string trimmed = trim_copy(value);
+        if (trimmed.empty()) return;
+        std::string norm = normalize(trimmed);
+        if (norm.empty()) return;
+        if (!seen.insert(norm).second) return;
+        candidates.emplace_back(trimmed, lang);
+        normalized_targets.push_back(norm);
+    };
+
+    std::string english = row.count("english_name") ? row.at("english_name") : std::string();
+    std::string localized = row.count("localized_name") ? row.at("localized_name") : std::string();
+    std::string fallback = row.count("name") ? row.at("name") : std::string();
+
+    add_candidate(english, "");
+    if (localized != english) add_candidate(localized, "it");
+    if (fallback != localized && fallback != english) add_candidate(fallback, "");
+
+    if (candidates.empty()) {
+        failure_reason = "Nessun nome disponibile";
+        return std::nullopt;
+    }
+
+    std::string raw_set = row.count("set_code") ? row.at("set_code") : std::string();
+    std::string set_trimmed = trim_copy(raw_set);
+    std::string set_lower = lowercase_ascii(set_trimmed);
+    auto looks_like_set_code = [](const std::string& value) {
+        if (value.empty()) return false;
+        if (value.size() > 5) return false;
+        for (unsigned char ch : value) {
+            if (!std::isalnum(ch)) return false;
+        }
+        return true;
+    };
+    bool set_is_code = looks_like_set_code(set_trimmed);
+    std::string set_code_for_lookup = set_is_code ? lowercase_ascii(set_trimmed) : std::string();
+
+    auto matches_set = [&](const ScryfallCard& card) {
+        if (set_trimmed.empty()) return true;
+        std::string card_code_lower = lowercase_ascii(card.set_code);
+        if (!card_code_lower.empty() && card_code_lower == set_lower) return true;
+        std::string card_name_lower = lowercase_ascii(card.set_name);
+        if (!card_name_lower.empty() && card_name_lower == set_lower) return true;
+        return false;
+    };
+
+    auto name_matches = [&](const ScryfallCard& card) {
+        std::vector<std::string> others;
+        if (!card.localized_name.empty()) others.push_back(normalize(card.localized_name));
+        if (!card.english_name.empty()) others.push_back(normalize(card.english_name));
+        if (!card.name.empty()) others.push_back(normalize(card.name));
+        for (const auto& target : normalized_targets) {
+            for (const auto& cand : others) {
+                if (!cand.empty() && cand == target) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    auto ensure_dual_language = [&](ScryfallCard& card) {
+        std::string english_lookup;
+        if (!english.empty()) {
+            english_lookup = english;
+        } else if (!card.english_name.empty()) {
+            english_lookup = card.english_name;
+        } else if (!card.name.empty()) {
+            english_lookup = card.name;
+        } else if (!candidates.empty()) {
+            english_lookup = candidates.front().first;
+        }
+
+        if (english_lookup.empty()) return;
+
+        const std::string set_hint = set_is_code ? set_code_for_lookup : std::string();
+        auto as_lower = [](const std::string& value) {
+            return lowercase_ascii(value);
+        };
+
+        std::string card_localized_lower = as_lower(card.localized_name);
+        std::string card_english_lower = as_lower(card.english_name);
+
+        if (card.english_name.empty() || card_english_lower == card_localized_lower) {
+            auto english_card = fetch_card_named_exact(english_lookup, set_hint, "");
+            if (english_card) {
+                if (!english_card->english_name.empty()) card.english_name = english_card->english_name;
+                if (!english_card->type.empty()) card.type = english_card->type;
+                if (!english_card->mana_cost.empty()) card.mana_cost = english_card->mana_cost;
+                if (!english_card->rarity.empty()) card.rarity = english_card->rarity;
+                if (!english_card->colors.empty()) card.colors = english_card->colors;
+                if (!english_card->image_url.empty()) card.image_url = english_card->image_url;
+                if (!english_card->price_usd.empty()) card.price_usd = english_card->price_usd;
+                if (!english_card->oracle_text.empty()) card.oracle_text = english_card->oracle_text;
+            }
+            card_english_lower = as_lower(card.english_name);
+        }
+
+        card_localized_lower = as_lower(card.localized_name);
+        bool need_italian = card.localized_name.empty() || card_localized_lower == card_english_lower || card.localized_type.empty();
+        if (!need_italian) return;
+
+        auto italian_card = fetch_card_named_exact(english_lookup, set_hint, "it");
+        if (!italian_card) return;
+        if (!matches_set(*italian_card)) return;
+
+        if (!italian_card->localized_name.empty()) card.localized_name = italian_card->localized_name;
+        if (!italian_card->localized_type.empty()) card.localized_type = italian_card->localized_type;
+        if (!italian_card->oracle_text.empty()) card.oracle_text = italian_card->oracle_text;
+        if (!italian_card->image_url.empty()) card.image_url = italian_card->image_url;
+        if (!italian_card->colors.empty()) card.colors = italian_card->colors;
+        if (!italian_card->price_usd.empty()) card.price_usd = italian_card->price_usd;
+    };
+
+    auto make_enriched = [&](const ScryfallCard& base) {
+        ScryfallCard enriched = base;
+        ensure_dual_language(enriched);
+        if (enriched.localized_name.empty() && !enriched.english_name.empty()) {
+            enriched.localized_name = enriched.english_name;
+        }
+        if (enriched.localized_type.empty()) {
+            enriched.localized_type = enriched.type;
+        }
+        if (enriched.name.empty()) {
+            enriched.name = !enriched.localized_name.empty() ? enriched.localized_name : enriched.english_name;
+        }
+        return enriched;
+    };
+
+    auto card_has_minimum_data = [&](const ScryfallCard& card) {
+        return !trim_copy(card.english_name).empty() || !trim_copy(card.localized_name).empty();
+    };
+
+    if (!set_code_for_lookup.empty()) {
+        for (const auto& cand : candidates) {
+            auto card = fetch_card_named_exact(cand.first, set_code_for_lookup, cand.second);
+            if (!card && !cand.second.empty()) {
+                card = fetch_card_named_exact(cand.first, set_code_for_lookup, "");
+            }
+            if (!card || !matches_set(*card) || !name_matches(*card)) {
+                continue;
+            }
+            ScryfallCard enriched = make_enriched(*card);
+            if (!card_has_minimum_data(enriched)) {
+                failure_reason = "Risposta incompleta da Scryfall";
+                continue;
+            }
+            return enriched;
+        }
+    } else {
+        for (const auto& cand : candidates) {
+            auto card = fetch_card_named_exact(cand.first, std::string(), cand.second);
+            if (!card && !cand.second.empty()) {
+                card = fetch_card_named_exact(cand.first, std::string(), "");
+            }
+            if (!card || !name_matches(*card) || !matches_set(*card)) {
+                continue;
+            }
+            ScryfallCard enriched = make_enriched(*card);
+            if (!card_has_minimum_data(enriched)) {
+                failure_reason = "Risposta incompleta da Scryfall";
+                continue;
+            }
+            return enriched;
+        }
+    }
+
+    for (const auto& cand : candidates) {
+        auto results = search_cards_from_scryfall(cand.first);
+        if (results.empty()) continue;
+        for (const auto& rc : results) {
+            if (!matches_set(rc)) continue;
+            if (!name_matches(rc)) continue;
+            ScryfallCard enriched = make_enriched(rc);
+            if (!card_has_minimum_data(enriched)) {
+                failure_reason = "Risposta incompleta da Scryfall";
+                continue;
+            }
+            return enriched;
+        }
+        if (set_trimmed.empty()) {
+            for (const auto& rc : results) {
+                if (name_matches(rc)) {
+                    ScryfallCard enriched = make_enriched(rc);
+                    if (!card_has_minimum_data(enriched)) {
+                        failure_reason = "Risposta incompleta da Scryfall";
+                        continue;
+                    }
+                    return enriched;
+                }
+            }
+        }
+    }
+
+    if (!set_trimmed.empty()) {
+        failure_reason = std::string("Nessuna corrispondenza affidabile per \"") + candidates.front().first + "\" (set: " + set_trimmed + ")";
+    } else {
+        failure_reason = std::string("Nessuna corrispondenza affidabile per \"") + candidates.front().first + "\"";
+    }
+    return std::nullopt;
+}
+
 static void start_refresh_cards_async(GtkWindow* window, AppState* state) {
     if (!window || !state || !state->db) return;
-    auto cards = load_cards_from_db(state->db, std::string(""), state->selected_deck_id, state->filter_no_deck);
+    auto cards = load_cards_from_db(state->db, std::string(""), state->selected_deck_id, state->filter_no_deck, false);
     if (cards.empty()) {
         GtkAlertDialog* alert = gtk_alert_dialog_new("%s", "Nessuna carta da aggiornare.");
         gtk_alert_dialog_show(alert, window);
@@ -2174,33 +2459,68 @@ static void start_refresh_cards_async(GtkWindow* window, AppState* state) {
     ctx->cards = std::move(cards);
     ctx->refresh_button = state->refresh_button;
 
-    GtkWidget* dialog = create_styled_dialog(window, 440, 220);
+    GtkWidget* dialog = create_styled_dialog(window, 480, 260);
     gtk_window_set_title(GTK_WINDOW(dialog), "Aggiornamento carte");
     gtk_window_set_resizable(GTK_WINDOW(dialog), FALSE);
     gtk_window_set_decorated(GTK_WINDOW(dialog), FALSE);
 
-    GtkWidget* content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14);
-    gtk_widget_add_css_class(content, "refresh-dialog-content");
+    GtkWidget* content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 18);
+    gtk_widget_add_css_class(content, "refresh-dialog-root");
     gtk_window_set_child(GTK_WINDOW(dialog), content);
 
-    GtkWidget* header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
-    gtk_box_append(GTK_BOX(content), header);
+    GtkWidget* hero = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 16);
+    gtk_widget_add_css_class(hero, "refresh-dialog-hero");
+    gtk_box_append(GTK_BOX(content), hero);
+
+    GtkWidget* hero_indicator = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_add_css_class(hero_indicator, "refresh-dialog-hero-indicator");
+    gtk_widget_set_halign(hero_indicator, GTK_ALIGN_CENTER);
+    gtk_widget_set_valign(hero_indicator, GTK_ALIGN_CENTER);
+    gtk_box_append(GTK_BOX(hero), hero_indicator);
 
     GtkWidget* spinner = gtk_spinner_new();
     gtk_widget_add_css_class(spinner, "accent-spinner");
     gtk_spinner_start(GTK_SPINNER(spinner));
-    gtk_box_append(GTK_BOX(header), spinner);
+    gtk_widget_set_halign(spinner, GTK_ALIGN_CENTER);
+    gtk_widget_set_valign(spinner, GTK_ALIGN_CENTER);
+    gtk_box_append(GTK_BOX(hero_indicator), spinner);
 
-    GtkWidget* title = gtk_label_new(NULL);
-    gtk_label_set_markup(GTK_LABEL(title), "<span weight=\"bold\" size=\"large\">Aggiornamento carte</span>");
-    gtk_label_set_xalign(GTK_LABEL(title), 0.0);
+    GtkWidget* hero_text = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_widget_add_css_class(hero_text, "refresh-dialog-hero-text");
+    gtk_box_append(GTK_BOX(hero), hero_text);
+
+    GtkWidget* title = gtk_label_new("Aggiornamento carte");
     gtk_widget_add_css_class(title, "refresh-dialog-title");
-    gtk_box_append(GTK_BOX(header), title);
+    gtk_label_set_xalign(GTK_LABEL(title), 0.0);
+    gtk_box_append(GTK_BOX(hero_text), title);
+
+    GtkWidget* subtitle = gtk_label_new("Sincronizziamo la collezione con le ultime informazioni da Scryfall.");
+    gtk_widget_add_css_class(subtitle, "refresh-dialog-subtitle");
+    gtk_label_set_xalign(GTK_LABEL(subtitle), 0.0);
+    gtk_label_set_wrap(GTK_LABEL(subtitle), TRUE);
+    gtk_box_append(GTK_BOX(hero_text), subtitle);
+
+    GtkWidget* progress_card = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_widget_add_css_class(progress_card, "refresh-progress-card");
+    gtk_widget_set_hexpand(progress_card, TRUE);
+    gtk_box_append(GTK_BOX(content), progress_card);
+
+    GtkWidget* status_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    gtk_widget_add_css_class(status_row, "refresh-status-row");
+    gtk_widget_set_hexpand(status_row, TRUE);
+    gtk_box_append(GTK_BOX(progress_card), status_row);
+
+    GtkWidget* status_badge = gtk_label_new("In corso");
+    gtk_widget_add_css_class(status_badge, "refresh-status-badge");
+    gtk_box_append(GTK_BOX(status_row), status_badge);
 
     GtkWidget* summary = gtk_label_new("");
-    gtk_label_set_xalign(GTK_LABEL(summary), 0.0);
-    gtk_widget_add_css_class(summary, "refresh-dialog-subtitle");
-    gtk_box_append(GTK_BOX(content), summary);
+    gtk_widget_add_css_class(summary, "refresh-dialog-summary");
+    gtk_label_set_xalign(GTK_LABEL(summary), 1.0);
+    gtk_label_set_single_line_mode(GTK_LABEL(summary), TRUE);
+    gtk_label_set_max_width_chars(GTK_LABEL(summary), 32);
+    gtk_widget_set_hexpand(summary, TRUE);
+    gtk_box_append(GTK_BOX(status_row), summary);
 
     GtkWidget* progress = gtk_progress_bar_new();
     gtk_widget_add_css_class(progress, "accent-progress");
@@ -2208,16 +2528,110 @@ static void start_refresh_cards_async(GtkWindow* window, AppState* state) {
     gtk_progress_bar_set_show_text(GTK_PROGRESS_BAR(progress), TRUE);
     gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(progress), 0.0);
     gtk_progress_bar_set_text(GTK_PROGRESS_BAR(progress), "0%");
-    gtk_box_append(GTK_BOX(content), progress);
+    gtk_box_append(GTK_BOX(progress_card), progress);
+
+    GtkWidget* metrics_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_add_css_class(metrics_row, "refresh-metrics-row");
+    gtk_widget_set_hexpand(metrics_row, TRUE);
+    gtk_box_append(GTK_BOX(progress_card), metrics_row);
+
+    GtkWidget* metrics_chip = gtk_label_new("");
+    gtk_widget_add_css_class(metrics_chip, "refresh-chip");
+    gtk_label_set_xalign(GTK_LABEL(metrics_chip), 0.0);
+    gtk_widget_set_hexpand(metrics_chip, TRUE);
+    gtk_box_append(GTK_BOX(metrics_row), metrics_chip);
+
+    GtkWidget* eta_chip = gtk_label_new("");
+    gtk_widget_add_css_class(eta_chip, "refresh-chip-secondary");
+    gtk_label_set_xalign(GTK_LABEL(eta_chip), 1.0);
+    gtk_box_append(GTK_BOX(metrics_row), eta_chip);
 
     GtkWidget* detail = gtk_label_new("");
+    gtk_widget_add_css_class(detail, "refresh-dialog-detail");
     gtk_label_set_xalign(GTK_LABEL(detail), 0.0);
     gtk_label_set_wrap(GTK_LABEL(detail), TRUE);
-    gtk_widget_add_css_class(detail, "refresh-dialog-detail");
-    gtk_box_append(GTK_BOX(content), detail);
+    gtk_label_set_max_width_chars(GTK_LABEL(detail), 48);
+    gtk_widget_set_margin_top(detail, 8);
+    gtk_box_append(GTK_BOX(progress_card), detail);
+
+    GtkWidget* telemetry_card = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_widget_add_css_class(telemetry_card, "refresh-telemetry-card");
+    gtk_box_append(GTK_BOX(progress_card), telemetry_card);
+
+    GtkWidget* telemetry_header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_add_css_class(telemetry_header, "refresh-telemetry-header");
+    gtk_widget_set_hexpand(telemetry_header, TRUE);
+    gtk_box_append(GTK_BOX(telemetry_card), telemetry_header);
+
+    GtkWidget* telemetry_title = gtk_label_new("Telemetria in tempo reale");
+    gtk_widget_add_css_class(telemetry_title, "refresh-telemetry-title");
+    gtk_label_set_xalign(GTK_LABEL(telemetry_title), 0.0);
+    gtk_widget_set_hexpand(telemetry_title, TRUE);
+    gtk_box_append(GTK_BOX(telemetry_header), telemetry_title);
+
+    GtkWidget* telemetry_live = gtk_label_new("LIVE");
+    gtk_widget_add_css_class(telemetry_live, "refresh-telemetry-live");
+    gtk_box_append(GTK_BOX(telemetry_header), telemetry_live);
+
+    GtkWidget* telemetry_grid = gtk_grid_new();
+    gtk_widget_add_css_class(telemetry_grid, "refresh-telemetry-grid");
+    gtk_grid_set_column_spacing(GTK_GRID(telemetry_grid), 24);
+    gtk_grid_set_row_spacing(GTK_GRID(telemetry_grid), 10);
+    gtk_widget_set_hexpand(telemetry_grid, TRUE);
+    gtk_box_append(GTK_BOX(telemetry_card), telemetry_grid);
+
+    GtkWidget* stat_updated = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    gtk_widget_add_css_class(stat_updated, "refresh-telemetry-stat");
+    gtk_grid_attach(GTK_GRID(telemetry_grid), stat_updated, 0, 0, 1, 1);
+    GtkWidget* stat_updated_title = gtk_label_new("Aggiornate");
+    gtk_widget_add_css_class(stat_updated_title, "refresh-telemetry-stat-title");
+    gtk_label_set_xalign(GTK_LABEL(stat_updated_title), 0.0);
+    gtk_box_append(GTK_BOX(stat_updated), stat_updated_title);
+    GtkWidget* stat_updated_value = gtk_label_new("0");
+    gtk_widget_add_css_class(stat_updated_value, "refresh-telemetry-stat-value");
+    gtk_label_set_xalign(GTK_LABEL(stat_updated_value), 0.0);
+    gtk_box_append(GTK_BOX(stat_updated), stat_updated_value);
+
+    GtkWidget* stat_accuracy = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    gtk_widget_add_css_class(stat_accuracy, "refresh-telemetry-stat");
+    gtk_grid_attach(GTK_GRID(telemetry_grid), stat_accuracy, 1, 0, 1, 1);
+    GtkWidget* stat_accuracy_title = gtk_label_new("Precisione");
+    gtk_widget_add_css_class(stat_accuracy_title, "refresh-telemetry-stat-title");
+    gtk_label_set_xalign(GTK_LABEL(stat_accuracy_title), 0.0);
+    gtk_box_append(GTK_BOX(stat_accuracy), stat_accuracy_title);
+    GtkWidget* stat_accuracy_value = gtk_label_new("—");
+    gtk_widget_add_css_class(stat_accuracy_value, "refresh-telemetry-stat-value");
+    gtk_label_set_xalign(GTK_LABEL(stat_accuracy_value), 0.0);
+    gtk_box_append(GTK_BOX(stat_accuracy), stat_accuracy_value);
+
+    GtkWidget* stat_velocity = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    gtk_widget_add_css_class(stat_velocity, "refresh-telemetry-stat");
+    gtk_grid_attach(GTK_GRID(telemetry_grid), stat_velocity, 0, 1, 1, 1);
+    GtkWidget* stat_velocity_title = gtk_label_new("Velocità");
+    gtk_widget_add_css_class(stat_velocity_title, "refresh-telemetry-stat-title");
+    gtk_label_set_xalign(GTK_LABEL(stat_velocity_title), 0.0);
+    gtk_box_append(GTK_BOX(stat_velocity), stat_velocity_title);
+    GtkWidget* stat_velocity_value = gtk_label_new("—");
+    gtk_widget_add_css_class(stat_velocity_value, "refresh-telemetry-stat-value");
+    gtk_label_set_xalign(GTK_LABEL(stat_velocity_value), 0.0);
+    gtk_box_append(GTK_BOX(stat_velocity), stat_velocity_value);
+
+    GtkWidget* stat_remaining = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    gtk_widget_add_css_class(stat_remaining, "refresh-telemetry-stat");
+    gtk_grid_attach(GTK_GRID(telemetry_grid), stat_remaining, 1, 1, 1, 1);
+    GtkWidget* stat_remaining_title = gtk_label_new("Rimanenti");
+    gtk_widget_add_css_class(stat_remaining_title, "refresh-telemetry-stat-title");
+    gtk_label_set_xalign(GTK_LABEL(stat_remaining_title), 0.0);
+    gtk_box_append(GTK_BOX(stat_remaining), stat_remaining_title);
+    GtkWidget* stat_remaining_value = gtk_label_new("0");
+    gtk_widget_add_css_class(stat_remaining_value, "refresh-telemetry-stat-value");
+    gtk_label_set_xalign(GTK_LABEL(stat_remaining_value), 0.0);
+    gtk_box_append(GTK_BOX(stat_remaining), stat_remaining_value);
 
     GtkWidget* buttons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_add_css_class(buttons, "refresh-dialog-buttons");
     gtk_widget_set_halign(buttons, GTK_ALIGN_END);
+    gtk_widget_set_margin_top(buttons, 18);
     GtkWidget* cancel_btn = gtk_button_new_with_label("Annulla");
     gtk_widget_add_css_class(cancel_btn, "ghost-button");
     gtk_box_append(GTK_BOX(buttons), cancel_btn);
@@ -2226,14 +2640,28 @@ static void start_refresh_cards_async(GtkWindow* window, AppState* state) {
     ctx->dialog = dialog;
     ctx->spinner = spinner;
     ctx->progress = GTK_PROGRESS_BAR(progress);
+    ctx->status_badge = GTK_LABEL(status_badge);
     ctx->summary_label = GTK_LABEL(summary);
     ctx->detail_label = GTK_LABEL(detail);
+    ctx->metrics_label = GTK_LABEL(metrics_chip);
+    ctx->eta_label = GTK_LABEL(eta_chip);
+    ctx->stat_updated_value = GTK_LABEL(stat_updated_value);
+    ctx->stat_accuracy_value = GTK_LABEL(stat_accuracy_value);
+    ctx->stat_velocity_value = GTK_LABEL(stat_velocity_value);
+    ctx->stat_remaining_value = GTK_LABEL(stat_remaining_value);
     ctx->cancel_button = cancel_btn;
 
     std::ostringstream initial_summary;
     initial_summary << "0 / " << ctx->cards.size() << " carte elaborate";
     gtk_label_set_text(GTK_LABEL(summary), initial_summary.str().c_str());
     gtk_label_set_text(GTK_LABEL(detail), "Preparazione in corso...");
+    std::ostringstream initial_metrics;
+    initial_metrics << "0 aggiornate • 0 / " << ctx->cards.size() << " elaborate";
+    gtk_label_set_text(GTK_LABEL(metrics_chip), initial_metrics.str().c_str());
+    gtk_label_set_text(GTK_LABEL(eta_chip), "Tempo stimato —");
+    std::ostringstream initial_remaining;
+    initial_remaining << ctx->cards.size();
+    gtk_label_set_text(GTK_LABEL(stat_remaining_value), initial_remaining.str().c_str());
 
     g_signal_connect(cancel_btn, "clicked", G_CALLBACK(refresh_dialog_cancel), ctx);
 
@@ -2241,53 +2669,125 @@ static void start_refresh_cards_async(GtkWindow* window, AppState* state) {
         gtk_widget_set_sensitive(state->refresh_button, FALSE);
     }
 
+    ctx->start_time = std::chrono::steady_clock::now();
     gtk_window_present(GTK_WINDOW(dialog));
 
     std::thread([ctx]() {
         const int total = static_cast<int>(ctx->cards.size());
         int processed = 0;
+
+        auto format_eta = [](double seconds) -> std::string {
+            if (seconds <= 1.0) return std::string("<1s");
+            int total_sec = static_cast<int>(std::round(seconds));
+            if (total_sec < 1) return std::string("<1s");
+            int hours = total_sec / 3600;
+            int minutes = (total_sec % 3600) / 60;
+            int secs = total_sec % 60;
+            std::ostringstream out;
+            if (hours > 0) {
+                out << hours << "h";
+                if (minutes > 0) out << " " << minutes << "m";
+            } else {
+                if (minutes > 0) {
+                    out << minutes << "m";
+                    if (secs > 0) out << " " << secs << "s";
+                } else {
+                    out << secs << "s";
+                }
+            }
+            std::string value = out.str();
+            if (value.empty()) value = "<1s";
+            return value;
+        };
+
+        auto build_metrics_text = [&](int processed_local, int total_local, int updated_local) -> std::string {
+            std::ostringstream metrics;
+            metrics << updated_local << " aggiornate";
+            if (total_local > 0) {
+                metrics << " • " << processed_local << " / " << total_local << " elaborate";
+            }
+            if (processed_local > 0) {
+                int success_percent = static_cast<int>(std::round((updated_local * 100.0) / processed_local));
+                metrics << " • " << success_percent << "% precisione";
+            }
+            return metrics.str();
+        };
+
+        auto build_eta_text = [&](int processed_local, int total_local) -> std::string {
+            if (total_local <= 0 || processed_local <= 0) return std::string("Tempo stimato —");
+            if (processed_local >= total_local) return std::string("Tempo stimato 0s");
+            auto elapsed = std::chrono::steady_clock::now() - ctx->start_time;
+            double elapsed_seconds = std::chrono::duration_cast<std::chrono::duration<double>>(elapsed).count();
+            if (elapsed_seconds <= 0.0) return std::string("Tempo stimato —");
+            double per_card = elapsed_seconds / static_cast<double>(processed_local);
+            double remaining_seconds = per_card * static_cast<double>(total_local - processed_local);
+            if (remaining_seconds <= 1.0) return std::string("Tempo stimato <1s");
+            return std::string("Tempo stimato ≈ ") + format_eta(remaining_seconds);
+        };
+
+        auto build_accuracy_text = [&](int updated_local, int processed_local) -> std::string {
+            if (processed_local <= 0) return std::string("—");
+            double ratio = (updated_local * 100.0) / static_cast<double>(processed_local);
+            ratio = std::clamp(ratio, 0.0, 100.0);
+            std::ostringstream oss;
+            oss << std::fixed << std::setprecision(ratio < 10.0 ? 1 : 0) << ratio << "%";
+            return oss.str();
+        };
+
+        auto build_velocity_text = [&](int processed_local, double elapsed_seconds) -> std::string {
+            if (processed_local <= 0 || elapsed_seconds <= 0.0) return std::string("—");
+            double per_min = (static_cast<double>(processed_local) / elapsed_seconds) * 60.0;
+            if (per_min < 0.05) return std::string("<0.1/min");
+            std::ostringstream oss;
+            if (per_min < 10.0) {
+                oss << std::fixed << std::setprecision(1) << per_min;
+            } else {
+                oss << std::fixed << std::setprecision(0) << per_min;
+            }
+            oss << "/min";
+            return oss.str();
+        };
+
+        auto build_remaining_text = [&](int processed_local, int total_local) -> std::string {
+            if (total_local <= 0) return std::string("—");
+            int remaining = std::max(total_local - processed_local, 0);
+            return std::to_string(remaining);
+        };
+
+        auto emit_progress = [&](int processed_local, int total_local, double fraction_local, const std::string& summary_text, const std::string& detail_text) {
+            int updated_local = ctx->updated_count;
+            std::string metrics_text = build_metrics_text(processed_local, total_local, updated_local);
+            std::string eta_text = build_eta_text(processed_local, total_local);
+            double elapsed_seconds = std::chrono::duration_cast<std::chrono::duration<double>>(std::chrono::steady_clock::now() - ctx->start_time).count();
+            std::string accuracy_text = build_accuracy_text(updated_local, processed_local);
+            std::string velocity_text = build_velocity_text(processed_local, elapsed_seconds);
+            std::string remaining_text = build_remaining_text(processed_local, total_local);
+            auto* payload = new RefreshProgressPayload{ctx, fraction_local, summary_text, detail_text, metrics_text, eta_text, processed_local, updated_local, total_local, accuracy_text, velocity_text, remaining_text};
+            g_idle_add_full(G_PRIORITY_DEFAULT, refresh_dialog_progress_cb, payload, [](gpointer data){ delete static_cast<RefreshProgressPayload*>(data); });
+        };
+
         for (const auto& row : ctx->cards) {
             if (ctx->cancel_requested.load()) break;
 
-            std::string search_name;
-            auto it_en = row.find("english_name");
-            if (it_en != row.end()) search_name = it_en->second;
-            if (search_name.empty()) {
-                auto it_name = row.find("name");
-                if (it_name != row.end()) search_name = it_name->second;
-            }
-            if (search_name.empty()) {
+            std::string localized_name = row.count("localized_name") ? row.at("localized_name") : std::string();
+            std::string english_name = row.count("english_name") ? row.at("english_name") : std::string();
+            std::string fallback_name = row.count("name") ? row.at("name") : std::string();
+            std::string display_name = !localized_name.empty() ? localized_name : (!english_name.empty() ? english_name : fallback_name);
+            if (display_name.empty()) {
                 processed++;
                 ctx->processed_count = processed;
-                auto* payload = new RefreshProgressPayload{ctx, total > 0 ? static_cast<double>(processed) / total : 1.0, std::to_string(processed) + " / " + std::to_string(total) + " carte elaborate", "Nessun nome disponibile"};
-                g_idle_add_full(G_PRIORITY_DEFAULT, refresh_dialog_progress_cb, payload, [](gpointer data){ delete static_cast<RefreshProgressPayload*>(data); });
+                double fraction = total > 0 ? static_cast<double>(processed) / total : 1.0;
+                std::ostringstream summary;
+                summary << processed << " / " << total << " carte elaborate";
+                emit_progress(processed, total, fraction, summary.str(), "Nessun nome disponibile");
                 continue;
             }
 
-            auto results = search_cards_from_scryfall(search_name);
-            const std::string row_set = row.count("set_code") ? row.at("set_code") : std::string();
-            ScryfallCard* found = nullptr;
-            for (auto& card : results) {
-                if (!row_set.empty()) {
-                    std::string card_code = card.set_code;
-                    if (!card_code.empty()) {
-                        std::string row_code_upper = row_set;
-                        std::string card_code_upper = card_code;
-                        std::transform(row_code_upper.begin(), row_code_upper.end(), row_code_upper.begin(), ::toupper);
-                        std::transform(card_code_upper.begin(), card_code_upper.end(), card_code_upper.begin(), ::toupper);
-                        if (row_code_upper == card_code_upper) {
-                            found = &card;
-                            break;
-                        }
-                    }
-                }
-            }
-            if (!found && !results.empty()) {
-                found = &results.front();
-            }
+            std::string failure_reason;
+            std::optional<ScryfallCard> resolved = resolve_card_for_refresh(row, failure_reason);
 
             bool success = false;
-            if (found && ctx->state && ctx->state->db) {
+            if (resolved && ctx->state && ctx->state->db) {
                 int card_id = 0;
                 auto it_id = row.find("id");
                 if (it_id != row.end()) {
@@ -2295,16 +2795,16 @@ static void start_refresh_cards_async(GtkWindow* window, AppState* state) {
                 }
                 if (card_id > 0) {
                     success = ctx->state->db->update_card_info(card_id,
-                        found->english_name,
-                        found->localized_name,
-                        found->type,
-                        found->localized_type,
-                        found->colors,
-                        found->mana_cost,
-                        found->rarity,
-                        found->image_url,
-                        found->price_usd,
-                        found->oracle_text);
+                        resolved->english_name,
+                        resolved->localized_name,
+                        resolved->type,
+                        resolved->localized_type,
+                        resolved->colors,
+                        resolved->mana_cost,
+                        resolved->rarity,
+                        resolved->image_url,
+                        resolved->price_usd,
+                        resolved->oracle_text);
                 }
             }
             if (success) ctx->updated_count++;
@@ -2318,16 +2818,20 @@ static void start_refresh_cards_async(GtkWindow* window, AppState* state) {
             std::string detail;
             if (ctx->cancel_requested.load()) {
                 detail = "Annullamento in corso...";
-            } else if (found) {
-                const std::string& display_name = !found->localized_name.empty() ? found->localized_name : found->english_name;
-                detail = std::string("Ultima carta: ") + display_name;
-                if (!success) detail += " (errore)";
+            } else if (resolved && success) {
+                std::string resolved_name = !resolved->localized_name.empty() ? resolved->localized_name : (!resolved->english_name.empty() ? resolved->english_name : display_name);
+                detail = std::string("Aggiornata: ") + resolved_name;
+                if (!resolved->set_code.empty()) {
+                    detail += " [" + resolved->set_code + "]";
+                }
+            } else if (resolved && !success) {
+                std::string resolved_name = !resolved->localized_name.empty() ? resolved->localized_name : (!resolved->english_name.empty() ? resolved->english_name : display_name);
+                detail = std::string("Errore aggiornando ") + resolved_name;
             } else {
-                detail = std::string("Nessuna corrispondenza per: ") + search_name;
+                detail = failure_reason.empty() ? std::string("Nessuna corrispondenza per: ") + display_name : failure_reason;
             }
 
-            auto* payload = new RefreshProgressPayload{ctx, fraction, summary.str(), detail};
-            g_idle_add_full(G_PRIORITY_DEFAULT, refresh_dialog_progress_cb, payload, [](gpointer data){ delete static_cast<RefreshProgressPayload*>(data); });
+            emit_progress(processed, total, fraction, summary.str(), detail);
 
             if (ctx->cancel_requested.load()) {
                 break;
@@ -2336,7 +2840,13 @@ static void start_refresh_cards_async(GtkWindow* window, AppState* state) {
 
         int total_cards = static_cast<int>(ctx->cards.size());
         ctx->cards.clear();
-        auto* final_payload = new RefreshFinalPayload{ctx, ctx->cancel_requested.load(), ctx->updated_count, ctx->processed_count, total_cards};
+    std::string final_metrics = build_metrics_text(ctx->processed_count, total_cards, ctx->updated_count);
+        std::string final_eta = ctx->cancel_requested.load() ? std::string("Tempo stimato —") : build_eta_text(ctx->processed_count, total_cards);
+        double total_elapsed_seconds = std::chrono::duration_cast<std::chrono::duration<double>>(std::chrono::steady_clock::now() - ctx->start_time).count();
+        std::string final_accuracy = build_accuracy_text(ctx->updated_count, ctx->processed_count);
+        std::string final_velocity = build_velocity_text(ctx->processed_count, total_elapsed_seconds);
+        std::string final_remaining = build_remaining_text(ctx->processed_count, total_cards);
+        auto* final_payload = new RefreshFinalPayload{ctx, ctx->cancel_requested.load(), ctx->updated_count, ctx->processed_count, total_cards, final_metrics, final_eta, final_accuracy, final_velocity, final_remaining};
         g_idle_add_full(G_PRIORITY_DEFAULT, refresh_dialog_finish_cb, final_payload, [](gpointer data){ delete static_cast<RefreshFinalPayload*>(data); });
     }).detach();
 }
@@ -5110,7 +5620,7 @@ static GtkWidget* find_editable_descendant(GtkWidget* root) {
 }
 
 // Funzione per caricare le carte dal database
-static std::vector<std::map<std::string, std::string>> load_cards_from_db(Database* db, const std::string& filter = "", int deck_filter = -1, bool only_no_deck = false) {
+static std::vector<std::map<std::string, std::string>> load_cards_from_db(Database* db, const std::string& filter = "", int deck_filter = -1, bool only_no_deck = false, bool aggregate_main) {
     std::vector<std::map<std::string, std::string>> cards;
     if (!db) return cards;
     // Build SQL and optional params for deck filtering
@@ -5135,6 +5645,12 @@ static std::vector<std::map<std::string, std::string>> load_cards_from_db(Databa
         }
         cards.push_back(row);
     }, params);
+    if (only_no_deck && deck_filter == -1 && !aggregate_main) {
+        cards.erase(std::remove_if(cards.begin(), cards.end(), [](const std::map<std::string,std::string>& row){
+            auto it = row.find("deck_id");
+            return it != row.end() && !it->second.empty();
+        }), cards.end());
+    }
     // If we're viewing the main database (no deck filter), aggregate rows that represent
     // the same card (case/whitespace-insensitive name match) while keeping foil rows separate.
     // Aggregation rules:
@@ -5143,7 +5659,7 @@ static std::vector<std::map<std::string, std::string>> load_cards_from_db(Databa
     // - Sum the quantity across all matching rows.
     // - For display metadata (type, image_url, added_date, price_usd, etc.) pick the row with
     //   the latest added_date (ISO timestamp) as representative.
-    if (deck_filter == -1) {
+    if (deck_filter == -1 && aggregate_main) {
         struct AggItem {
             std::map<std::string,std::string> rep; // representative row
             int total_qty;
@@ -5162,7 +5678,8 @@ static std::vector<std::map<std::string, std::string>> load_cards_from_db(Databa
         for (const auto &r : cards) {
             // If caller requested only cards not in any deck, skip rows that belong to a deck
             if (only_no_deck) {
-                if (r.count("deck_id") && !r.at("deck_id").empty()) continue;
+                auto dit = r.find("deck_id");
+                if (dit != r.end() && !dit->second.empty()) continue;
             }
             std::string en = r.count("english_name") && !r.at("english_name").empty() ? r.at("english_name") : "";
             std::string ln = r.count("localized_name") && !r.at("localized_name").empty() ? r.at("localized_name") : "";
@@ -6898,6 +7415,89 @@ static void on_delete_card(GSimpleAction *action, GVariant *parameter, gpointer 
 
         gtk_window_present(GTK_WINDOW(dialog));
     }
+}
+
+struct RefetchCardJob {
+    GtkWindow* window;
+    AppState* state;
+    int card_id;
+    std::map<std::string,std::string> row;
+};
+
+struct RefetchCardResult {
+    GtkWindow* window;
+    AppState* state;
+    int card_id;
+    bool success;
+    std::string message;
+};
+
+static void on_refetch_card(GSimpleAction*, GVariant* parameter, gpointer user_data) {
+    GtkWindow* window = GTK_WINDOW(user_data);
+    AppState* state = (AppState*)g_object_get_data(G_OBJECT(window), "app_state");
+    if (!state || !state->db) return;
+    int card_id = g_variant_get_int32(parameter);
+
+    std::map<std::string,std::string> row_data;
+    bool found = false;
+    state->db->query("SELECT id, english_name, localized_name, name, type, localized_type, colors, set_code, mana_cost, rarity, image_url, price_usd, oracle_text FROM cards WHERE id = ? LIMIT 1", [&](const std::map<std::string,std::string>& row){
+        row_data = row;
+        found = true;
+    }, {std::to_string(card_id)});
+
+    if (!found) {
+        GtkAlertDialog* alert = gtk_alert_dialog_new("%s", "Carta non trovata nel database.");
+        gtk_alert_dialog_show(alert, window);
+        g_object_unref(alert);
+        return;
+    }
+
+    auto* job = new RefetchCardJob{window, state, card_id, row_data};
+    std::thread([job]() {
+        std::string failure_reason;
+        auto resolved = resolve_card_for_refresh(job->row, failure_reason);
+        bool updated = false;
+        std::string message;
+
+        if (resolved && job->state && job->state->db) {
+            updated = job->state->db->update_card_info(job->card_id,
+                resolved->english_name,
+                resolved->localized_name,
+                resolved->type,
+                resolved->localized_type,
+                resolved->colors,
+                resolved->mana_cost,
+                resolved->rarity,
+                resolved->image_url,
+                resolved->price_usd,
+                resolved->oracle_text);
+            if (updated) {
+                message = "Carta aggiornata da Scryfall.";
+            } else {
+                message = "Errore salvando i dati aggiornati.";
+            }
+        } else {
+            if (failure_reason.empty()) failure_reason = "Nessuna corrispondenza affidabile su Scryfall.";
+            message = failure_reason;
+        }
+
+        auto* result = new RefetchCardResult{job->window, job->state, job->card_id, updated, message};
+        g_idle_add_full(G_PRIORITY_DEFAULT, +[](gpointer data) -> gboolean {
+            auto* result = static_cast<RefetchCardResult*>(data);
+            if (result->success && result->state) {
+                refresh_card_list(result->state);
+            }
+            if (result->window && GTK_IS_WINDOW(result->window)) {
+                GtkAlertDialog* alert = gtk_alert_dialog_new("%s", result->message.c_str());
+                gtk_alert_dialog_show(alert, result->window);
+                g_object_unref(alert);
+            }
+            delete result;
+            return G_SOURCE_REMOVE;
+        }, result, nullptr);
+
+        delete job;
+    }).detach();
 }
 
 // Context for deleting a deck (used by the dialog handlers)
@@ -9601,6 +10201,11 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     g_signal_connect(delete_action, "activate", G_CALLBACK(on_delete_card), window);
     g_action_map_add_action(G_ACTION_MAP(app), G_ACTION(delete_action));
 
+    // Azione per rifetch da Scryfall
+    GSimpleAction *refetch_action = g_simple_action_new("refetch_card", G_VARIANT_TYPE_INT32);
+    g_signal_connect(refetch_action, "activate", G_CALLBACK(on_refetch_card), window);
+    g_action_map_add_action(G_ACTION_MAP(app), G_ACTION(refetch_action));
+
     // Export actions
     GSimpleAction *export_db_action = g_simple_action_new("export_db", NULL);
     g_signal_connect(export_db_action, "activate", G_CALLBACK(on_export_database_action), window);
@@ -9860,6 +10465,10 @@ static GMenu* create_context_menu(CardRow *row, AppState *state) {
     g_menu_item_set_action_and_target_value(add_item, "app.add_to_deck", g_variant_new_int32(row->id));
     g_menu_append_item(menu, add_item);
     g_object_unref(add_item);
+    GMenuItem *refetch_item = g_menu_item_new("Aggiorna da Scryfall", NULL);
+    g_menu_item_set_action_and_target_value(refetch_item, "app.refetch_card", g_variant_new_int32(row->id));
+    g_menu_append_item(menu, refetch_item);
+    g_object_unref(refetch_item);
     GMenuItem *delete_item = g_menu_item_new("Elimina", NULL);
     g_menu_item_set_action_and_target_value(delete_item, "app.delete_card", g_variant_new_int32(row->id));
     g_menu_append_item(menu, delete_item);
