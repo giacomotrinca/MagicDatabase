@@ -15,6 +15,7 @@
         "text_encoding": "cpp",
         "typeinfo": "cpp",
         "random": "cpp",
-        "list": "cpp"
+        "list": "cpp",
+        "initializer_list": "cpp"
     }
 }

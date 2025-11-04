@@ -3,6 +3,7 @@
 #include <string>
 #include <map>
 #include <vector>
+#include <optional>
 
 // Struttura per rappresentare una carta trovata
 struct ScryfallCard {
@@ -24,6 +25,9 @@ struct ScryfallCard {
 
 // Restituisce una carta singola se trovata esattamente, oppure una lista di nomi se multiple corrispondenze
 std::vector<ScryfallCard> search_cards_from_scryfall(const std::string& query);
+
+// Fetch a single card using Scryfall's named endpoint with optional set/language hints.
+std::optional<ScryfallCard> fetch_card_named_exact(const std::string& name, const std::string& set_code = "", const std::string& language = "");
 
 // Scarica i dati binari dell'immagine dall'URL
 std::vector<unsigned char> download_image_data(const std::string& url);

@@ -98,6 +98,218 @@ spinbutton:focus-visible {
     color: @text_primary;
 }
 
+.app-dialog {
+    background-color: transparent;
+    box-shadow: none;
+}
+
+.refresh-dialog-root {
+    background-image:
+        radial-gradient(circle at 18% 12%, rgba(124,107,255,0.32), transparent 68%),
+        radial-gradient(circle at 84% 0%, rgba(57,195,255,0.26), transparent 62%),
+        linear-gradient(170deg, rgba(18,24,40,0.94), rgba(10,14,28,0.94));
+    border: 1px solid rgba(124,107,255,0.32);
+    border-radius: 24px;
+    box-shadow: 0 28px 64px rgba(6,8,20,0.52);
+    padding: 26px 30px 24px 30px;
+}
+
+.refresh-dialog-hero {
+    align-items: center;
+}
+
+.refresh-dialog-hero-indicator {
+    min-width: 72px;
+    min-height: 72px;
+    border-radius: 24px;
+    padding: 16px;
+    background-image: linear-gradient(135deg, rgba(124,107,255,0.4), rgba(57,195,255,0.3));
+    border: 1px solid rgba(124,107,255,0.45);
+    box-shadow: 0 16px 42px rgba(8,10,26,0.55);
+}
+
+spinner.accent-spinner {
+    color: @text_primary;
+    min-width: 36px;
+    min-height: 36px;
+}
+
+.refresh-dialog-title {
+    font-size: 20px;
+    font-weight: 700;
+    letter-spacing: 0.25px;
+    color: @text_primary;
+}
+
+.refresh-dialog-subtitle {
+    color: @text_secondary;
+    font-size: 13px;
+}
+
+.refresh-dialog-summary {
+    color: @text_primary;
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.refresh-progress-card {
+    background-color: rgba(14,20,34,0.9);
+    border-radius: 18px;
+    border: 1px solid rgba(124,107,255,0.25);
+    padding: 18px 20px;
+    box-shadow: 0 20px 48px rgba(6,8,20,0.45);
+}
+
+progressbar.accent-progress trough {
+    min-height: 14px;
+    border-radius: 999px;
+    background-color: rgba(255,255,255,0.08);
+    border: 1px solid rgba(124,107,255,0.28);
+}
+
+progressbar.accent-progress progress {
+    border-radius: 999px;
+    background-image: linear-gradient(90deg, @accent_primary, @accent_tertiary);
+    box-shadow: 0 8px 18px rgba(124,107,255,0.45);
+}
+
+progressbar.accent-progress text {
+    color: @text_primary;
+    font-weight: 600;
+}
+
+.refresh-status-row {
+    align-items: center;
+    gap: 12px;
+}
+
+.refresh-metrics-row {
+    margin-top: 4px;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+}
+
+.refresh-chip {
+    padding: 4px 14px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    background-image: linear-gradient(135deg, rgba(124,107,255,0.18), rgba(57,195,255,0.12));
+    border: 1px solid rgba(124,107,255,0.28);
+    color: @text_primary;
+    box-shadow: 0 12px 28px rgba(6,8,20,0.3);
+}
+
+.refresh-chip-secondary {
+    padding: 4px 12px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    background-color: rgba(255,255,255,0.06);
+    border: 1px solid rgba(124,107,255,0.18);
+    color: @text_secondary;
+    box-shadow: 0 8px 20px rgba(6,8,20,0.25);
+}
+
+.refresh-telemetry-card {
+    margin-top: 12px;
+    padding: 14px 16px 10px 16px;
+    border-radius: 14px;
+    border: 1px solid rgba(124,107,255,0.25);
+    background-image: linear-gradient(155deg, rgba(20,26,44,0.95), rgba(12,16,30,0.92));
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,0.02), 0 18px 36px rgba(6,8,20,0.38);
+}
+
+.refresh-telemetry-header {
+    align-items: center;
+}
+
+.refresh-telemetry-title {
+    font-size: 11px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: rgba(180,187,255,0.9);
+    font-weight: 700;
+}
+
+.refresh-telemetry-live {
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 10px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    font-weight: 700;
+    background-image: linear-gradient(120deg, rgba(255,92,163,0.4), rgba(255,200,127,0.26));
+    border: 1px solid rgba(255,153,214,0.4);
+    color: #ffeef9;
+    box-shadow: 0 8px 20px rgba(255,120,180,0.28);
+}
+
+.refresh-telemetry-grid {
+    margin-top: 12px;
+}
+
+.refresh-telemetry-stat {
+    min-width: 120px;
+}
+
+.refresh-telemetry-stat-title {
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: rgba(166,175,214,0.78);
+    font-weight: 600;
+}
+
+.refresh-telemetry-stat-value {
+    font-size: 20px;
+    font-weight: 700;
+    color: @text_primary;
+    text-shadow: 0 12px 24px rgba(10,12,32,0.6);
+}
+
+.refresh-status-badge {
+    padding: 4px 14px;
+    border-radius: 999px;
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    font-weight: 600;
+    background-image: linear-gradient(135deg, rgba(124,107,255,0.35), rgba(57,195,255,0.28));
+    border: 1px solid rgba(124,107,255,0.45);
+    color: @text_primary;
+    box-shadow: 0 12px 28px rgba(10,12,30,0.45);
+}
+
+.refresh-status-badge-success {
+    background-image: linear-gradient(135deg, rgba(76,222,128,0.32), rgba(76,222,128,0.22));
+    border-color: rgba(74,222,128,0.55);
+    color: @text_primary;
+}
+
+.refresh-status-badge-cancelled {
+    background-image: linear-gradient(135deg, rgba(255,107,107,0.28), rgba(255,107,107,0.18));
+    border-color: rgba(255,107,107,0.45);
+    color: @text_primary;
+}
+
+.refresh-dialog-detail {
+    color: @text_secondary;
+    font-size: 13px;
+    line-height: 1.5;
+}
+
+.refresh-dialog-buttons {
+    margin-top: 12px;
+}
+
+.refresh-dialog-buttons button {
+    min-width: 120px;
+}
+
 .danger-button {
     background-color: rgba(220,38,38,0.14);
     border: 1px solid rgba(220,38,38,0.38);
