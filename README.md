@@ -126,6 +126,15 @@ sudo apt install -y build-essential pkg-config git \
 - **Duplicate rows**: foil and sideboard flags are part of the identity when aggregating. Toggle filters or merge duplicates from the deck management actions.
 - **Scryfall quota or connectivity**: cached responses live for 10 minutes. If you query the same card repeatedly while offline, the cached entry will be used.
 
+## Credits & Resources
+- **Inter Typeface** — Designed by Rasmus Andersson. Download it from [rsms.me/inter](https://rsms.me/inter/) or Google Fonts and drop the regular weight into `data/fonts/Inter-Regular.ttf`; see `data/fonts/README.md` for the precise placement notes this project relies on.
+- **Mana Symbol Font** — Crafted by Andrew Gioia and distributed under the SIL OFL 1.1. We ship the glyph set referenced in `img/mana/README.md`; the official homepage ([mana.andrewgioia.com](https://mana.andrewgioia.com)) lists usage guidance and extension tips.
+- **GTK Inspector & Friends** — The warning clean-up journey used `GTK_DEBUG=interactive` extensively. Keep that flag handy when you are iterating on theming.
+- **Scryfall API** — Thanks to the Scryfall team for providing the public API that powers search, prices, and card imagery.
+
 ## License
 
 MIT — see `LICENSE` for full terms. Built by [Giacomo Trinca](https://github.com/giacomotrinca); issues and feature requests welcome.
+
+## Changelog
+- **2025-11-05** — Registered the bundled Mana icon font via Fontconfig, eliminated GTK theme parser warnings, refreshed theming credits, and introduced this changelog to track high-impact tweaks.
