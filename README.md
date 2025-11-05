@@ -24,7 +24,7 @@
 - **Deck aware by design**: create, select, and purge decks, move cards between main and sideboard, and keep split quantities in sync when spreading a card across multiple lists.
 - **Detail pane that matters**: double-click to open a sliding inspector with localized oracle text, pricing, color identity, and high-res art. Thumbnails are cached on disk (`data/img/`) via asynchronous prefetching so the list stays snappy even on cold starts.
 - **Filters and search**: filter by color identity, rarity, foil status, deck membership, and string search (`Ctrl+F`). Filters mirror the bilingual UI, translating type/rary names on the fly.
-- **Multilingual & polite**: toggle Italian/English from the View menu. Desktop notifications and focus behavior can be customized in Preferences (retry counts and delay are persisted in `settings.ini`).
+- **Multilingual & polite**: toggle Italian/English from the View menu. Desktop notifications can be toggled directly from the View menu and the choice is persisted in `settings.ini`.
 - **Exports built in**: from the File menu export the whole database or a single deck. Database exports are bilingual tables (EN/IT) with columns for mana cost, rarity, USD price, and foil flag; deck exports provide aligned main/sideboard lists in the chosen language.
 - **Offline friendly**: once downloaded, cards, prices, settings, and images live locally. Scryfall responses are cached for 10 minutes, and the app never requires an always-on connection beyond the API calls you initiate.
 
@@ -112,7 +112,6 @@ sudo apt install -y build-essential pkg-config git \
 ## Keyboard Shortcuts
 - `Ctrl+N` – add a card via Scryfall search
 - `Ctrl+F` – focus the search box
-- `Ctrl+,` – open Preferences
 
 ## Data Layout
 - `data/` – everything runtime-related: databases, exports, cached images, settings, mana-curve artifacts.
