@@ -1,1 +1,1 @@
-data/collection.db
+/mnt/01D9269698DA8D30/gitrepos/MagicDatabase/data/collection.db

@@ -190,6 +190,75 @@ Database::Database(const std::string& db_path) : db(nullptr) {
                         std::cout << "Aggiunta colonna 'localized_type' alla tabella cards." << std::endl;
                     }
                 }
+                // Check for scryfall_id column
+                bool has_scryfall_id = false;
+                pi = nullptr;
+                if (sqlite3_prepare_v2(db, pragma, -1, &pi, nullptr) == SQLITE_OK) {
+                    while (sqlite3_step(pi) == SQLITE_ROW) {
+                        const unsigned char* colname = sqlite3_column_text(pi, 1);
+                        if (colname && strcmp((const char*)colname, "scryfall_id") == 0) {
+                            has_scryfall_id = true;
+                            break;
+                        }
+                    }
+                    sqlite3_finalize(pi);
+                }
+                if (!has_scryfall_id) {
+                    char* err = nullptr;
+                    const char* alter = "ALTER TABLE cards ADD COLUMN scryfall_id TEXT";
+                    if (sqlite3_exec(db, alter, nullptr, nullptr, &err) != SQLITE_OK) {
+                        std::cerr << "Errore alter table aggiunta scryfall_id: " << (err ? err : (char*)"unknown") << std::endl;
+                        if (err) sqlite3_free(err);
+                    } else {
+                        std::cout << "Aggiunta colonna 'scryfall_id' alla tabella cards." << std::endl;
+                    }
+                }
+                // Check for oracle_id column
+                bool has_oracle_id_col = false;
+                pi = nullptr;
+                if (sqlite3_prepare_v2(db, pragma, -1, &pi, nullptr) == SQLITE_OK) {
+                    while (sqlite3_step(pi) == SQLITE_ROW) {
+                        const unsigned char* colname = sqlite3_column_text(pi, 1);
+                        if (colname && strcmp((const char*)colname, "oracle_id") == 0) {
+                            has_oracle_id_col = true;
+                            break;
+                        }
+                    }
+                    sqlite3_finalize(pi);
+                }
+                if (!has_oracle_id_col) {
+                    char* err = nullptr;
+                    const char* alter = "ALTER TABLE cards ADD COLUMN oracle_id TEXT";
+                    if (sqlite3_exec(db, alter, nullptr, nullptr, &err) != SQLITE_OK) {
+                        std::cerr << "Errore alter table aggiunta oracle_id: " << (err ? err : (char*)"unknown") << std::endl;
+                        if (err) sqlite3_free(err);
+                    } else {
+                        std::cout << "Aggiunta colonna 'oracle_id' alla tabella cards." << std::endl;
+                    }
+                }
+                // Check for collector_number column
+                bool has_collector_number = false;
+                pi = nullptr;
+                if (sqlite3_prepare_v2(db, pragma, -1, &pi, nullptr) == SQLITE_OK) {
+                    while (sqlite3_step(pi) == SQLITE_ROW) {
+                        const unsigned char* colname = sqlite3_column_text(pi, 1);
+                        if (colname && strcmp((const char*)colname, "collector_number") == 0) {
+                            has_collector_number = true;
+                            break;
+                        }
+                    }
+                    sqlite3_finalize(pi);
+                }
+                if (!has_collector_number) {
+                    char* err = nullptr;
+                    const char* alter = "ALTER TABLE cards ADD COLUMN collector_number TEXT";
+                    if (sqlite3_exec(db, alter, nullptr, nullptr, &err) != SQLITE_OK) {
+                        std::cerr << "Errore alter table aggiunta collector_number: " << (err ? err : (char*)"unknown") << std::endl;
+                        if (err) sqlite3_free(err);
+                    } else {
+                        std::cout << "Aggiunta colonna 'collector_number' alla tabella cards." << std::endl;
+                    }
+                }
                 // Check for decks table
                 bool has_decks_table = false;
                 sqlite3_stmt* stmt_decks = nullptr;
@@ -399,7 +468,10 @@ Database::Database(const std::string& db_path) : db(nullptr) {
                     "CREATE INDEX IF NOT EXISTS idx_cards_foil ON cards (foil)",
                     "CREATE INDEX IF NOT EXISTS idx_cards_name ON cards (name)",
                     "CREATE INDEX IF NOT EXISTS idx_cards_english_name ON cards (english_name)",
-                    "CREATE INDEX IF NOT EXISTS idx_cards_localized_name ON cards (localized_name)"
+                    "CREATE INDEX IF NOT EXISTS idx_cards_localized_name ON cards (localized_name)",
+                    "CREATE INDEX IF NOT EXISTS idx_cards_oracle_id ON cards (oracle_id)",
+                    "CREATE INDEX IF NOT EXISTS idx_cards_scryfall_id ON cards (scryfall_id)",
+                    "CREATE INDEX IF NOT EXISTS idx_cards_collector_number ON cards (collector_number)"
                 };
                 for (const char* idx_sql : idxs) {
                     char* ierr = nullptr;
@@ -508,6 +580,10 @@ Database::~Database() {
     }
 }
 
+bool Database::is_open() const {
+    return db != nullptr;
+}
+
 bool Database::execute(const std::string& sql) {
     char* errMsg = nullptr;
     int rc = sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &errMsg);
@@ -519,7 +595,7 @@ bool Database::execute(const std::string& sql) {
     return true;
 }
 
-bool Database::insert_card(const std::string& english_name, const std::string& localized_name, const std::string& type, const std::string& localized_type, const std::string& colors, const std::string& set_code, const std::string& mana_cost, const std::string& rarity, int quantity, const std::string& image_url, const std::string& price_usd, const std::string& oracle_text, int deck_id, int foil, int sideboard) {
+bool Database::insert_card(const std::string& english_name, const std::string& localized_name, const std::string& type, const std::string& localized_type, const std::string& colors, const std::string& set_code, const std::string& mana_cost, const std::string& rarity, int quantity, const std::string& image_url, const std::string& price_usd, const std::string& oracle_text, int deck_id, int foil, int sideboard, const std::string& scryfall_id, const std::string& oracle_id, const std::string& collector_number) {
     // Normalize deck_id: callers may pass 0 for "no deck"; internally we treat <=0 as -1 (NULL)
     if (deck_id <= 0) deck_id = -1;
     if (sideboard <= 0) sideboard = 0; // normalize any non-positive to 0
@@ -612,7 +688,7 @@ bool Database::insert_card(const std::string& english_name, const std::string& l
     } else {
         sqlite3_finalize(check_stmt);
         // Non esiste, inserisci nuova (imposta added_date alla data/ora corrente in formato ISO)
-    const char* insert_sql = "INSERT INTO cards (english_name, localized_name, name, canonical_name, type, localized_type, colors, set_code, mana_cost, rarity, quantity, image_url, added_date, price_usd, foil, sideboard, oracle_text, deck_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+    const char* insert_sql = "INSERT INTO cards (english_name, localized_name, name, canonical_name, type, localized_type, colors, set_code, mana_cost, rarity, quantity, image_url, added_date, price_usd, foil, sideboard, oracle_text, deck_id, scryfall_id, oracle_id, collector_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
         sqlite3_stmt* insert_stmt;
         if (sqlite3_prepare_v2(db, insert_sql, -1, &insert_stmt, nullptr) != SQLITE_OK) {
             std::cerr << "Errore prepare insert: " << sqlite3_errmsg(db) << std::endl;
@@ -665,6 +741,21 @@ bool Database::insert_card(const std::string& english_name, const std::string& l
             sqlite3_bind_int(insert_stmt, 18, deck_id);
         } else {
             sqlite3_bind_null(insert_stmt, 18);
+        }
+        if (!scryfall_id.empty()) {
+            sqlite3_bind_text(insert_stmt, 19, scryfall_id.c_str(), -1, SQLITE_TRANSIENT);
+        } else {
+            sqlite3_bind_null(insert_stmt, 19);
+        }
+        if (!oracle_id.empty()) {
+            sqlite3_bind_text(insert_stmt, 20, oracle_id.c_str(), -1, SQLITE_TRANSIENT);
+        } else {
+            sqlite3_bind_null(insert_stmt, 20);
+        }
+        if (!collector_number.empty()) {
+            sqlite3_bind_text(insert_stmt, 21, collector_number.c_str(), -1, SQLITE_TRANSIENT);
+        } else {
+            sqlite3_bind_null(insert_stmt, 21);
         }
     // As above, drop FTS triggers before insert to avoid FTS5 trigger errors
     drop_cards_fts_triggers(db);
@@ -737,7 +828,7 @@ bool Database::get_card_quantity(int id, int& quantity) {
     }
 }
 
-bool Database::update_card_info(int id, const std::string& english_name, const std::string& localized_name, const std::string& type, const std::string& localized_type, const std::string& colors, const std::string& mana_cost, const std::string& rarity, const std::string& image_url, const std::string& price_usd, const std::string& oracle_text) {
+bool Database::update_card_info(int id, const std::string& english_name, const std::string& localized_name, const std::string& type, const std::string& localized_type, const std::string& colors, const std::string& mana_cost, const std::string& rarity, const std::string& image_url, const std::string& price_usd, const std::string& oracle_text, const std::string& scryfall_id, const std::string& oracle_id, const std::string& collector_number) {
     std::string set_code;
     bool set_code_is_null = true;
     {
@@ -758,7 +849,7 @@ bool Database::update_card_info(int id, const std::string& english_name, const s
 
     drop_cards_fts_triggers(db);
 
-    const char* sql = "UPDATE cards SET english_name = ?, localized_name = ?, name = ?, type = ?, localized_type = ?, colors = ?, mana_cost = ?, rarity = ?, image_url = ?, price_usd = ?, oracle_text = ? WHERE id = ?";
+    const char* sql = "UPDATE cards SET english_name = ?, localized_name = ?, name = ?, type = ?, localized_type = ?, colors = ?, mana_cost = ?, rarity = ?, image_url = ?, price_usd = ?, oracle_text = ?, scryfall_id = ?, oracle_id = ?, collector_number = ? WHERE id = ?";
     sqlite3_stmt* stmt = nullptr;
     bool success = false;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
@@ -775,7 +866,22 @@ bool Database::update_card_info(int id, const std::string& english_name, const s
         sqlite3_bind_text(stmt, 9, image_url.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 10, price_usd.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 11, oracle_text.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(stmt, 12, id);
+        if (!scryfall_id.empty()) {
+            sqlite3_bind_text(stmt, 12, scryfall_id.c_str(), -1, SQLITE_TRANSIENT);
+        } else {
+            sqlite3_bind_null(stmt, 12);
+        }
+        if (!oracle_id.empty()) {
+            sqlite3_bind_text(stmt, 13, oracle_id.c_str(), -1, SQLITE_TRANSIENT);
+        } else {
+            sqlite3_bind_null(stmt, 13);
+        }
+        if (!collector_number.empty()) {
+            sqlite3_bind_text(stmt, 14, collector_number.c_str(), -1, SQLITE_TRANSIENT);
+        } else {
+            sqlite3_bind_null(stmt, 14);
+        }
+        sqlite3_bind_int(stmt, 15, id);
         int rc = sqlite3_step(stmt);
         if (rc != SQLITE_DONE) {
             std::cerr << "Errore update_card_info: " << sqlite3_errmsg(db) << std::endl;

@@ -11,6 +11,7 @@
 #include <cctype>
 #include <optional>
 #include <thread>
+#include <limits>
 
 using json = nlohmann::json;
 
@@ -66,12 +67,36 @@ using CacheEntry = std::pair<std::chrono::steady_clock::time_point, std::vector<
 static std::mutex g_cache_mutex;
 static std::unordered_map<std::string, CacheEntry> g_cache;
 
+using SingleCardCacheEntry = std::pair<std::chrono::steady_clock::time_point, ScryfallCard>;
+static std::mutex g_single_card_cache_mutex;
+static std::unordered_map<std::string, SingleCardCacheEntry> g_single_card_cache;
+
 using PriceCacheEntry = std::pair<std::chrono::steady_clock::time_point, std::string>;
 static std::mutex g_price_cache_mutex;
 static std::unordered_map<std::string, PriceCacheEntry> g_price_cache;
 
 static std::string make_cache_key(const std::string& query, bool require_italian) {
     return query + (require_italian ? "|it" : "|any");
+}
+
+static std::string lowercase_ascii(const std::string& value) {
+    std::string out;
+    out.reserve(value.size());
+    for (unsigned char ch : value) {
+        out.push_back(static_cast<char>(std::tolower(ch)));
+    }
+    return out;
+}
+
+static std::string make_single_card_cache_key(const std::string& prefix, const std::string& identifier, const std::string& language) {
+    std::string key = prefix;
+    key.append("|");
+    key.append(lowercase_ascii(identifier));
+    if (!language.empty()) {
+        key.append("|");
+        key.append(lowercase_ascii(language));
+    }
+    return key;
 }
 
 static std::string sanitize_query(const std::string& query) {
@@ -186,6 +211,28 @@ static bool try_cache_lookup(const std::string& key, std::vector<ScryfallCard>& 
     return true;
 }
 
+static bool try_single_card_cache_lookup(const std::string& key, ScryfallCard& out_card) {
+    if (key.empty()) return false;
+    std::lock_guard<std::mutex> lock(g_single_card_cache_mutex);
+    auto it = g_single_card_cache.find(key);
+    if (it == g_single_card_cache.end()) {
+        return false;
+    }
+    auto age = std::chrono::steady_clock::now() - it->second.first;
+    if (age > kCacheTtl) {
+        g_single_card_cache.erase(it);
+        return false;
+    }
+    out_card = it->second.second;
+    return true;
+}
+
+static void store_single_card_cache_entry(const std::string& key, const ScryfallCard& card) {
+    if (key.empty()) return;
+    std::lock_guard<std::mutex> lock(g_single_card_cache_mutex);
+    g_single_card_cache[key] = {std::chrono::steady_clock::now(), card};
+}
+
 static std::string normalize_price_string(std::string price) {
     price.erase(price.begin(), std::find_if(price.begin(), price.end(), [](unsigned char ch){ return !std::isspace(ch); }));
     price.erase(std::find_if(price.rbegin(), price.rend(), [](unsigned char ch){ return !std::isspace(ch); }).base(), price.end());
@@ -273,6 +320,105 @@ static std::string fetch_price_from_named(const std::string& exact_name) {
     return price;
 }
 
+static std::string read_optional_string(const json& node, const char* key) {
+    if (!node.contains(key)) return std::string();
+    const json& value = node.at(key);
+    if (value.is_null()) return std::string();
+    if (value.is_string()) return value.get<std::string>();
+    return std::string();
+}
+
+static ScryfallCard build_card_from_payload(const json& payload) {
+    ScryfallCard result;
+    result.scryfall_id = read_optional_string(payload, "id");
+    result.oracle_id = read_optional_string(payload, "oracle_id");
+    result.collector_number = read_optional_string(payload, "collector_number");
+    result.lang = read_optional_string(payload, "lang");
+    result.set_code = read_optional_string(payload, "set");
+    result.set_name = read_optional_string(payload, "set_name");
+    result.english_name = read_optional_string(payload, "name");
+    result.localized_name = read_optional_string(payload, "printed_name");
+    if (result.localized_name.empty()) result.localized_name = result.english_name;
+    result.name = !result.localized_name.empty() ? result.localized_name : result.english_name;
+    result.type = read_optional_string(payload, "type_line");
+    result.localized_type = read_optional_string(payload, "printed_type_line");
+    if (result.localized_type.empty()) result.localized_type = result.type;
+    result.oracle_text = read_optional_string(payload, "printed_text");
+    if (result.oracle_text.empty()) {
+        result.oracle_text = read_optional_string(payload, "oracle_text");
+    }
+
+    auto colors_json = payload.value("colors", json::array());
+    result.colors = colors_json.is_null() ? "[]" : colors_json.dump();
+
+    result.mana_cost = read_optional_string(payload, "mana_cost");
+    result.rarity = read_optional_string(payload, "rarity");
+
+    auto image_uris = payload.value("image_uris", json::object());
+    if (!image_uris.is_null() && image_uris.contains("normal") && image_uris["normal"].is_string()) {
+        result.image_url = image_uris["normal"].get<std::string>();
+    } else if (payload.contains("card_faces") && payload["card_faces"].is_array() && !payload["card_faces"].empty()) {
+        const auto& face = payload["card_faces"].front();
+        auto face_images = face.value("image_uris", json::object());
+        if (!face_images.is_null() && face_images.contains("normal") && face_images["normal"].is_string()) {
+            result.image_url = face_images["normal"].get<std::string>();
+        }
+        std::string face_printed_name = read_optional_string(face, "printed_name");
+        if (result.localized_name.empty() && !face_printed_name.empty()) {
+            result.localized_name = face_printed_name;
+            result.name = result.localized_name;
+        }
+        std::string face_printed_type = read_optional_string(face, "printed_type_line");
+        if (result.localized_type.empty() && !face_printed_type.empty()) {
+            result.localized_type = face_printed_type;
+        }
+        std::string face_printed_text = read_optional_string(face, "printed_text");
+        if (result.oracle_text.empty() && !face_printed_text.empty()) {
+            result.oracle_text = face_printed_text;
+        } else if (result.oracle_text.empty()) {
+            std::string face_oracle_text = read_optional_string(face, "oracle_text");
+            if (!face_oracle_text.empty()) result.oracle_text = face_oracle_text;
+        }
+    }
+
+    auto prices_node = payload.value("prices", json::object());
+    result.price_usd = select_best_price_usd(prices_node);
+    if (result.price_usd.empty()) {
+        const std::string price_name = !result.english_name.empty() ? result.english_name : result.name;
+        result.price_usd = fetch_price_from_named(price_name);
+    }
+
+    result.is_exact_match = true;
+    return result;
+}
+
+static std::optional<ScryfallCard> fetch_single_card_from_url(const std::string& url, const std::string& cache_key) {
+    ScryfallCard cached;
+    if (try_single_card_cache_lookup(cache_key, cached)) {
+        return cached;
+    }
+
+    std::string buffer;
+    if (!perform_json_request(url, buffer)) {
+        return std::nullopt;
+    }
+
+    json payload;
+    if (!parse_json(buffer, payload)) {
+        return std::nullopt;
+    }
+
+    if (!payload.contains("object") || payload.value("object", "") != "card") {
+        return std::nullopt;
+    }
+
+    ScryfallCard result = build_card_from_payload(payload);
+    if (!cache_key.empty()) {
+        store_single_card_cache_entry(cache_key, result);
+    }
+    return result;
+}
+
 } // namespace
 
 // Funzione helper per cercare carte
@@ -317,59 +463,34 @@ static std::vector<ScryfallCard> perform_search(const std::string& query, bool r
         const auto& data = payload["data"];
         std::cout << "Found " << data.size() << " cards" << std::endl;
 
-        std::string query_lower = trimmed_query;
-        std::transform(query_lower.begin(), query_lower.end(), query_lower.begin(), ::tolower);
+        const std::string query_lower = lowercase_ascii(trimmed_query);
 
         for (const auto& card : data) {
-            ScryfallCard result;
+            ScryfallCard result = build_card_from_payload(card);
             result.is_exact_match = false;
 
-            std::string card_name = card.value("name", "");
-            std::transform(card_name.begin(), card_name.end(), card_name.begin(), ::tolower);
-
-            if (card_name.find(query_lower) != std::string::npos) {
+            std::string card_name = lowercase_ascii(read_optional_string(card, "name"));
+            if (!card_name.empty() && card_name.find(query_lower) != std::string::npos) {
                 result.is_exact_match = true;
             }
 
             if (require_italian) {
-                result.english_name = card.value("name", "");
-                result.localized_name = card.value("printed_name", card.value("name", ""));
-                result.name = result.localized_name;
-                result.type = card.value("type_line", "");
-                result.localized_type = card.value("printed_type_line", card.value("type_line", ""));
-                result.oracle_text = card.value("printed_text", card.value("oracle_text", ""));
+                if (result.localized_name.empty()) {
+                    result.localized_name = result.english_name;
+                }
+                result.name = !result.localized_name.empty() ? result.localized_name : result.english_name;
+                std::string printed_text = read_optional_string(card, "printed_text");
+                if (!printed_text.empty()) result.oracle_text = printed_text;
+                std::string printed_type = read_optional_string(card, "printed_type_line");
+                if (!printed_type.empty()) result.localized_type = printed_type;
             } else {
-                result.english_name = card.value("name", "");
-                result.localized_name = card.value("printed_name", card.value("name", ""));
                 result.name = result.english_name;
-                result.type = card.value("type_line", "");
-                result.localized_type = card.value("printed_type_line", card.value("type_line", ""));
-                result.oracle_text = card.value("oracle_text", "");
-            }
-
-            auto colors_json = card.value("colors", json::array());
-            if (colors_json.is_null()) {
-                result.colors = "[]";
-            } else {
-                result.colors = colors_json.dump();
-            }
-
-            result.set_name = card.value("set_name", "");
-            result.set_code = card.value("set", "");
-            result.mana_cost = card.value("mana_cost", "");
-            result.rarity = card.value("rarity", "");
-
-            auto image_uris = card.value("image_uris", json::object());
-            if (!image_uris.is_null()) {
-                result.image_url = image_uris.value("normal", "");
-            } else {
-                result.image_url = "";
-            }
-
-            auto prices = card.value("prices", json::object());
-            result.price_usd = select_best_price_usd(prices);
-            if (result.price_usd.empty()) {
-                result.price_usd = fetch_price_from_named(result.english_name.empty() ? card.value("name", "") : result.english_name);
+                std::string oracle_text = read_optional_string(card, "oracle_text");
+                if (!oracle_text.empty()) result.oracle_text = oracle_text;
+                std::string localized_name = read_optional_string(card, "printed_name");
+                if (!localized_name.empty()) result.localized_name = localized_name;
+                std::string localized_type = read_optional_string(card, "printed_type_line");
+                if (!localized_type.empty()) result.localized_type = localized_type;
             }
 
             std::cout << "Parsed card: " << result.name << ", price_usd: '" << result.price_usd << "'" << std::endl;
@@ -415,11 +536,22 @@ std::vector<ScryfallCard> search_cards_from_scryfall(const std::string& query) {
 
             if (italian_card) {
                 card.english_name = card.name;
-                card.localized_name = italian_card->localized_name;
-                card.name = card.localized_name;
-                card.type = italian_card->type;
-                card.localized_type = italian_card->localized_type;
-                card.oracle_text = italian_card->oracle_text;
+                if (!italian_card->localized_name.empty()) {
+                    card.localized_name = italian_card->localized_name;
+                }
+                card.name = !card.localized_name.empty() ? card.localized_name : card.english_name;
+                if (!italian_card->type.empty()) card.type = italian_card->type;
+                if (!italian_card->localized_type.empty()) card.localized_type = italian_card->localized_type;
+                if (!italian_card->oracle_text.empty()) card.oracle_text = italian_card->oracle_text;
+                if (!italian_card->colors.empty()) card.colors = italian_card->colors;
+                if (card.price_usd.empty() && !italian_card->price_usd.empty()) card.price_usd = italian_card->price_usd;
+                if (card.image_url.empty() && !italian_card->image_url.empty()) card.image_url = italian_card->image_url;
+                if (card.scryfall_id.empty() && !italian_card->scryfall_id.empty()) card.scryfall_id = italian_card->scryfall_id;
+                if (card.oracle_id.empty() && !italian_card->oracle_id.empty()) card.oracle_id = italian_card->oracle_id;
+                if (card.collector_number.empty() && !italian_card->collector_number.empty()) card.collector_number = italian_card->collector_number;
+                if (card.set_code.empty() && !italian_card->set_code.empty()) card.set_code = italian_card->set_code;
+                if (card.set_name.empty() && !italian_card->set_name.empty()) card.set_name = italian_card->set_name;
+                if (card.lang.empty() && !italian_card->lang.empty()) card.lang = italian_card->lang;
             }
         }
     }
@@ -428,35 +560,164 @@ std::vector<ScryfallCard> search_cards_from_scryfall(const std::string& query) {
 }
 
 std::optional<ScryfallCard> fetch_card_named_exact(const std::string& name, const std::string& set_code, const std::string& language) {
-    const std::string trimmed = sanitize_query(name);
-    if (trimmed.empty()) {
+    const std::string trimmed_name = sanitize_query(name);
+    if (trimmed_name.empty()) {
         return std::nullopt;
     }
 
-    char* escaped_name = curl_easy_escape(nullptr, trimmed.c_str(), static_cast<int>(trimmed.length()));
+    const std::string trimmed_set = sanitize_query(set_code);
+    const std::string lowered_set = trimmed_set.empty() ? std::string() : lowercase_ascii(trimmed_set);
+    const std::string lowered_lang = lowercase_ascii(language);
+
+    std::string cache_identifier = trimmed_name;
+    if (!lowered_set.empty()) {
+        cache_identifier.append("|");
+        cache_identifier.append(lowered_set);
+    }
+    std::string cache_key = make_single_card_cache_key("named", cache_identifier, lowered_lang);
+
+    char* escaped_name = curl_easy_escape(nullptr, trimmed_name.c_str(), static_cast<int>(trimmed_name.length()));
     std::string url = "https://api.scryfall.com/cards/named?exact=" + std::string(escaped_name ? escaped_name : "");
     if (escaped_name) {
         curl_free(escaped_name);
     }
 
-    if (!set_code.empty()) {
-        std::string lowered = set_code;
-        std::transform(lowered.begin(), lowered.end(), lowered.begin(), ::tolower);
-        char* esc_set = curl_easy_escape(nullptr, lowered.c_str(), static_cast<int>(lowered.length()));
+    if (!lowered_set.empty()) {
+        char* esc_set = curl_easy_escape(nullptr, lowered_set.c_str(), static_cast<int>(lowered_set.length()));
         url += "&set=" + std::string(esc_set ? esc_set : "");
         if (esc_set) {
             curl_free(esc_set);
         }
     }
 
-    if (!language.empty()) {
-        std::string lowered_lang = language;
-        std::transform(lowered_lang.begin(), lowered_lang.end(), lowered_lang.begin(), ::tolower);
+    if (!lowered_lang.empty()) {
         char* esc_lang = curl_easy_escape(nullptr, lowered_lang.c_str(), static_cast<int>(lowered_lang.length()));
         url += "&lang=" + std::string(esc_lang ? esc_lang : "");
         if (esc_lang) {
             curl_free(esc_lang);
         }
+    }
+
+    auto card = fetch_single_card_from_url(url, cache_key);
+    if (card) {
+        card->is_exact_match = true;
+    }
+    return card;
+}
+
+std::optional<ScryfallCard> fetch_card_by_id(const std::string& scryfall_id, const std::string& language) {
+    const std::string trimmed_id = sanitize_query(scryfall_id);
+    if (trimmed_id.empty()) {
+        return std::nullopt;
+    }
+
+    const std::string lowered_lang = lowercase_ascii(language);
+    std::string cache_key = make_single_card_cache_key("id", trimmed_id, lowered_lang);
+
+    char* esc_id = curl_easy_escape(nullptr, trimmed_id.c_str(), static_cast<int>(trimmed_id.length()));
+    std::string url = "https://api.scryfall.com/cards/" + std::string(esc_id ? esc_id : "");
+    if (esc_id) {
+        curl_free(esc_id);
+    }
+
+    if (!lowered_lang.empty()) {
+        char* esc_lang = curl_easy_escape(nullptr, lowered_lang.c_str(), static_cast<int>(lowered_lang.length()));
+        url += "?lang=" + std::string(esc_lang ? esc_lang : "");
+        if (esc_lang) {
+            curl_free(esc_lang);
+        }
+    }
+
+    auto card = fetch_single_card_from_url(url, cache_key);
+    if (card) {
+        card->is_exact_match = true;
+    }
+    return card;
+}
+
+std::optional<ScryfallCard> fetch_card_by_set_number(const std::string& set_code, const std::string& collector_number, const std::string& language) {
+    const std::string trimmed_set = sanitize_query(set_code);
+    const std::string trimmed_collector = sanitize_query(collector_number);
+    if (trimmed_set.empty() || trimmed_collector.empty()) {
+        return std::nullopt;
+    }
+
+    const std::string lowered_set = lowercase_ascii(trimmed_set);
+    const std::string lowered_lang = lowercase_ascii(language);
+    const std::string lowered_collector = lowercase_ascii(trimmed_collector);
+    std::string cache_identifier = lowered_set + "/" + lowered_collector;
+    std::string cache_key = make_single_card_cache_key("set", cache_identifier, lowered_lang);
+
+    char* esc_set = curl_easy_escape(nullptr, lowered_set.c_str(), static_cast<int>(lowered_set.length()));
+    char* esc_collector = curl_easy_escape(nullptr, trimmed_collector.c_str(), static_cast<int>(trimmed_collector.length()));
+    std::string url = "https://api.scryfall.com/cards/" + std::string(esc_set ? esc_set : "");
+    if (esc_set) {
+        curl_free(esc_set);
+    }
+    url += "/" + std::string(esc_collector ? esc_collector : "");
+    if (esc_collector) {
+        curl_free(esc_collector);
+    }
+
+    if (!lowered_lang.empty()) {
+        char* esc_lang = curl_easy_escape(nullptr, lowered_lang.c_str(), static_cast<int>(lowered_lang.length()));
+        url += "?lang=" + std::string(esc_lang ? esc_lang : "");
+        if (esc_lang) {
+            curl_free(esc_lang);
+        }
+    }
+
+    auto card = fetch_single_card_from_url(url, cache_key);
+    if (card) {
+        card->is_exact_match = true;
+    }
+    return card;
+}
+
+std::optional<ScryfallCard> fetch_print(const std::string& oracle_id, const std::string& language, const std::string& preferred_set, const std::string& preferred_collector) {
+    const std::string trimmed_oracle = sanitize_query(oracle_id);
+    if (trimmed_oracle.empty()) {
+        return std::nullopt;
+    }
+
+    const std::string lowered_lang = lowercase_ascii(language);
+    const std::string lowered_set = lowercase_ascii(sanitize_query(preferred_set));
+    const std::string lowered_collector = lowercase_ascii(sanitize_query(preferred_collector));
+
+    std::string cache_identifier = trimmed_oracle;
+    if (!lowered_set.empty()) {
+        cache_identifier.append("|");
+        cache_identifier.append(lowered_set);
+    }
+    if (!lowered_collector.empty()) {
+        cache_identifier.append("|");
+        cache_identifier.append(lowered_collector);
+    }
+    std::string cache_key = make_single_card_cache_key("print", cache_identifier, lowered_lang);
+
+    ScryfallCard cached;
+    if (try_single_card_cache_lookup(cache_key, cached)) {
+        return cached;
+    }
+
+    std::string query = "oracleid:" + trimmed_oracle;
+    if (!lowered_lang.empty()) {
+        query.append(" lang:");
+        query.append(lowered_lang);
+    }
+    if (!lowered_set.empty()) {
+        query.append(" set:");
+        query.append(lowered_set);
+    }
+    if (!lowered_collector.empty()) {
+        query.append(" number:");
+        query.append(lowered_collector);
+    }
+
+    char* escaped_query = curl_easy_escape(nullptr, query.c_str(), static_cast<int>(query.length()));
+    std::string url = "https://api.scryfall.com/cards/search?order=set&q=" + std::string(escaped_query ? escaped_query : "");
+    if (escaped_query) {
+        curl_free(escaped_query);
     }
 
     std::string buffer;
@@ -469,58 +730,59 @@ std::optional<ScryfallCard> fetch_card_named_exact(const std::string& name, cons
         return std::nullopt;
     }
 
-    const std::string object_type = payload.value("object", "");
-    if (object_type == "error" || object_type != "card") {
+    if (payload.contains("object") && payload["object"] == "error") {
         return std::nullopt;
     }
 
-    ScryfallCard result;
-    result.english_name = payload.value("name", "");
-    result.localized_name = payload.value("printed_name", result.english_name);
-    result.name = result.localized_name.empty() ? result.english_name : result.localized_name;
-    result.type = payload.value("type_line", "");
-    result.localized_type = payload.value("printed_type_line", result.type);
-    result.oracle_text = payload.value("printed_text", payload.value("oracle_text", ""));
-
-    auto colors_json = payload.value("colors", json::array());
-    result.colors = colors_json.is_null() ? "[]" : colors_json.dump();
-
-    result.set_name = payload.value("set_name", "");
-    result.set_code = payload.value("set", "");
-    result.mana_cost = payload.value("mana_cost", "");
-    result.rarity = payload.value("rarity", "");
-
-    auto image_uris = payload.value("image_uris", json::object());
-    if (!image_uris.is_null()) {
-        result.image_url = image_uris.value("normal", "");
-    } else if (payload.contains("card_faces") && payload["card_faces"].is_array() && !payload["card_faces"].empty()) {
-        const auto& face = payload["card_faces"].front();
-        auto face_images = face.value("image_uris", json::object());
-        if (!face_images.is_null()) {
-            result.image_url = face_images.value("normal", "");
-        }
-        if (result.localized_name.empty()) {
-            result.localized_name = face.value("printed_name", "");
-        }
-        if (result.localized_type.empty()) {
-            result.localized_type = face.value("printed_type_line", result.localized_type);
-        }
-        if (result.oracle_text.empty()) {
-            result.oracle_text = face.value("printed_text", face.value("oracle_text", ""));
-        }
-    } else {
-        result.image_url.clear();
+    if (!payload.contains("data") || !payload["data"].is_array()) {
+        return std::nullopt;
     }
 
-    auto prices = payload.value("prices", json::object());
-    result.price_usd = select_best_price_usd(prices);
-    if (result.price_usd.empty()) {
-        const std::string price_name = result.english_name.empty() ? payload.value("name", "") : result.english_name;
-        result.price_usd = fetch_price_from_named(price_name);
+    const auto& data = payload["data"];
+    if (data.empty()) {
+        return std::nullopt;
     }
 
-    result.is_exact_match = true;
-    return result;
+    std::optional<ScryfallCard> best;
+    int best_score = std::numeric_limits<int>::min();
+
+    auto score_candidate = [&](const ScryfallCard& card) {
+        int score = 0;
+        if (lowered_set.empty()) {
+            score += 1;
+        } else if (lowercase_ascii(card.set_code) == lowered_set) {
+            score += 4;
+        }
+
+        if (lowered_collector.empty()) {
+            score += 1;
+        } else if (lowercase_ascii(card.collector_number) == lowered_collector) {
+            score += 8;
+        }
+        return score;
+    };
+
+    for (const auto& element : data) {
+        if (!element.is_object()) continue;
+        ScryfallCard candidate = build_card_from_payload(element);
+        candidate.is_exact_match = true;
+
+        int score = score_candidate(candidate);
+        if (score > best_score) {
+            best_score = score;
+            best = candidate;
+            if (!lowered_set.empty() && !lowered_collector.empty() && lowercase_ascii(candidate.set_code) == lowered_set && lowercase_ascii(candidate.collector_number) == lowered_collector) {
+                break;
+            }
+        }
+    }
+
+    if (!best) {
+        return std::nullopt;
+    }
+
+    store_single_card_cache_entry(cache_key, *best);
+    return best;
 }
 
 std::vector<unsigned char> download_image_data(const std::string& url) {
