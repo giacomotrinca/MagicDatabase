@@ -13,6 +13,7 @@
 #include <chrono>
 #include <sstream>
 #include <iomanip>
+#include <mutex>
 
 namespace {
 
@@ -403,6 +404,30 @@ Database::Database(const std::string& db_path) : db(nullptr) {
                         if (serr) sqlite3_free(serr);
                     }
                 }
+                // Ensure snapshot rows carry the full card identity so restore_snapshot
+                // can rebuild cards without losing metadata (price, image, Scryfall ids).
+                {
+                    const char* snap_cols[] = {"localized_type", "image_url", "price_usd", "scryfall_id", "oracle_id", "collector_number"};
+                    for (const char* col : snap_cols) {
+                        sqlite3_stmt* spi = nullptr;
+                        bool has_col = false;
+                        if (sqlite3_prepare_v2(db, "PRAGMA table_info(deck_snapshot_rows)", -1, &spi, nullptr) == SQLITE_OK) {
+                            while (sqlite3_step(spi) == SQLITE_ROW) {
+                                const unsigned char* colname = sqlite3_column_text(spi, 1);
+                                if (colname && strcmp((const char*)colname, col) == 0) { has_col = true; break; }
+                            }
+                            sqlite3_finalize(spi);
+                        }
+                        if (!has_col) {
+                            std::string alter_sql = std::string("ALTER TABLE deck_snapshot_rows ADD COLUMN ") + col + " TEXT";
+                            char* serr = nullptr;
+                            if (sqlite3_exec(db, alter_sql.c_str(), nullptr, nullptr, &serr) != SQLITE_OK) {
+                                std::cerr << "Errore alter table aggiunta " << col << " su deck_snapshot_rows: " << (serr ? serr : (char*)"unknown") << std::endl;
+                                if (serr) sqlite3_free(serr);
+                            }
+                        }
+                    }
+                }
                 // Tags and notes
                 const char* create_card_tags = "CREATE TABLE IF NOT EXISTS card_tags (id INTEGER PRIMARY KEY, card_id INTEGER, tag TEXT)";
                 errx = nullptr;
@@ -528,13 +553,24 @@ Database::Database(const std::string& db_path) : db(nullptr) {
                         buf << ifs.rdbuf();
                         std::string sql = buf.str();
                         if (sql.empty()) continue;
+                        // Run each migration file inside its own transaction so a
+                        // mid-file failure leaves no partially-applied schema.
+                        char* berr = nullptr;
+                        if (sqlite3_exec(db, "BEGIN", nullptr, nullptr, &berr) != SQLITE_OK) {
+                            std::cerr << "Error starting transaction for migration " << fname << ": " << (berr ? berr : (char*)"unknown") << std::endl;
+                            if (berr) sqlite3_free(berr);
+                            break;
+                        }
                         char* merr = nullptr;
-                        if (sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &merr) != SQLITE_OK) {
+                        bool mig_ok = (sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &merr) == SQLITE_OK);
+                        if (!mig_ok) {
                             std::cerr << "Error applying migration " << fname << ": " << (merr ? merr : (char*)"unknown") << std::endl;
                             if (merr) sqlite3_free(merr);
+                            sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
                             // stop on first failing migration to avoid partial state
                             break;
                         }
+                        sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr);
                         // Record applied migration with timestamp
                         char timebuf[32] = {0};
                         time_t now = time(nullptr);
@@ -550,7 +586,10 @@ Database::Database(const std::string& db_path) : db(nullptr) {
                         if (sqlite3_prepare_v2(db, ins, -1, &pins, nullptr) == SQLITE_OK) {
                             sqlite3_bind_text(pins, 1, fname.c_str(), -1, SQLITE_TRANSIENT);
                             sqlite3_bind_text(pins, 2, timebuf, -1, SQLITE_TRANSIENT);
-                            sqlite3_step(pins);
+                            int irc = sqlite3_step(pins);
+                            if (irc != SQLITE_DONE) {
+                                std::cerr << "Warning: could not record migration " << fname << " as applied: " << sqlite3_errmsg(db) << std::endl;
+                            }
                             sqlite3_finalize(pins);
                         }
                     }
@@ -585,6 +624,7 @@ bool Database::is_open() const {
 }
 
 bool Database::execute(const std::string& sql) {
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     char* errMsg = nullptr;
     int rc = sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &errMsg);
     if (rc != SQLITE_OK) {
@@ -596,6 +636,7 @@ bool Database::execute(const std::string& sql) {
 }
 
 bool Database::insert_card(const std::string& english_name, const std::string& localized_name, const std::string& type, const std::string& localized_type, const std::string& colors, const std::string& set_code, const std::string& mana_cost, const std::string& rarity, int quantity, const std::string& image_url, const std::string& price_usd, const std::string& oracle_text, int deck_id, int foil, int sideboard, const std::string& scryfall_id, const std::string& oracle_id, const std::string& collector_number) {
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     // Normalize deck_id: callers may pass 0 for "no deck"; internally we treat <=0 as -1 (NULL)
     if (deck_id <= 0) deck_id = -1;
     if (sideboard <= 0) sideboard = 0; // normalize any non-positive to 0
@@ -792,6 +833,7 @@ bool Database::delete_card(int id) {
 
 
 bool Database::update_quantity(int id, int new_quantity) {
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     const char* sql = "UPDATE cards SET quantity = ? WHERE id = ?";
     sqlite3_stmt* stmt;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
@@ -810,6 +852,7 @@ bool Database::update_quantity(int id, int new_quantity) {
 }
 
 bool Database::get_card_quantity(int id, int& quantity) {
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     const char* sql = "SELECT quantity FROM cards WHERE id = ?";
     sqlite3_stmt* stmt;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
@@ -829,6 +872,7 @@ bool Database::get_card_quantity(int id, int& quantity) {
 }
 
 bool Database::update_card_info(int id, const std::string& english_name, const std::string& localized_name, const std::string& type, const std::string& localized_type, const std::string& colors, const std::string& mana_cost, const std::string& rarity, const std::string& image_url, const std::string& price_usd, const std::string& oracle_text, const std::string& scryfall_id, const std::string& oracle_id, const std::string& collector_number) {
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     std::string set_code;
     bool set_code_is_null = true;
     {
@@ -937,6 +981,7 @@ bool Database::update_card_info(int id, const std::string& english_name, const s
 }
 
 bool Database::create_deck(const std::string& name) {
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     const char* sql = "INSERT INTO decks (name) VALUES (?)";
     sqlite3_stmt* stmt;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
@@ -986,6 +1031,7 @@ bool Database::set_card_deck(int card_id, int deck_id, int sideboard) {
 }
 
 bool Database::query(const std::string& sql, const std::function<void(const std::map<std::string, std::string>&)>& callback, const std::vector<std::string>& params) {
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     sqlite3_stmt* stmt;
     if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
         std::cerr << "Errore prepare query: " << sqlite3_errmsg(db) << std::endl;
@@ -1011,6 +1057,7 @@ bool Database::query(const std::string& sql, const std::function<void(const std:
 
 // Snapshot & tagging implementations
 bool Database::create_snapshot(int deck_id, const std::string& name, int& out_snapshot_id) {
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     if (!db) return false;
     char timebuf[32] = {0};
     time_t now = time(nullptr);
@@ -1036,14 +1083,14 @@ bool Database::create_snapshot(int deck_id, const std::string& name, int& out_sn
     if (rc != SQLITE_DONE) { sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr); return false; }
     int snap_id = (int)sqlite3_last_insert_rowid(db);
     // Copy current deck rows into deck_snapshot_rows
-    const char* sel = "SELECT id, english_name, localized_name, type, colors, set_code, mana_cost, rarity, quantity, foil, sideboard, oracle_text FROM cards WHERE deck_id = ?";
+    const char* sel = "SELECT id, english_name, localized_name, type, localized_type, colors, set_code, mana_cost, rarity, quantity, foil, sideboard, oracle_text, image_url, price_usd, scryfall_id, oracle_id, collector_number FROM cards WHERE deck_id = ?";
     sqlite3_stmt* psel = nullptr;
     if (sqlite3_prepare_v2(db, sel, -1, &psel, nullptr) != SQLITE_OK) {
         sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
         return false;
     }
     sqlite3_bind_int(psel, 1, deck_id);
-    const char* ins_row = "INSERT INTO deck_snapshot_rows (snapshot_id, original_card_id, english_name, localized_name, type, colors, set_code, mana_cost, rarity, quantity, foil, sideboard, oracle_text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+    const char* ins_row = "INSERT INTO deck_snapshot_rows (snapshot_id, original_card_id, english_name, localized_name, type, localized_type, colors, set_code, mana_cost, rarity, quantity, foil, sideboard, oracle_text, image_url, price_usd, scryfall_id, oracle_id, collector_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
     sqlite3_stmt* pins = nullptr;
     if (sqlite3_prepare_v2(db, ins_row, -1, &pins, nullptr) != SQLITE_OK) {
         sqlite3_finalize(psel);
@@ -1055,19 +1102,26 @@ bool Database::create_snapshot(int deck_id, const std::string& name, int& out_sn
         const unsigned char* en = sqlite3_column_text(psel, 1);
         const unsigned char* ln = sqlite3_column_text(psel, 2);
         const unsigned char* ty = sqlite3_column_text(psel, 3);
-        const unsigned char* cols = sqlite3_column_text(psel, 4);
-        const unsigned char* setc = sqlite3_column_text(psel, 5);
-        const unsigned char* mana = sqlite3_column_text(psel, 6);
-        const unsigned char* rar = sqlite3_column_text(psel, 7);
-        int qty = sqlite3_column_int(psel, 8);
-        int foil = sqlite3_column_int(psel, 9);
-    int side = sqlite3_column_int(psel, 10);
-    const unsigned char* oracle = sqlite3_column_text(psel, 11);
+        const unsigned char* lty = sqlite3_column_text(psel, 4);
+        const unsigned char* cols = sqlite3_column_text(psel, 5);
+        const unsigned char* setc = sqlite3_column_text(psel, 6);
+        const unsigned char* mana = sqlite3_column_text(psel, 7);
+        const unsigned char* rar = sqlite3_column_text(psel, 8);
+        int qty = sqlite3_column_int(psel, 9);
+        int foil = sqlite3_column_int(psel, 10);
+    int side = sqlite3_column_int(psel, 11);
+    const unsigned char* oracle = sqlite3_column_text(psel, 12);
+    const unsigned char* imgurl = sqlite3_column_text(psel, 13);
+    const unsigned char* price = sqlite3_column_text(psel, 14);
+    const unsigned char* sfid = sqlite3_column_text(psel, 15);
+    const unsigned char* orid = sqlite3_column_text(psel, 16);
+    const unsigned char* colnum = sqlite3_column_text(psel, 17);
     sqlite3_bind_int(pins, 1, snap_id);
     sqlite3_bind_int(pins, 2, cid);
     const char* en_s = en ? reinterpret_cast<const char*>(en) : "";
     const char* ln_s = ln ? reinterpret_cast<const char*>(ln) : "";
     const char* ty_s = ty ? reinterpret_cast<const char*>(ty) : "";
+    const char* lty_s = lty ? reinterpret_cast<const char*>(lty) : "";
     const char* cols_s = cols ? reinterpret_cast<const char*>(cols) : "";
     const char* setc_s = setc ? reinterpret_cast<const char*>(setc) : "";
     const char* mana_s = mana ? reinterpret_cast<const char*>(mana) : "";
@@ -1075,15 +1129,21 @@ bool Database::create_snapshot(int deck_id, const std::string& name, int& out_sn
     sqlite3_bind_text(pins, 3, en_s, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(pins, 4, ln_s, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(pins, 5, ty_s, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(pins, 6, cols_s, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(pins, 7, setc_s, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(pins, 8, mana_s, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(pins, 9, rar_s, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(pins, 10, qty);
-        sqlite3_bind_int(pins, 11, foil);
-    sqlite3_bind_int(pins, 12, side);
+    sqlite3_bind_text(pins, 6, lty_s, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(pins, 7, cols_s, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(pins, 8, setc_s, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(pins, 9, mana_s, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(pins, 10, rar_s, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(pins, 11, qty);
+        sqlite3_bind_int(pins, 12, foil);
+    sqlite3_bind_int(pins, 13, side);
     const char* oracle_s = oracle ? reinterpret_cast<const char*>(oracle) : "";
-    sqlite3_bind_text(pins, 13, oracle_s, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(pins, 14, oracle_s, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(pins, 15, imgurl ? reinterpret_cast<const char*>(imgurl) : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(pins, 16, price ? reinterpret_cast<const char*>(price) : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(pins, 17, sfid ? reinterpret_cast<const char*>(sfid) : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(pins, 18, orid ? reinterpret_cast<const char*>(orid) : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(pins, 19, colnum ? reinterpret_cast<const char*>(colnum) : "", -1, SQLITE_TRANSIENT);
         rc = sqlite3_step(pins);
         sqlite3_reset(pins);
         if (rc != SQLITE_DONE) {
@@ -1101,6 +1161,7 @@ bool Database::create_snapshot(int deck_id, const std::string& name, int& out_sn
 }
 
 bool Database::list_snapshots(int deck_id, const std::function<void(const std::map<std::string,std::string>&)>& callback) {
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     const char* sql = "SELECT id, name, created_at FROM deck_snapshots WHERE deck_id = ? ORDER BY created_at DESC";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) return false;
@@ -1119,7 +1180,8 @@ bool Database::list_snapshots(int deck_id, const std::function<void(const std::m
 }
 
 bool Database::get_snapshot_rows(int snapshot_id, const std::function<void(const std::map<std::string,std::string>&)>& callback) {
-    const char* sql = "SELECT id, original_card_id, english_name, localized_name, type, colors, set_code, mana_cost, rarity, quantity, foil, sideboard, oracle_text FROM deck_snapshot_rows WHERE snapshot_id = ?";
+    std::lock_guard<std::recursive_mutex> lock(mtx);
+    const char* sql = "SELECT id, original_card_id, english_name, localized_name, type, colors, set_code, mana_cost, rarity, quantity, foil, sideboard, oracle_text, localized_type, image_url, price_usd, scryfall_id, oracle_id, collector_number FROM deck_snapshot_rows WHERE snapshot_id = ?";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) return false;
     sqlite3_bind_int(stmt, 1, snapshot_id);
@@ -1137,6 +1199,11 @@ bool Database::get_snapshot_rows(int snapshot_id, const std::function<void(const
     row["sideboard"] = std::to_string(sqlite3_column_int(stmt, 11));
     const unsigned char* oracle = sqlite3_column_text(stmt, 12);
     row["oracle_text"] = oracle ? (const char*)oracle : "";
+    const char* extra_cols[] = {"localized_type","image_url","price_usd","scryfall_id","oracle_id","collector_number"};
+    for (int i=0;i<6;++i) {
+        const unsigned char* txt = sqlite3_column_text(stmt, i+13);
+        row[extra_cols[i]] = txt ? (const char*)txt : "";
+    }
         callback(row);
     }
     sqlite3_finalize(stmt);
@@ -1144,6 +1211,7 @@ bool Database::get_snapshot_rows(int snapshot_id, const std::function<void(const
 }
 
 bool Database::restore_snapshot(int snapshot_id) {
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     if (!db) return false;
     // Find deck_id for this snapshot
     int deck_id = -1;
@@ -1164,11 +1232,11 @@ bool Database::restore_snapshot(int snapshot_id) {
     if (sqlite3_step(sdel) != SQLITE_DONE) { sqlite3_finalize(sdel); sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr); return false; }
     sqlite3_finalize(sdel);
     // Insert snapshot rows as new cards for this deck
-    const char* ins = "INSERT INTO cards (english_name, localized_name, name, canonical_name, type, localized_type, colors, set_code, mana_cost, rarity, quantity, image_url, added_date, price_usd, foil, sideboard, oracle_text, deck_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+    const char* ins = "INSERT INTO cards (english_name, localized_name, name, canonical_name, type, localized_type, colors, set_code, mana_cost, rarity, quantity, image_url, added_date, price_usd, foil, sideboard, oracle_text, deck_id, scryfall_id, oracle_id, collector_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
     sqlite3_stmt* pins = nullptr;
     if (sqlite3_prepare_v2(db, ins, -1, &pins, nullptr) != SQLITE_OK) { sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr); return false; }
     // iterate snapshot rows
-    const char* sel = "SELECT english_name, localized_name, type, colors, set_code, mana_cost, rarity, quantity, foil, sideboard, oracle_text FROM deck_snapshot_rows WHERE snapshot_id = ?";
+    const char* sel = "SELECT english_name, localized_name, type, localized_type, colors, set_code, mana_cost, rarity, quantity, foil, sideboard, oracle_text, image_url, price_usd, scryfall_id, oracle_id, collector_number FROM deck_snapshot_rows WHERE snapshot_id = ?";
     sqlite3_stmt* ssel = nullptr;
     if (sqlite3_prepare_v2(db, sel, -1, &ssel, nullptr) != SQLITE_OK) { sqlite3_finalize(pins); sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr); return false; }
     sqlite3_bind_int(ssel, 1, snapshot_id);
@@ -1176,17 +1244,24 @@ bool Database::restore_snapshot(int snapshot_id) {
         const unsigned char* en = sqlite3_column_text(ssel, 0);
         const unsigned char* ln = sqlite3_column_text(ssel, 1);
         const unsigned char* ty = sqlite3_column_text(ssel, 2);
-        const unsigned char* cols = sqlite3_column_text(ssel, 3);
-        const unsigned char* setc = sqlite3_column_text(ssel, 4);
-        const unsigned char* mana = sqlite3_column_text(ssel, 5);
-        const unsigned char* rar = sqlite3_column_text(ssel, 6);
-        int qty = sqlite3_column_int(ssel, 7);
-        int foil = sqlite3_column_int(ssel, 8);
-    int side = sqlite3_column_int(ssel, 9);
-    const unsigned char* oracle = sqlite3_column_text(ssel, 10);
+        const unsigned char* lty = sqlite3_column_text(ssel, 3);
+        const unsigned char* cols = sqlite3_column_text(ssel, 4);
+        const unsigned char* setc = sqlite3_column_text(ssel, 5);
+        const unsigned char* mana = sqlite3_column_text(ssel, 6);
+        const unsigned char* rar = sqlite3_column_text(ssel, 7);
+        int qty = sqlite3_column_int(ssel, 8);
+        int foil = sqlite3_column_int(ssel, 9);
+    int side = sqlite3_column_int(ssel, 10);
+    const unsigned char* oracle = sqlite3_column_text(ssel, 11);
+    const unsigned char* imgurl = sqlite3_column_text(ssel, 12);
+    const unsigned char* price = sqlite3_column_text(ssel, 13);
+    const unsigned char* sfid = sqlite3_column_text(ssel, 14);
+    const unsigned char* orid = sqlite3_column_text(ssel, 15);
+    const unsigned char* colnum = sqlite3_column_text(ssel, 16);
     const char* en_s = en ? reinterpret_cast<const char*>(en) : "";
     const char* ln_s = ln ? reinterpret_cast<const char*>(ln) : "";
     const char* ty_s = ty ? reinterpret_cast<const char*>(ty) : "";
+    const char* lty_s = lty ? reinterpret_cast<const char*>(lty) : "";
     const char* cols_s = cols ? reinterpret_cast<const char*>(cols) : "";
     const char* setc_s = setc ? reinterpret_cast<const char*>(setc) : "";
     const char* mana_s = mana ? reinterpret_cast<const char*>(mana) : "";
@@ -1207,21 +1282,36 @@ bool Database::restore_snapshot(int snapshot_id) {
     for (auto &c : canonical2) c = (char)tolower((unsigned char)c);
     sqlite3_bind_text(pins, 4, canonical2.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(pins, 5, ty_s, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(pins, 6, ty_s, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(pins, 6, lty_s, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(pins, 7, cols_s, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(pins, 8, setc_s, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(pins, 9, mana_s, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(pins, 10, rar_s, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(pins, 11, qty);
-        sqlite3_bind_text(pins, 12, "", -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(pins, 12, imgurl ? reinterpret_cast<const char*>(imgurl) : "", -1, SQLITE_TRANSIENT);
         char timebuf2[32] = {0}; time_t now = time(nullptr); struct tm ltm{}; localtime_r(&now, &ltm); strftime(timebuf2, sizeof(timebuf2), "%Y-%m-%dT%H:%M:%S", &ltm);
         sqlite3_bind_text(pins, 13, timebuf2, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(pins, 14, "", -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(pins, 14, price ? reinterpret_cast<const char*>(price) : "", -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(pins, 15, foil);
     sqlite3_bind_int(pins, 16, side);
     const char* oracle_s = oracle ? reinterpret_cast<const char*>(oracle) : "";
     sqlite3_bind_text(pins, 17, oracle_s, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(pins, 18, deck_id);
+    if (sfid && strlen(reinterpret_cast<const char*>(sfid))) {
+        sqlite3_bind_text(pins, 19, reinterpret_cast<const char*>(sfid), -1, SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_null(pins, 19);
+    }
+    if (orid && strlen(reinterpret_cast<const char*>(orid))) {
+        sqlite3_bind_text(pins, 20, reinterpret_cast<const char*>(orid), -1, SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_null(pins, 20);
+    }
+    if (colnum && strlen(reinterpret_cast<const char*>(colnum))) {
+        sqlite3_bind_text(pins, 21, reinterpret_cast<const char*>(colnum), -1, SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_null(pins, 21);
+    }
         int rc = sqlite3_step(pins);
         sqlite3_reset(pins);
         if (rc != SQLITE_DONE) { sqlite3_finalize(pins); sqlite3_finalize(ssel); sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr); return false; }
@@ -1233,6 +1323,7 @@ bool Database::restore_snapshot(int snapshot_id) {
 }
 
 bool Database::delete_snapshot(int snapshot_id) {
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     if (!db) return false;
     sqlite3_exec(db, "BEGIN", nullptr, nullptr, nullptr);
     const char* del_rows = "DELETE FROM deck_snapshot_rows WHERE snapshot_id = ?";
@@ -1251,6 +1342,7 @@ bool Database::delete_snapshot(int snapshot_id) {
 }
 
 bool Database::add_tag_to_card(int card_id, const std::string& tag) {
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     if (!db) return false;
     const char* sql = "INSERT INTO card_tags (card_id, tag) VALUES (?, ?)";
     sqlite3_stmt* s = nullptr;
@@ -1263,6 +1355,7 @@ bool Database::add_tag_to_card(int card_id, const std::string& tag) {
 }
 
 bool Database::remove_tag_from_card(int card_id, const std::string& tag) {
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     if (!db) return false;
     const char* sql = "DELETE FROM card_tags WHERE card_id = ? AND tag = ?";
     sqlite3_stmt* s = nullptr;
@@ -1275,6 +1368,7 @@ bool Database::remove_tag_from_card(int card_id, const std::string& tag) {
 }
 
 bool Database::get_tags_for_card(int card_id, const std::function<void(const std::string&)>& callback) {
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     if (!db) return false;
     const char* sql = "SELECT tag FROM card_tags WHERE card_id = ?";
     sqlite3_stmt* s = nullptr;
@@ -1289,6 +1383,7 @@ bool Database::get_tags_for_card(int card_id, const std::function<void(const std
 }
 
 bool Database::add_note_to_card(int card_id, const std::string& note) {
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     if (!db) return false;
     // Replace existing note
     const char* del = "DELETE FROM card_notes WHERE card_id = ?";
@@ -1308,6 +1403,7 @@ bool Database::add_note_to_card(int card_id, const std::string& note) {
 }
 
 bool Database::get_note_for_card(int card_id, std::string& out_note) {
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     if (!db) return false;
     const char* sql = "SELECT note FROM card_notes WHERE card_id = ? LIMIT 1";
     sqlite3_stmt* s = nullptr;
@@ -1324,6 +1420,7 @@ bool Database::get_note_for_card(int card_id, std::string& out_note) {
 }
 
 bool Database::add_tag_to_deck(int deck_id, const std::string& tag) {
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     if (!db) return false;
     const char* sql = "INSERT INTO deck_tags (deck_id, tag) VALUES (?, ?)";
     sqlite3_stmt* s = nullptr;
@@ -1336,6 +1433,7 @@ bool Database::add_tag_to_deck(int deck_id, const std::string& tag) {
 }
 
 bool Database::get_tags_for_deck(int deck_id, const std::function<void(const std::string&)>& callback) {
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     if (!db) return false;
     const char* sql = "SELECT tag FROM deck_tags WHERE deck_id = ?";
     sqlite3_stmt* s = nullptr;
@@ -1350,6 +1448,7 @@ bool Database::get_tags_for_deck(int deck_id, const std::function<void(const std
 }
 
 bool Database::search_fulltext(const std::string& query, const std::function<void(const std::map<std::string,std::string>&)>& callback) {
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     if (!db) return false;
     // Check if cards_fts exists
     bool has_fts = false;

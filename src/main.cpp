@@ -2467,6 +2467,18 @@ static void on_filters_action(GSimpleAction *action, GVariant *parameter, gpoint
 // Forward declaration for menu rebuild helper
 static void rebuild_menus_for_language(AppState* state);
 
+// Helper: build the local cache path for an image URL, stripping any query string
+// ("?1234567") so filenames stay valid on Windows/NTFS and the same card always
+// maps to the same cache entry even when Scryfall rotates its timestamps.
+static std::string image_cache_path(const std::string &url) {
+    std::filesystem::path url_path(url);
+    std::string filename = url_path.filename().string();
+    std::size_t qpos = filename.find('?');
+    if (qpos != std::string::npos) filename.resize(qpos);
+    if (filename.empty()) return std::string();
+    return std::string("data/img/") + filename;
+}
+
 // Helper: sanitize a filename (basic), replace spaces with underscore and remove problematic chars
 static std::string sanitize_filename(const std::string &s) {
     std::string out;
@@ -7297,10 +7309,8 @@ static void prefetch_thumbnails_async(const std::vector<std::map<std::string,std
             try {
                 if (!r.count("image_url") || r.at("image_url").empty()) continue;
                 std::string url = r.at("image_url");
-                std::filesystem::path url_path(url);
-                std::string filename = url_path.filename().string();
-                if (filename.empty()) continue;
-                std::string filepath = std::string("data/img/") + filename;
+                std::string filepath = image_cache_path(url);
+                if (filepath.empty()) continue;
                 if (std::filesystem::exists(filepath)) continue;
                 auto data = download_image_data(url);
                 if (!data.empty()) {
@@ -8004,9 +8014,7 @@ static void on_row_enter(GtkEventControllerMotion*, double x, double y, gpointer
     GtkWidget *label = gtk_list_item_get_child(list_item);
     GtkWidget *picture = gtk_picture_new();
     // Controlla se l'immagine è già in cache
-    std::filesystem::path url_path(row->image_url);
-    std::string filename = url_path.filename().string();
-    std::string filepath = "data/img/" + filename;
+    std::string filepath = image_cache_path(row->image_url);
     std::vector<unsigned char> image_data;
     if (std::filesystem::exists(filepath)) {
         image_data = load_image_from_file(filepath);
@@ -9690,9 +9698,7 @@ static void name_factory_bind_cb(GtkListItemFactory *factory, GtkListItem *item,
     if (picture && row->image_url && strlen(row->image_url)>0) {
         std::string url = row->image_url;
         // If cached file exists, load synchronously; otherwise spawn async loader
-        std::filesystem::path up(url);
-        std::string filename = up.filename().string();
-        std::string filepath = std::string("data/img/") + filename;
+        std::string filepath = image_cache_path(url);
         if (std::filesystem::exists(filepath)) {
             std::vector<unsigned char> data = load_image_from_file(filepath);
             if (!data.empty()) {
@@ -9713,11 +9719,11 @@ static void name_factory_bind_cb(GtkListItemFactory *factory, GtkListItem *item,
                 if (data.empty()) return;
                 // save into cache
                 try {
-                    std::filesystem::path upath(u);
-                    std::string fname = upath.filename().string();
-                    std::string fpath = std::string("data/img/") + fname;
-                    std::ofstream out(fpath, std::ios::binary);
-                    if (out) { out.write((char*)data.data(), data.size()); out.close(); }
+                    std::string fpath = image_cache_path(u);
+                    if (!fpath.empty()) {
+                        std::ofstream out(fpath, std::ios::binary);
+                        if (out) { out.write((char*)data.data(), data.size()); out.close(); }
+                    }
                 } catch(...) {}
                 // create texture on main thread
                 PicCtx* pctx = new PicCtx();

@@ -5,6 +5,7 @@
 #include <string>
 #include <functional>
 #include <map>
+#include <mutex>
 
 class Database {
 public:
@@ -44,6 +45,9 @@ public:
     bool search_fulltext(const std::string& query, const std::function<void(const std::map<std::string,std::string>&)>& callback);
 private:
     sqlite3* db;
+    // Serializes all access: worker threads (refresh, prefetcher) share this object
+    // with the GTK main thread. Recursive because query_decks() calls query().
+    mutable std::recursive_mutex mtx;
 };
 
 #endif // DATABASE_H
