@@ -24,31 +24,27 @@
 
 ## Alti
 
-### B5 · Chiamate di rete bloccanti sul thread UI
-- **Dove**: add-card OK handler fa chiamata Scryfall bloccante (main.cpp ~7325–7696); probabilmente altri handler
-- **Effetto**: UI freezata durante la ricerca
-- **Fix**: spostare su worker thread + marshalling come già fatto per picture loader
+### B5 · Chiamate di rete bloccanti sul thread UI — RISOLTO
+- **Fix applicato**:
+  - add-card (`on_add_card_ok_clicked`): ricerca Scryfall spostata su thread con risultato marshalled via `g_main_context_invoke`; input disabilitati durante la ricerca, guard anti-doppio-submit (`ctx->busy`)
+  - hover preview (`on_row_enter`): download in background, popup mostrato subito, texture applicata al termine
 
-### B6 · Thread detached sopravvivono ai widget/Database
-- **Dove**: picture thread cattura raw `GtkWidget* pic` (main.cpp:9711) senza ref; worker che usano `db` possono girare dopo la distruzione
-- **Fix**: GRefPtr / g_object_ref sui widget toccati dai callback, join o flag di shutdown per i worker
+### B6 · Thread detached sopravvivono ai widget/Database — PARZIALMENTE RISOLTO
+- **Fix applicato**: `GWeakRef` invece di raw pointer per picture loader detail pane (`PicCtx`) e hover preview (`HoverImageCtx`); owner del dialog add-card tracciato con weak ref (`AddCardContext::lifetime_owner`)
+- **Rimane**: worker bulk refresh e refetch singola usano ancora puntatori raw a AppState/db
 
 ### B7 · Cache Scryfall senza limiti
 - **Dove**: scryfall.cpp:66–76, eviction solo lazy (206–208, 222–224, 276–278)
 - **Effetto**: crescita illimitata in sessioni lunghe; README dice "LRU" ma non lo è
 - **Fix**: LRU con cap (es. 256 entry) o sweep periodico
 
-### B8 · Risposte vuote cachate 10 min
-- **Dove**: scryfall.cpp:507
-- **Effetto**: un failure transitorio (rete/quota) "avvelena" la ricerca per TTL
-- **Fix**: non cachare esito=0 carte, o TTL corto per risposte vuote
+### B8 · Risposte vuote cachate 10 min — RISOLTO
+- **Fix applicato**: `perform_search` cachera solo result set non vuoti; prezzi vuoti non più cachati su failure; single-card già sicuro
 
 ## Medi
 
-### B9 · FTS5 MATCH con input utente grezzo
-- **Dove**: database.cpp:1367 (`search_fulltext`), LIKE path senza escape `%`/`_` (1386)
-- **Effetto**: caratteri sintassi FTS (`"`, `*`, `-`, `(`) causano errori prepare o semantica strana
-- **Fix**: escape/quote della query prima del MATCH
+### B9 · FTS5 MATCH con input utente grezzo — RISOLTO
+- **Fix applicato**: query quotata come frase FTS5 (doppie quote interne raddoppiate); LIKE con escape `\` di `%`, `_`, `\` + `ESCAPE '\'`
 
 ### B10 · Migrazioni colonne copia-incolla (~300 righe)
 - **Dove**: Database::Database, blocchi PRAGMA table_info + ALTER TABLE ×12 (database.cpp:91–405)

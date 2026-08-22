@@ -1459,11 +1459,18 @@ bool Database::search_fulltext(const std::string& query, const std::function<voi
         sqlite3_finalize(s);
     }
     if (has_fts) {
-        // Use MATCH
+        // Use MATCH. Quote the whole query as an FTS5 string so user-supplied
+        // characters ("*-,()...) are treated as literals, not syntax.
+        std::string safe_query = "\"";
+        for (char c : query) {
+            if (c == '"') safe_query += "\"\"";
+            else safe_query += c;
+        }
+        safe_query += "\"";
         std::string sql = "SELECT rowid AS id, name, type, set_code FROM cards_fts WHERE cards_fts MATCH ?";
         sqlite3_stmt* stmt = nullptr;
         if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) return false;
-        sqlite3_bind_text(stmt, 1, query.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 1, safe_query.c_str(), -1, SQLITE_TRANSIENT);
         while (sqlite3_step(stmt) == SQLITE_ROW) {
             std::map<std::string,std::string> row;
             row["id"] = std::to_string(sqlite3_column_int(stmt, 0));
@@ -1478,11 +1485,17 @@ bool Database::search_fulltext(const std::string& query, const std::function<voi
         sqlite3_finalize(stmt);
         return true;
     } else {
-        // Fallback to LIKE on english_name/localized_name/name
-        std::string sql = "SELECT id, COALESCE(english_name, localized_name, name) AS name, type, set_code FROM cards WHERE LOWER(COALESCE(english_name, localized_name, name)) LIKE ?";
+        // Fallback to LIKE on english_name/localized_name/name. Escape %, _ and \
+        // so wildcards in user input are matched literally.
+        std::string sql = "SELECT id, COALESCE(english_name, localized_name, name) AS name, type, set_code FROM cards WHERE LOWER(COALESCE(english_name, localized_name, name)) LIKE ? ESCAPE '\\'";
         sqlite3_stmt* stmt = nullptr;
         if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) return false;
-        std::string param = "%" + query + "%";
+        std::string param = "%";
+        for (char c : query) {
+            if (c == '%' || c == '_' || c == '\\') param += '\\';
+            param += c;
+        }
+        param += "%";
         // lowercase the param
         for (auto &c : param) c = tolower((unsigned char)c);
         sqlite3_bind_text(stmt, 1, param.c_str(), -1, SQLITE_TRANSIENT);

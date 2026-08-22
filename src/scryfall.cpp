@@ -300,23 +300,22 @@ static std::string fetch_price_from_named(const std::string& exact_name) {
 
     std::string buffer;
     if (!perform_json_request(url, buffer)) {
-        store_price_cache_entry(trimmed, "");
         return "";
     }
 
     json payload;
     if (!parse_json(buffer, payload)) {
-        store_price_cache_entry(trimmed, "");
         return "";
     }
 
     if (payload.contains("object") && payload["object"] == "error") {
-        store_price_cache_entry(trimmed, "");
         return "";
     }
 
     std::string price = select_best_price_usd(payload.value("prices", json::object()));
-    store_price_cache_entry(trimmed, price);
+    if (!price.empty()) {
+        store_price_cache_entry(trimmed, price);
+    }
     return price;
 }
 
@@ -504,7 +503,11 @@ static std::vector<ScryfallCard> perform_search(const std::string& query, bool r
         std::cout << "Scryfall error: " << payload.value("details", "") << std::endl;
     }
 
-    store_in_cache(cache_key, results);
+    // Cache only non-empty result sets: a transient failure (network/quota) or a
+    // genuinely unknown card should not poison lookups for the whole TTL.
+    if (!results.empty()) {
+        store_in_cache(cache_key, results);
+    }
     return results;
 }
 

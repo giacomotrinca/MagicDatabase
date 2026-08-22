@@ -16,12 +16,14 @@
 
 ## Fase 2 — Robustezza frontend
 
-- [ ] **F2.0** Cleanup vecchi file immagine con `?` già presenti in data/img/ sulle macchine Linux
-
-- [ ] **F2.1** Eliminare chiamate di rete bloccanti sul thread UI (add-card handler e simili) — B5
-- [ ] **F2.2** Ref-safety widget nei thread (GRefPtr/g_object_ref), shutdown ordinato dei worker detached — B6
-- [ ] **F2.3** Non cachare risposte Scryfall vuote (o TTL breve) — B8
-- [ ] **F2.4** Escape input per FTS5 MATCH e LIKE — B9
+- [x] **F2.0** Cleanup vecchi file immagine con `?` già presenti in data/img/ (nessuno trovato su disco)
+- [x] **F2.1** Eliminate chiamate di rete bloccanti sul thread UI: ricerca add-card async
+      con guard anti-doppio-submit; hover preview async — B5
+- [x] **F2.2a** Ref-safety widget nei thread: GWeakRef per picture loader e hover preview;
+      owner del dialog add-card tracciato con weak ref — B6 parziale
+- [x] **F2.3** Non cachare risposte Scryfall vuote (o TTL breve) — B8
+- [x] **F2.4** Escape input per FTS5 MATCH e LIKE — B9
+- [ ] **F2.2b** Shutdown ordinato worker bulk refresh/refetch singola (usano AppState/db raw)
 
 ## Fase 3 — Refactoring architetturale
 

@@ -6277,6 +6277,12 @@ struct AddCardContext {
     AppState* state;
     GtkWindow* parent;
     GtkWidget* foil_checkbox;
+    // Widget whose lifetime governs this context (the search dialog or the main
+    // window for the inline row). Used to keep async searches safe.
+    GtkWidget* lifetime_owner;
+    // Set while a background Scryfall search is in flight so repeated
+    // Enter presses don't spawn parallel searches.
+    gboolean busy;
 };
 
 // Find a descendant widget that implements GtkEditable (e.g., the internal
@@ -7367,15 +7373,81 @@ static bool add_card_to_deck(AppState* state, int card_id, int to_move, int targ
     return state->db->insert_card(en, ln, ty, lty, cols, setc, mana, rar, to_move, img, price, oracle, target_deck_id, foil, sideboard);
 }
 
+// Runs on the GTK main loop when a background add-card Scryfall search completes.
+struct AsyncAddCardSearch {
+    GWeakRef owner_ref;   // widget governing ctx lifetime (search dialog or main window)
+    AddCardContext* ctx;
+    std::string query;
+    int quantity;
+    std::vector<ScryfallCard> results;
+};
+
+static void handle_add_card_results(AddCardContext* ctx, const std::vector<ScryfallCard>& cards, const std::string& query, int quantity);
+
+static gboolean on_add_card_search_done(gpointer user_data) {
+    AsyncAddCardSearch* req = (AsyncAddCardSearch*)user_data;
+    if (!req) return G_SOURCE_REMOVE;
+    GtkWidget* owner = GTK_WIDGET(g_weak_ref_get(&req->owner_ref));
+    if (!owner) {
+        // Owner (dialog or main window) was destroyed while the search ran:
+        // the AddCardContext is gone too, nothing left to update.
+        g_weak_ref_clear(&req->owner_ref);
+        delete req;
+        return G_SOURCE_REMOVE;
+    }
+    g_object_unref(owner); // only needed for the liveness check
+    AddCardContext* ctx = req->ctx;
+    // Re-enable inputs
+    if (ctx->entry && GTK_IS_WIDGET(ctx->entry)) gtk_widget_set_sensitive(ctx->entry, TRUE);
+    if (ctx->spin && GTK_IS_WIDGET(ctx->spin)) gtk_widget_set_sensitive(ctx->spin, TRUE);
+    if (ctx->foil_checkbox && GTK_IS_WIDGET(ctx->foil_checkbox)) gtk_widget_set_sensitive(ctx->foil_checkbox, TRUE);
+    ctx->busy = FALSE;
+
+    handle_add_card_results(ctx, req->results, req->query, req->quantity);
+
+    g_weak_ref_clear(&req->owner_ref);
+    delete req;
+    return G_SOURCE_REMOVE;
+}
+
 static void on_add_card_ok_clicked(GtkButton *button, gpointer user_data) {
+    (void)button;
     AddCardContext* ctx = (AddCardContext*)user_data;
     GtkWidget *entry = ctx->entry;
     GtkWidget *spin = ctx->spin;
-    AppState* state = ctx->state;
+    if (ctx->busy) return; // a search is already running
     const char *card_name = gtk_editable_get_text(GTK_EDITABLE(entry));
+    std::string query = card_name ? card_name : "";
+    // trim
+    auto first = query.find_first_not_of(" \t");
+    auto last = query.find_last_not_of(" \t");
+    if (first == std::string::npos) return;
+    query = query.substr(first, last - first + 1);
     int quantity = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(spin));
-    
-    auto cards = search_cards_from_scryfall(card_name);
+
+    // Disable inputs while searching so repeated Enters don't stack searches
+    ctx->busy = TRUE;
+    if (GTK_IS_WIDGET(entry)) gtk_widget_set_sensitive(entry, FALSE);
+    if (GTK_IS_WIDGET(spin)) gtk_widget_set_sensitive(spin, FALSE);
+    if (ctx->foil_checkbox && GTK_IS_WIDGET(ctx->foil_checkbox)) gtk_widget_set_sensitive(ctx->foil_checkbox, FALSE);
+
+    AsyncAddCardSearch* req = new AsyncAddCardSearch();
+    g_weak_ref_init(&req->owner_ref, ctx->lifetime_owner);
+    req->ctx = ctx;
+    req->query = query;
+    req->quantity = quantity;
+
+    std::thread([req]() {
+        req->results = search_cards_from_scryfall(req->query);
+        g_main_context_invoke(NULL, on_add_card_search_done, req);
+    }).detach();
+}
+
+static void handle_add_card_results(AddCardContext* ctx, const std::vector<ScryfallCard>& cards, const std::string& query, int quantity) {
+    GtkWidget *entry = ctx->entry;
+    GtkWidget *spin = ctx->spin;
+    AppState* state = ctx->state;
+    const char *card_name = query.c_str();
     
     // If no matches, just show an alert and keep the dialog open so the user can refine the query
     if (cards.empty()) {
@@ -7913,7 +7985,7 @@ static void on_add_card_clicked(GtkButton *button, gpointer user_data) {
     gtk_window_set_default_widget(GTK_WINDOW(dialog), ok_button);
 
     // Recupera lo stato globale
-    AddCardContext* ctx = new AddCardContext{entry, spin, state, parent, foil_check};
+    AddCardContext* ctx = new AddCardContext{entry, spin, state, parent, foil_check, dialog, FALSE};
     g_signal_connect(ok_button, "clicked", G_CALLBACK(on_add_card_ok_clicked), ctx);
     g_signal_connect_swapped(cancel_button, "clicked", G_CALLBACK(gtk_window_destroy), dialog);
 
@@ -8007,6 +8079,35 @@ static void leave_handler(GtkEventControllerMotion*, gpointer user_data) {
     }
 }
 
+// Patch the hover-preview image into the picture widget once the background
+// download finishes. Uses a weak ref so the popup may already be gone.
+struct HoverImageCtx {
+    GWeakRef picture_ref;
+    std::vector<unsigned char>* data; // NULL if download failed
+};
+
+static gboolean on_hover_image_loaded(gpointer user_data) {
+    HoverImageCtx* h = (HoverImageCtx*)user_data;
+    if (!h) return G_SOURCE_REMOVE;
+    GtkPicture* pic = GTK_PICTURE(g_weak_ref_get(&h->picture_ref));
+    if (pic) {
+        if (h->data && !h->data->empty()) {
+            GBytes* bytes = g_bytes_new(h->data->data(), h->data->size());
+            GdkTexture* texture = gdk_texture_new_from_bytes(bytes, nullptr);
+            if (texture) {
+                gtk_picture_set_paintable(pic, GDK_PAINTABLE(texture));
+                g_object_unref(texture);
+            }
+            g_bytes_unref(bytes);
+        }
+        g_object_unref(pic); // release the strong ref from g_weak_ref_get
+    }
+    delete h->data;
+    g_weak_ref_clear(&h->picture_ref);
+    delete h;
+    return G_SOURCE_REMOVE;
+}
+
 static void on_row_enter(GtkEventControllerMotion*, double x, double y, gpointer user_data) {
     GtkListItem *list_item = GTK_LIST_ITEM(user_data);
     CardRow *row = (CardRow*)gtk_list_item_get_item(list_item);
@@ -8016,17 +8117,29 @@ static void on_row_enter(GtkEventControllerMotion*, double x, double y, gpointer
     // Controlla se l'immagine è già in cache
     std::string filepath = image_cache_path(row->image_url);
     std::vector<unsigned char> image_data;
-    if (std::filesystem::exists(filepath)) {
+    if (!filepath.empty() && std::filesystem::exists(filepath)) {
         image_data = load_image_from_file(filepath);
     } else {
-        image_data = download_image_data(row->image_url);
-        if (!image_data.empty()) {
-            // Salva in cache
-            std::ofstream file(filepath, std::ios::binary);
-            if (file) {
-                file.write((char*)image_data.data(), image_data.size());
+        // Not cached: download in the background so the UI never blocks on
+        // mouse hover. The popup shows immediately and gets patched when ready.
+        std::string url = row->image_url;
+        HoverImageCtx* h = new HoverImageCtx();
+        g_weak_ref_init(&h->picture_ref, picture);
+        h->data = nullptr;
+        std::thread([url, h]() {
+            auto data = download_image_data(url);
+            if (!data.empty()) {
+                try {
+                    ensure_data_dir_exists("data/img");
+                    std::ofstream file(image_cache_path(url), std::ios::binary);
+                    if (file) {
+                        file.write((const char*)data.data(), data.size());
+                    }
+                } catch(...) {}
+                h->data = new std::vector<unsigned char>(std::move(data));
             }
-        }
+            g_main_context_invoke(NULL, on_hover_image_loaded, h);
+        }).detach();
     }
     if (!image_data.empty()) {
         GBytes *bytes = g_bytes_new(image_data.data(), image_data.size());
@@ -9199,8 +9312,10 @@ static std::string translate_type(const char* type) {
     return t; // Se non trovato, restituisci originale
 }
 
-/* PicCtx used to pass picture + raw data to the main-loop invoker */
-struct PicCtx { GtkWidget* pic; std::vector<unsigned char>* data; };
+/* PicCtx used to pass picture + raw data to the main-loop invoker.
+   The picture is held via GWeakRef: the list item may be recycled or
+   destroyed while the download is still running. */
+struct PicCtx { GWeakRef pic_ref; std::vector<unsigned char>* data; };
 /* Text update context used to set oracle text on the main thread */
 struct TextCtx { GtkWidget* lbl; char* text; };
 static gboolean on_picture_update_invoke(gpointer user_data);
@@ -9714,21 +9829,24 @@ static void name_factory_bind_cb(GtkListItemFactory *factory, GtkListItem *item,
             // spawn thread to download and update picture when ready
             std::string u = url;
             GtkWidget *pic = picture;
-            std::thread([u, pic]() {
+            PicCtx* pctx = new PicCtx();
+            g_weak_ref_init(&pctx->pic_ref, pic);
+            pctx->data = nullptr;
+            std::thread([u, pctx]() {
                 auto data = download_image_data(u);
-                if (data.empty()) return;
-                // save into cache
-                try {
-                    std::string fpath = image_cache_path(u);
-                    if (!fpath.empty()) {
-                        std::ofstream out(fpath, std::ios::binary);
-                        if (out) { out.write((char*)data.data(), data.size()); out.close(); }
-                    }
-                } catch(...) {}
-                // create texture on main thread
-                PicCtx* pctx = new PicCtx();
-                pctx->pic = pic;
-                pctx->data = new std::vector<unsigned char>(data.begin(), data.end());
+                if (!data.empty()) {
+                    // save into cache
+                    try {
+                        std::string fpath = image_cache_path(u);
+                        if (!fpath.empty()) {
+                            ensure_data_dir_exists("data/img");
+                            std::ofstream out(fpath, std::ios::binary);
+                            if (out) { out.write((char*)data.data(), data.size()); out.close(); }
+                        }
+                    } catch(...) {}
+                    pctx->data = new std::vector<unsigned char>(data.begin(), data.end());
+                }
+                // patch texture on main thread (invoker handles dead widgets)
                 g_main_context_invoke(NULL, (GSourceFunc)on_picture_update_invoke, pctx);
             }).detach();
         }
@@ -9738,14 +9856,19 @@ static void name_factory_bind_cb(GtkListItemFactory *factory, GtkListItem *item,
 static gboolean on_picture_update_invoke(gpointer user_data) {
     PicCtx* ctx = (PicCtx*)user_data;
     if (!ctx) return G_SOURCE_REMOVE;
-    GBytes *bytes = g_bytes_new(ctx->data->data(), ctx->data->size());
-    GdkTexture *texture = gdk_texture_new_from_bytes(bytes, nullptr);
-    if (texture) {
-        gtk_picture_set_paintable(GTK_PICTURE(ctx->pic), GDK_PAINTABLE(texture));
-        g_object_unref(texture);
+    GtkWidget* pic = GTK_WIDGET(g_weak_ref_get(&ctx->pic_ref));
+    if (pic && ctx->data && !ctx->data->empty()) {
+        GBytes *bytes = g_bytes_new(ctx->data->data(), ctx->data->size());
+        GdkTexture *texture = gdk_texture_new_from_bytes(bytes, nullptr);
+        if (texture) {
+            gtk_picture_set_paintable(GTK_PICTURE(pic), GDK_PAINTABLE(texture));
+            g_object_unref(texture);
+        }
+        g_bytes_unref(bytes);
     }
-    g_bytes_unref(bytes);
+    if (pic) g_object_unref(pic); // release strong ref from g_weak_ref_get
     delete ctx->data;
+    g_weak_ref_clear(&ctx->pic_ref);
     delete ctx;
     return G_SOURCE_REMOVE;
 }
@@ -10094,7 +10217,7 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     gtk_widget_add_css_class(inline_foil, "inline-toggle");
 
     // Create AddCardContext for inline widgets and connect entry activate
-    AddCardContext* inline_ctx = new AddCardContext{inline_entry, inline_spin, state, GTK_WINDOW(window), inline_foil};
+    AddCardContext* inline_ctx = new AddCardContext{inline_entry, inline_spin, state, GTK_WINDOW(window), inline_foil, window, FALSE};
     g_signal_connect(inline_entry, "activate", G_CALLBACK(on_add_card_ok_clicked), inline_ctx);
 
     // Attach a key controller to the spin so Enter triggers the add action
