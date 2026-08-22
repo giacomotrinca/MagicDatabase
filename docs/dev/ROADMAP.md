@@ -23,6 +23,10 @@
       owner del dialog add-card tracciato con weak ref — B6 parziale
 - [x] **F2.3** Non cachare risposte Scryfall vuote (o TTL breve) — B8
 - [x] **F2.4** Escape input per FTS5 MATCH e LIKE — B9
+- [x] **F2.5** Colonne tabella adattive: root cause = minimo header bar (1283px) > finestra;
+      fix entry adattive + CSS + overlay measure + stack non-homogeneous +
+      collasso responsivo menu sotto 1050px — B16
+- [ ] **F2.6** Indagare min intrinseco ~190px dello spinbutton; valutare label menu più corte
 - [ ] **F2.2b** Shutdown ordinato worker bulk refresh/refetch singola (usano AppState/db raw)
 
 ## Fase 3 — Refactoring architetturale

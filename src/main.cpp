@@ -9336,11 +9336,16 @@ static void name_factory_setup_cb(GtkListItemFactory *factory, GtkListItem *item
     GtkWidget *name_label = gtk_label_new("");
     gtk_label_set_xalign(GTK_LABEL(name_label), 0.0);
     gtk_label_set_ellipsize(GTK_LABEL(name_label), PANGO_ELLIPSIZE_END);
+    /* cap the natural width so the Name column can shrink on narrow windows */
+    gtk_label_set_width_chars(GTK_LABEL(name_label), 16);
+    gtk_label_set_max_width_chars(GTK_LABEL(name_label), 30);
     gtk_widget_add_css_class(name_label, "name-label");
 
     GtkWidget *meta_label = gtk_label_new("");
     gtk_label_set_xalign(GTK_LABEL(meta_label), 0.0);
     gtk_label_set_ellipsize(GTK_LABEL(meta_label), PANGO_ELLIPSIZE_END);
+    gtk_label_set_width_chars(GTK_LABEL(meta_label), 14);
+    gtk_label_set_max_width_chars(GTK_LABEL(meta_label), 40);
     gtk_widget_add_css_class(meta_label, "meta-label");
 
     gtk_box_append(GTK_BOX(visible_box), name_label);
@@ -9392,6 +9397,7 @@ static void name_factory_setup_cb(GtkListItemFactory *factory, GtkListItem *item
     GtkWidget *title_label = gtk_label_new("");
     gtk_widget_add_css_class(title_label, "detail-title");
     gtk_label_set_xalign(GTK_LABEL(title_label), 0.0);
+    gtk_label_set_ellipsize(GTK_LABEL(title_label), PANGO_ELLIPSIZE_END);
     gtk_widget_set_hexpand(title_label, TRUE);
     gtk_box_append(GTK_BOX(header_row), title_label);
 
@@ -9412,10 +9418,14 @@ static void name_factory_setup_cb(GtkListItemFactory *factory, GtkListItem *item
 
     GtkWidget *art_frame = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_widget_add_css_class(art_frame, "detail-art-frame");
-    gtk_widget_set_size_request(art_frame, 200, 280);
+    /* No hard size_request here: a fixed minimum would leak through the
+     * collapsed revealer and prevent the Name column from shrinking on
+     * narrow windows. Vertical sizing comes from CSS (.detail-art-frame);
+     * the picture itself can_shrink to any allocation. */
     gtk_widget_set_hexpand(art_frame, FALSE);
     gtk_widget_set_vexpand(art_frame, FALSE);
     gtk_widget_set_overflow(art_frame, GTK_OVERFLOW_HIDDEN);
+    gtk_widget_set_valign(art_frame, GTK_ALIGN_START);
     gtk_box_append(GTK_BOX(preview_column), art_frame);
 
     GtkWidget *picture = gtk_picture_new();
@@ -9426,7 +9436,6 @@ static void name_factory_setup_cb(GtkListItemFactory *factory, GtkListItem *item
     gtk_widget_set_vexpand(picture, TRUE);
     gtk_widget_set_valign(picture, GTK_ALIGN_FILL);
     gtk_widget_set_halign(picture, GTK_ALIGN_FILL);
-    gtk_widget_set_size_request(picture, 200, 280);
     gtk_box_append(GTK_BOX(art_frame), picture);
 
     GtkWidget *action_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
@@ -9454,11 +9463,17 @@ static void name_factory_setup_cb(GtkListItemFactory *factory, GtkListItem *item
     GtkWidget *type_label = gtk_label_new("");
     gtk_widget_add_css_class(type_label, "detail-meta-line");
     gtk_label_set_xalign(GTK_LABEL(type_label), 0.0);
+    /* wrap + ellipsize so the detail panel never forces a large minimum
+     * width on the Name column (keeps columns adaptive on narrow windows) */
+    gtk_label_set_wrap(GTK_LABEL(type_label), TRUE);
+    gtk_label_set_wrap_mode(GTK_LABEL(type_label), PANGO_WRAP_WORD_CHAR);
     gtk_box_append(GTK_BOX(meta_box), type_label);
 
     GtkWidget *colors_label = gtk_label_new("");
     gtk_widget_add_css_class(colors_label, "detail-meta-line");
     gtk_label_set_xalign(GTK_LABEL(colors_label), 0.0);
+    gtk_label_set_wrap(GTK_LABEL(colors_label), TRUE);
+    gtk_label_set_wrap_mode(GTK_LABEL(colors_label), PANGO_WRAP_WORD_CHAR);
     gtk_box_append(GTK_BOX(meta_box), colors_label);
 
     GtkWidget *stat_grid = gtk_grid_new();
@@ -9471,29 +9486,40 @@ static void name_factory_setup_cb(GtkListItemFactory *factory, GtkListItem *item
         GtkWidget *caption = gtk_label_new(translate(key).c_str());
         gtk_widget_add_css_class(caption, "detail-stat-name");
         gtk_label_set_xalign(GTK_LABEL(caption), 0.0);
+        gtk_label_set_ellipsize(GTK_LABEL(caption), PANGO_ELLIPSIZE_END);
         gtk_grid_attach(GTK_GRID(stat_grid), caption, 0, row_index, 1, 1);
     };
 
     GtkWidget *rarity_label = gtk_label_new("");
     gtk_widget_add_css_class(rarity_label, "detail-stat-value");
     gtk_label_set_xalign(GTK_LABEL(rarity_label), 0.0);
+    gtk_label_set_wrap(GTK_LABEL(rarity_label), TRUE);
+    gtk_label_set_wrap_mode(GTK_LABEL(rarity_label), PANGO_WRAP_WORD_CHAR);
 
     GtkWidget *set_label = gtk_label_new("");
     gtk_widget_add_css_class(set_label, "detail-stat-value");
     gtk_label_set_xalign(GTK_LABEL(set_label), 0.0);
+    gtk_label_set_wrap(GTK_LABEL(set_label), TRUE);
+    gtk_label_set_wrap_mode(GTK_LABEL(set_label), PANGO_WRAP_WORD_CHAR);
 
     GtkWidget *mana_label = gtk_label_new("");
     gtk_widget_add_css_class(mana_label, "detail-stat-value");
     gtk_label_set_xalign(GTK_LABEL(mana_label), 0.0);
+    gtk_label_set_wrap(GTK_LABEL(mana_label), TRUE);
+    gtk_label_set_wrap_mode(GTK_LABEL(mana_label), PANGO_WRAP_WORD_CHAR);
 
     GtkWidget *price_label = gtk_label_new("");
     gtk_widget_add_css_class(price_label, "detail-stat-value");
     gtk_widget_add_css_class(price_label, "detail-price-chip");
     gtk_label_set_xalign(GTK_LABEL(price_label), 0.0);
+    gtk_label_set_wrap(GTK_LABEL(price_label), TRUE);
+    gtk_label_set_wrap_mode(GTK_LABEL(price_label), PANGO_WRAP_WORD_CHAR);
 
     GtkWidget *date_label = gtk_label_new("");
     gtk_widget_add_css_class(date_label, "detail-stat-value");
     gtk_label_set_xalign(GTK_LABEL(date_label), 0.0);
+    gtk_label_set_wrap(GTK_LABEL(date_label), TRUE);
+    gtk_label_set_wrap_mode(GTK_LABEL(date_label), PANGO_WRAP_WORD_CHAR);
 
     GtkWidget *deck_label = gtk_label_new("");
     gtk_widget_add_css_class(deck_label, "detail-stat-value");
@@ -9531,7 +9557,7 @@ static void name_factory_setup_cb(GtkListItemFactory *factory, GtkListItem *item
     gtk_box_append(GTK_BOX(oracle_section), oracle_title);
 
     GtkWidget *oracle_scroll = gtk_scrolled_window_new();
-    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(oracle_scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(oracle_scroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
     gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(oracle_scroll), 90);
     gtk_scrolled_window_set_max_content_height(GTK_SCROLLED_WINDOW(oracle_scroll), 240);
     gtk_widget_add_css_class(oracle_scroll, "detail-oracle-scroll");
@@ -9565,7 +9591,17 @@ static void name_factory_setup_cb(GtkListItemFactory *factory, GtkListItem *item
     g_object_set_data(G_OBJECT(detail_box), "oracle_scroll", oracle_scroll);
     g_object_set_data(G_OBJECT(detail_box), "oracle_section", oracle_section);
 
-    gtk_revealer_set_child(GTK_REVEALER(revealer), detail_box);
+    /* Wrap the detail panel in a scrolled window so the collapsed revealer
+     * does not propagate the panel's large minimum width to the Name column
+     * (this is what prevented adaptive column sizing on narrow windows).
+     * Horizontal = AUTOMATIC keeps the measured minimum tiny; vertical =
+     * NEVER lets the height follow the content. */
+    GtkWidget *detail_scroll = gtk_scrolled_window_new();
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(detail_scroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_NEVER);
+    gtk_widget_add_css_class(detail_scroll, "detail-scroller");
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(detail_scroll), detail_box);
+
+    gtk_revealer_set_child(GTK_REVEALER(revealer), detail_scroll);
 
     /* Make outer structure */
     gtk_box_append(GTK_BOX(outer_vbox), visible_box);
@@ -10059,7 +10095,10 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     // Campo di ricerca
     GtkWidget *search_entry = gtk_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(search_entry), "Cerca per nome...");
-    gtk_widget_set_size_request(search_entry, 200, -1);
+    /* Adaptive sizing: small minimum (chars-based) so the header bar can
+     * shrink on narrow windows; the entry still expands via hexpand. */
+    gtk_editable_set_width_chars(GTK_EDITABLE(search_entry), 10);
+    gtk_editable_set_max_width_chars(GTK_EDITABLE(search_entry), 36);
     gtk_widget_add_css_class(search_entry, "search-field");
     g_signal_connect(search_entry, "changed", G_CALLBACK(+[](GtkEditable*, gpointer user_data) {
         GtkWindow* window = GTK_WINDOW(user_data);
@@ -10084,6 +10123,33 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     state->view_button_box = view_content;
     state->view_button_icon = view_icon;
     state->view_button_arrow = view_arrow;
+
+    /* Responsive toolbar: below ~1050px the menu labels ("File", "Visualizza")
+     * and the "Foil" text collapse to icon-only, so the header bar's minimum
+     * width stays under typical window sizes and the table columns never get
+     * pushed off-screen. */
+    g_signal_connect(window, "notify::default-width", G_CALLBACK(+[](GObject* obj, GParamSpec*, gpointer user_data) {
+        AppState* st = (AppState*)user_data;
+        if (!st) return;
+        gint wd = 0;
+        g_object_get(obj, "default-width", &wd, NULL);
+        gboolean compact = (wd > 0 && wd < 1050);
+        if (st->file_button_label && gtk_widget_get_visible(st->file_button_label) != !compact)
+            gtk_widget_set_visible(st->file_button_label, !compact);
+        if (st->view_button_label && gtk_widget_get_visible(st->view_button_label) != !compact)
+            gtk_widget_set_visible(st->view_button_label, !compact);
+    }), state);
+    /* Apply the compact state once at startup: notify::default-width only
+     * fires on changes, and the initial size was set before the toolbar
+     * widgets existed. */
+    {
+        gint wd0 = 0;
+        g_object_get(window, "default-width", &wd0, NULL);
+        gboolean compact0 = (wd0 > 0 && wd0 < 1050);
+        if (state->file_button_label) gtk_widget_set_visible(state->file_button_label, !compact0);
+        if (state->view_button_label) gtk_widget_set_visible(state->view_button_label, !compact0);
+    }
+
     // Attach deck_menu (created above) to state so we can populate it dynamically
     state->deck_menu = deck_menu;
     // Keep file and view menu objects so we can rebuild them on language change
@@ -10184,9 +10250,15 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     gtk_widget_set_hexpand(toolbar_center, TRUE);
     gtk_center_box_set_center_widget(GTK_CENTER_BOX(toolbar), toolbar_center);
 
-    GtkWidget *toolbar_right = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    GtkWidget *toolbar_right = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     gtk_widget_add_css_class(toolbar_right, "toolbar-group");
     gtk_center_box_set_end_widget(GTK_CENTER_BOX(toolbar), toolbar_right);
+
+#ifdef COLUMN_DEBUG_PROBE
+    g_object_set_data(G_OBJECT(window), "tb_left", toolbar_left);
+    g_object_set_data(G_OBJECT(window), "tb_center", toolbar_center);
+    g_object_set_data(G_OBJECT(window), "tb_right", toolbar_right);
+#endif
 
     gtk_box_append(GTK_BOX(toolbar_left), file_button);
     gtk_box_append(GTK_BOX(toolbar_left), view_button);
@@ -10201,12 +10273,19 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     // modal add dialog for quick additions: entry + quantity spin + foil.
     GtkWidget *inline_entry = gtk_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(inline_entry), "Aggiungi carta...");
-    gtk_widget_set_size_request(inline_entry, 180, -1);
+    /* Adaptive sizing: no hard size_request (a fixed 180px minimum here
+     * inflated the header bar's minimum width, forcing the whole window
+     * wider than the screen and pushing table columns off-screen). */
+    gtk_editable_set_width_chars(GTK_EDITABLE(inline_entry), 8);
+    gtk_editable_set_max_width_chars(GTK_EDITABLE(inline_entry), 24);
     gtk_widget_set_margin_start(inline_entry, 6);
     gtk_widget_add_css_class(inline_entry, "inline-field");
 
     GtkWidget *inline_spin = gtk_spin_button_new_with_range(1, 100, 1);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(inline_spin), 1);
+    /* The default measured minimum of a spin button is ~190px; cap it so the
+     * toolbar can shrink on narrow windows. */
+    gtk_editable_set_width_chars(GTK_EDITABLE(inline_spin), 2);
     gtk_widget_set_size_request(inline_spin, 56, -1);
     gtk_widget_set_margin_start(inline_spin, 8);
     gtk_widget_set_margin_end(inline_spin, 8);
@@ -10553,7 +10632,9 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         }
     }), NULL);
     GtkColumnViewColumn *colors_col = gtk_column_view_column_new("Colori", colors_factory);
-    gtk_column_view_column_set_expand(colors_col, TRUE);
+    /* Fixed compact width: Nome is the only expanding column, so the table
+     * always fits the window width (adaptive without horizontal overflow). */
+    gtk_column_view_column_set_fixed_width(colors_col, 70);
     gtk_column_view_column_set_resizable(colors_col, FALSE);
     gtk_column_view_append_column(column_view, colors_col);
     state->colors_col = colors_col;
@@ -10665,7 +10746,7 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         }
     }), NULL);
     GtkColumnViewColumn *mana_col = gtk_column_view_column_new("Costo Mana", mana_factory);
-    gtk_column_view_column_set_fixed_width(mana_col, 100);
+    gtk_column_view_column_set_fixed_width(mana_col, 85);
     gtk_column_view_column_set_resizable(mana_col, FALSE);
     gtk_column_view_append_column(column_view, mana_col);
     state->mana_col = mana_col;
@@ -10723,7 +10804,7 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         gtk_widget_add_controller(label, GTK_EVENT_CONTROLLER(gesture));
     }), NULL);
     GtkColumnViewColumn *rarity_col = gtk_column_view_column_new("Rarità", rarity_factory);
-    gtk_column_view_column_set_fixed_width(rarity_col, 100);
+    gtk_column_view_column_set_fixed_width(rarity_col, 85);
     gtk_column_view_column_set_resizable(rarity_col, FALSE);
     gtk_column_view_append_column(column_view, rarity_col);
     state->rarity_col = rarity_col;
@@ -10783,7 +10864,7 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         gtk_widget_add_controller(label, GTK_EVENT_CONTROLLER(gesture));
     }), NULL);
     GtkColumnViewColumn *date_col = gtk_column_view_column_new("Data di aggiunta", date_factory);
-    gtk_column_view_column_set_fixed_width(date_col, 150);
+    gtk_column_view_column_set_fixed_width(date_col, 110);
     gtk_column_view_column_set_resizable(date_col, FALSE);
     gtk_column_view_append_column(column_view, date_col);
     state->date_col = date_col;
@@ -10843,7 +10924,7 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         gtk_widget_add_controller(label, GTK_EVENT_CONTROLLER(gesture));
     }), NULL);
     GtkColumnViewColumn *qty_col = gtk_column_view_column_new("Quantità", qty_factory);
-    gtk_column_view_column_set_fixed_width(qty_col, 80);
+    gtk_column_view_column_set_fixed_width(qty_col, 70);
     gtk_column_view_column_set_resizable(qty_col, FALSE);
     gtk_column_view_append_column(column_view, qty_col);
     state->qty_col = qty_col;
@@ -10900,7 +10981,7 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         gtk_widget_add_controller(label, GTK_EVENT_CONTROLLER(gesture));
     }), NULL);
     GtkColumnViewColumn *price_col = gtk_column_view_column_new("Prezzo", price_factory);
-    gtk_column_view_column_set_fixed_width(price_col, 90);
+    gtk_column_view_column_set_fixed_width(price_col, 75);
     gtk_column_view_column_set_resizable(price_col, FALSE);
     gtk_column_view_append_column(column_view, price_col);
     state->price_col = price_col;
@@ -10968,6 +11049,74 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     gtk_header_bar_set_title_widget(GTK_HEADER_BAR(header_bar), toolbar);
     gtk_header_bar_pack_end(GTK_HEADER_BAR(header_bar), close_button);
     gtk_window_set_titlebar(GTK_WINDOW(window), header_bar);
+
+#ifdef COLUMN_DEBUG_PROBE
+    // Temporary diagnostic: dump measured/allocated widths of the card table
+    g_timeout_add(4000, [](gpointer data) -> gboolean {
+        AppState* st = (AppState*)data;
+        if (!st || !st->column_view || !GTK_IS_WIDGET(st->column_view)) return G_SOURCE_REMOVE;
+        GtkWidget* cv = GTK_WIDGET(st->column_view);
+        GtkWidget* sw = gtk_widget_get_ancestor(cv, GTK_TYPE_SCROLLED_WINDOW);
+        int mn = 0, nt = 0;
+        gtk_widget_measure(cv, GTK_ORIENTATION_HORIZONTAL, -1, &mn, &nt, NULL, NULL);
+        g_print("[PROBE] columnview min=%d natural=%d allocated=%d scrolled_alloc=%d\n",
+                mn, nt, gtk_widget_get_width(cv), sw ? gtk_widget_get_width(sw) : -1);
+        GtkWidget* w = cv;
+        while (w) {
+            int amn = 0, ant = 0;
+            gtk_widget_measure(w, GTK_ORIENTATION_HORIZONTAL, -1, &amn, &ant, NULL, NULL);
+            g_print("[PROBE] chain %s min=%d nat=%d alloc=%d\n",
+                    G_OBJECT_TYPE_NAME(w), amn, ant, gtk_widget_get_width(w));
+            if (GTK_IS_WINDOW(w)) {
+                GtkWidget* tb = gtk_window_get_titlebar(GTK_WINDOW(w));
+                std::function<void(GtkWidget*, int)> dump = [&](GtkWidget* ww, int depth) {
+                    if (!ww || depth > 3) return;
+                    int amn = 0, ant = 0;
+                    gtk_widget_measure(ww, GTK_ORIENTATION_HORIZONTAL, -1, &amn, &ant, NULL, NULL);
+                    g_print("[PROBE]   tb%*s%s min=%d nat=%d w=%d\n", depth * 2, "", G_OBJECT_TYPE_NAME(ww), amn, ant, gtk_widget_get_width(ww));
+                    for (GtkWidget* c = gtk_widget_get_first_child(ww); c; c = gtk_widget_get_next_sibling(c))
+                        dump(c, depth + 1);
+                };
+                if (tb) { int tmn=0,tnt=0; gtk_widget_measure(tb, GTK_ORIENTATION_HORIZONTAL, -1, &tmn, &tnt, NULL, NULL); g_print("[PROBE] titlebar %s min=%d nat=%d w=%d\n", G_OBJECT_TYPE_NAME(tb), tmn, tnt, gtk_widget_get_width(tb)); dump(tb, 1);
+                    GtkWidget* tl = (GtkWidget*)g_object_get_data(G_OBJECT(w), "tb_left");
+                    GtkWidget* tc = (GtkWidget*)g_object_get_data(G_OBJECT(w), "tb_center");
+                    GtkWidget* tr = (GtkWidget*)g_object_get_data(G_OBJECT(w), "tb_right");
+                    for (GtkWidget* sec : {tl, tc, tr}) {
+                        if (!sec) continue;
+                        int smn = 0, snt = 0;
+                        gtk_widget_measure(sec, GTK_ORIENTATION_HORIZONTAL, -1, &smn, &snt, NULL, NULL);
+                        g_print("[PROBE]   section %s min=%d nat=%d w=%d\n", G_OBJECT_TYPE_NAME(sec), smn, snt, gtk_widget_get_width(sec));
+                        for (GtkWidget* c = gtk_widget_get_first_child(sec); c; c = gtk_widget_get_next_sibling(c)) {
+                            if (!gtk_widget_get_visible(c)) continue;
+                            int cmn2 = 0, cnt2 = 0;
+                            gtk_widget_measure(c, GTK_ORIENTATION_HORIZONTAL, -1, &cmn2, &cnt2, NULL, NULL);
+                            g_print("[PROBE]     item %s min=%d nat=%d w=%d\n", G_OBJECT_TYPE_NAME(c), cmn2, cnt2, gtk_widget_get_width(c));
+                        }
+                    }
+                }
+                break;
+            }
+            w = gtk_widget_get_parent(w);
+        }
+        GListModel* cols = gtk_column_view_get_columns(st->column_view);
+        guint n = g_list_model_get_n_items(cols);
+        for (guint i = 0; i < n; i++) {
+            GtkColumnViewColumn* c = GTK_COLUMN_VIEW_COLUMN(g_list_model_get_item(cols, i));
+            if (!c) continue;
+            gboolean exp = FALSE, vis = TRUE;
+            int fw = -1;
+            const char* title = "";
+            g_object_get(c, "expand", &exp, "visible", &vis, NULL);
+            g_object_get(c, "fixed-width", &fw, "title", &title, NULL);
+            GtkWidget* hdr = gtk_widget_get_first_child(cv); /* not reliable; just props */
+            (void)hdr;
+            g_print("[PROBE] col[%u] '%s' fixed=%d expand=%d visible=%d\n", i, title ? title : "", fw, exp, vis);
+            g_object_unref(c);
+        }
+        g_object_unref(cols);
+        return G_SOURCE_REMOVE;
+    }, state);
+#endif
 
     // Layout
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
@@ -11051,6 +11200,11 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     GtkWidget *stack = gtk_stack_new();
     gtk_widget_set_hexpand(stack, TRUE);
     gtk_widget_set_vexpand(stack, TRUE);
+    /* The stats page is much wider than the window: with the default
+     * homogeneous stack, its natural width forces EVERY page (the card
+     * list included) to ~1280px and columns overflow horizontally.
+     * Non-homogeneous = each page sizes independently within the window. */
+    gtk_stack_set_hhomogeneous(GTK_STACK(stack), FALSE);
     gtk_stack_set_transition_type(GTK_STACK(stack), GTK_STACK_TRANSITION_TYPE_SLIDE_LEFT_RIGHT);
     gtk_stack_set_transition_duration(GTK_STACK(stack), 250);
     gtk_stack_add_named(GTK_STACK(stack), cards_page, "cards");
@@ -11067,6 +11221,10 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     GtkWidget *welcome_revealer = create_welcome_overlay(state);
     if (welcome_revealer) {
         gtk_overlay_add_overlay(GTK_OVERLAY(root_overlay), welcome_revealer);
+        /* Do NOT let the overlay influence the window's measured size: even
+         * with wrapped labels its natural width was ~1280px, inflating the
+         * whole layout and pushing the card-table columns off-screen. */
+        gtk_overlay_set_measure_overlay(GTK_OVERLAY(root_overlay), welcome_revealer, FALSE);
     }
 
     gtk_window_set_child(GTK_WINDOW(window), root_overlay);
@@ -11467,6 +11625,13 @@ int main(int argc, char *argv[]) {
     }
 
     GtkApplication *app = gtk_application_new("org.magicdb.collection", G_APPLICATION_DEFAULT_FLAGS);
+    // The app theme (style.css) is designed for dark surfaces. The custom CSS
+    // does not cover every base widget background, so on light system themes
+    // white rows bleed through (unreadable list). Ensure the dark theme
+    // variant is used unless the user explicitly chose one via GTK_THEME.
+    if (g_getenv("GTK_THEME") == nullptr) {
+        g_setenv("GTK_THEME", "Adwaita:dark", FALSE);
+    }
     g_signal_connect(app, "activate", G_CALLBACK(on_activate), NULL);
     int status = g_application_run(G_APPLICATION(app), argc, argv);
     g_object_unref(app);

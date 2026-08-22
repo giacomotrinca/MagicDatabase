@@ -406,7 +406,9 @@ spinbutton selection {
 }
 
 .search-field {
-    min-width: 220px;
+    /* was 220px: forced the header bar (and thus the whole window) to be
+     * wider than narrow screens, pushing table columns off-screen */
+    min-width: 76px;
     background-color: rgba(21,28,46,0.92);
 }
 
@@ -490,9 +492,16 @@ scrolledwindow.card-scroller {
     background-image: linear-gradient(200deg, rgba(28,34,54,0.98), rgba(12,16,26,0.92));
     border: 1px solid rgba(124,107,255,0.26);
     box-shadow: 0 24px 40px rgba(5,10,26,0.35);
+    min-height: 260px;
 }
 
-.detail-art { border-radius: 16px; background-color: rgba(8,12,20,0.92); }
+/* Detail art keeps a comfortable height but no fixed minimum width, so the
+ * Name column can shrink on narrow windows (adaptive columns). */
+.detail-art {
+    border-radius: 16px;
+    background-color: rgba(8,12,20,0.92);
+    min-width: 90px;
+}
 .detail-chip {
     background-color: rgba(124,107,255,0.24);
     color: @text_primary;

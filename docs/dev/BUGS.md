@@ -76,6 +76,29 @@
 - curl_easy_escape(nullptr,...) presuppone global init fatto altrove
 - sqlite3_step ignorati in punti: registrazione migration applicata (553), delete nota (1298)
 
+### B14 · lastdb.txt con percorso assoluto di altra macchina → db non riaperto
+- **Evidenza**: al primo lancio "Nessun database aperto"; lastdb.txt conteneva `/mnt/01D9269698DA8D30/...` (path di un altro mount)
+- **Fix roadmap**: F3.6 (percorsi exe-relative/XDG). Workaround temporaneo: lastdb.txt relativo
+
+### B15 · Contrasto illeggibile su temi chiare di sistema — RISOLTO
+- **Causa**: style.css è progettato dark ma non copriva i background base; su tema Adwaita light le righe restavano bianche con testo quasi bianco (`label{color:@text_primary}`)
+- **Diagnosi**: test empirico `GTK_THEME=Adwaita:dark` → lista perfettamente leggibile
+- **Fix applicato**: `GTK_THEME=Adwaita:dark` via `g_setenv` in main() se l'utente non l'ha impostata (le GtkSettings prima di gtk_init vengono ignorate)
+
+### B16 · Colonne tabella fuori schermo su finestre strette — RISOLTO
+- **Sintomo**: a ~950px Rarità/Data/Quantità/Prezzo tagliate; contenuto allocato a ~1280px
+- **Diagnosi** (probe runtime con `COLUMN_DEBUG_PROBE`, catena measure/alloc):
+  - `GtkApplicationWindow min=1283` mentre il contenuto richiedeva solo 704 → colpevole: **header bar** (GtkCenterBox = somma minimi delle 3 sezioni)
+  - dentro la toolbar: `.search-field{min-width:220px}` CSS + `set_size_request(180/200)` sulle entry + spinbutton min intrinseco ~190px
+  - GtkOverlay misurava anche il welcome overlay (~1280px) → fix `gtk_overlay_set_measure_overlay(FALSE)`
+  -GtkStack homogeneous ereditava la pagina stats più larga → `set_hhomogeneous(FALSE)`
+- **Fix applicati**:
+  - entry: `width_chars`/`max_width_chars` adattivi invece di size_request fissi; `.search-field` min 76px
+  - pannello dettagli avvolto in ScrolledWindow(AUTOMATIC,NEVER) così il revealer chiuso non propaga min-width alla colonna Nome
+  - una sola colonna espandibile (Nome); Colori fissa 70; Mana/Rarità 85; Data 110; Quantità 70; Prezzo 75
+  - collasso responsivo: sotto 1050px le label File/Visualizza diventano icon-only
+- **Nota**: lo spinbutton mantiene min ~190px (intrinseco GTK4, da indagare)
+
 ## Storico interventi
 
 - 2026-08-22: repo riparato dopo clone fallito su NTFS — rimossi dall'indice i 4 file `data/img/*.jpg?<ts>`; checkout completato con `git restore`. Le cancellazioni sono in staging: spariranno da GitHub al prossimo push.
